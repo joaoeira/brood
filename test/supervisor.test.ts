@@ -428,7 +428,7 @@ it.effect("drain timeout interrupts stragglers and reports their IDs", () =>
   ),
 );
 
-it.effect("publishes only the first interruption reason when operator interrupt races drain", () =>
+it.effect("publishes authoritative interruption and timeout events when operator races drain", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const catalogue = yield* compileProfileCatalogue(
@@ -488,6 +488,7 @@ it.effect("publishes only the first interruption reason when operator interrupt 
       const outcome = yield* supervisor.awaitOutcome(rootId);
       const events = Array.from(yield* Fiber.join(lifecycle));
       const interruptEvents = events.filter((event) => event.type === "AgentInterruptRequested");
+      const timeoutEvent = events.find((event) => event.type === "DrainTimedOut");
 
       expect(interruptEvents).toEqual([
         expect.objectContaining({
@@ -495,6 +496,13 @@ it.effect("publishes only the first interruption reason when operator interrupt 
           reason: { _tag: "OperatorRequested", source: "api" },
         }),
       ]);
+      expect(timeoutEvent).toEqual(
+        expect.objectContaining({
+          type: "DrainTimedOut",
+          timeoutMillis: 1_000,
+          interruptedAgentIds: [rootId],
+        }),
+      );
       expect(outcome).toEqual({
         _tag: "Interrupted",
         reason: { _tag: "OperatorRequested", source: "api" },

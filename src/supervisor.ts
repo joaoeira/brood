@@ -110,6 +110,11 @@ export type SupervisorLifecycleEvent =
     }
   | { readonly type: "AgentResumed"; readonly agentId: AgentId; readonly waitId: WaitId }
   | { readonly type: "DrainStarted" }
+  | {
+      readonly type: "DrainTimedOut";
+      readonly timeoutMillis: number;
+      readonly interruptedAgentIds: ReadonlyArray<AgentId>;
+    }
   | { readonly type: "DrainCompleted"; readonly report: DrainReport };
 
 export type SupervisorEvent =
@@ -574,6 +579,11 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           };
           const shutdown = yield* registry.beginShutdown(reason);
           yield* installationGate.withPermit(Effect.void);
+          yield* publishLifecycle({
+            type: "DrainTimedOut",
+            timeoutMillis: options.drainTimeoutMillis,
+            interruptedAgentIds: Object.freeze([...shutdown.activeIds]),
+          });
           yield* publishInterruptions(shutdown.newlyRequested);
           const settledPending = yield* registry.settlePendingInstallations(reason);
           yield* Effect.forEach(settledPending, publishSettlement, { discard: true });
