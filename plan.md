@@ -63,10 +63,10 @@ including a one-element batch, and defaults to waiting for the whole batch.
 delegate({
   tasks: [
     { name: "api", goal: "Investigate the API", profile: "researcher" },
-    { name: "tests", goal: "Design the test strategy" }
+    { name: "tests", goal: "Design the test strategy" },
   ],
-  wait: "all" // optional; defaults to "all"
-})
+  wait: "all", // optional; defaults to "all"
+});
 ```
 
 The only values of `wait` are `"all"` and `"none"`. Subset and wait-any modes
@@ -78,8 +78,8 @@ the caller's children selected after resumption.
 
 ```ts
 wait_for_agents({
-  children: ["api", "tests"]
-})
+  children: ["api", "tests"],
+});
 ```
 
 ### 2.4 Names are scoped and never rebound
@@ -178,7 +178,8 @@ Initial implementation must pin exact versions and commit the lockfile:
 - `effect`: `4.0.0-beta.105`;
 - `@effect/vitest`: `4.0.0-beta.105`;
 - TypeScript `5.9.3`, `@types/node` `24.12.4`, Vitest `4.1.10`, and TypeBox
-  `1.3.7`.
+  `1.3.7`;
+- Oxfmt `0.62.0` and Oxlint `1.77.0`.
 
 Do not use version ranges for the Effect beta or Pi during v1 development.
 Re-evaluate upgrades intentionally because both integration surfaces are moving.
@@ -233,27 +234,18 @@ Only two public application services are needed initially:
 
 ```ts
 interface PiAdapterApi {
-  readonly open: (
-    config: PiAgentConfig
-  ) => Effect.Effect<PiAgent, PiOpenError, Scope.Scope>
+  readonly open: (config: PiAgentConfig) => Effect.Effect<PiAgent, PiOpenError, Scope.Scope>;
 }
 
 interface AgentSupervisorApi {
-  readonly startRoot: (
-    goal: Goal
-  ) => Effect.Effect<AgentId, RootStartError>
+  readonly startRoot: (goal: Goal) => Effect.Effect<AgentId, RootStartError>;
 
-  readonly awaitOutcome: (
-    id: AgentId
-  ) => Effect.Effect<AgentOutcome, UnknownAgent>
+  readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
 
-  readonly drain: Effect.Effect<DrainReport>
-  readonly interrupt: (
-    id: AgentId,
-    source: "cli" | "api"
-  ) => Effect.Effect<void, UnknownAgent>
-  readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>
-  readonly events: Stream.Stream<SupervisorEvent>
+  readonly drain: Effect.Effect<DrainReport>;
+  readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
+  readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
+  readonly events: Stream.Stream<SupervisorEvent>;
 }
 ```
 
@@ -283,17 +275,17 @@ TypeScript types.
 ### 6.1 Identifiers and inputs
 
 ```ts
-type AgentId = string & Brand.Brand<"AgentId">
-type BatchId = string & Brand.Brand<"BatchId">
-type AgentName = string & Brand.Brand<"AgentName">
-type ProfileName = string & Brand.Brand<"ProfileName">
-type ToolInvocationId = string & Brand.Brand<"ToolInvocationId">
-type WaitId = string & Brand.Brand<"WaitId">
+type AgentId = string & Brand.Brand<"AgentId">;
+type BatchId = string & Brand.Brand<"BatchId">;
+type AgentName = string & Brand.Brand<"AgentName">;
+type ProfileName = string & Brand.Brand<"ProfileName">;
+type ToolInvocationId = string & Brand.Brand<"ToolInvocationId">;
+type WaitId = string & Brand.Brand<"WaitId">;
 
 interface DelegatedTask {
-  readonly name: AgentName
-  readonly goal: string
-  readonly profile?: ProfileName
+  readonly name: AgentName;
+  readonly goal: string;
+  readonly profile?: ProfileName;
 }
 ```
 
@@ -314,11 +306,9 @@ Unknown persisted/control payloads are decoded with
 ### 6.2 Run-scoped model profiles
 
 ```ts
-import type {
-  ModelThinkingLevel as PiModelThinkingLevel
-} from "@earendil-works/pi-ai"
+import type { ModelThinkingLevel as PiModelThinkingLevel } from "@earendil-works/pi-ai";
 
-export type ModelThinkingLevel = PiModelThinkingLevel
+export type ModelThinkingLevel = PiModelThinkingLevel;
 
 export const THINKING_LEVELS = [
   "off",
@@ -327,8 +317,8 @@ export const THINKING_LEVELS = [
   "medium",
   "high",
   "xhigh",
-  "max"
-] as const satisfies ReadonlyArray<ModelThinkingLevel>
+  "max",
+] as const satisfies ReadonlyArray<ModelThinkingLevel>;
 
 const _exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
   off: true,
@@ -337,44 +327,44 @@ const _exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
   medium: true,
   high: true,
   xhigh: true,
-  max: true
-}
+  max: true,
+};
 
 interface ModelProfile {
-  readonly description: string
-  readonly provider: string
-  readonly model: string
-  readonly thinkingLevel?: ModelThinkingLevel
+  readonly description: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly thinkingLevel?: ModelThinkingLevel;
 }
 
 interface ProfilesConfigInput {
-  readonly defaultProfile: string
-  readonly rootProfile?: string
-  readonly profiles: Readonly<Record<string, ModelProfile>>
+  readonly defaultProfile: string;
+  readonly rootProfile?: string;
+  readonly profiles: Readonly<Record<string, ModelProfile>>;
 }
 
 interface ProfilesConfig {
-  readonly defaultProfile: ProfileName
-  readonly rootProfile?: ProfileName
-  readonly profiles: Readonly<Record<string, ModelProfile>>
+  readonly defaultProfile: ProfileName;
+  readonly rootProfile?: ProfileName;
+  readonly profiles: Readonly<Record<string, ModelProfile>>;
 }
 
 interface PublicModelProfile {
-  readonly name: ProfileName
-  readonly provider: string
-  readonly model: string
-  readonly thinkingLevel: ModelThinkingLevel
+  readonly name: ProfileName;
+  readonly provider: string;
+  readonly model: string;
+  readonly thinkingLevel: ModelThinkingLevel;
 }
 
 interface ResolvedModelProfile {
-  readonly public: PublicModelProfile
-  readonly description: string
-  readonly model: Model<Api> // private; never serialized
+  readonly public: PublicModelProfile;
+  readonly description: string;
+  readonly model: Model<Api>; // private; never serialized
 }
 
 interface PiAgentConfig {
-  readonly agentId: AgentId
-  readonly profile: ResolvedModelProfile
+  readonly agentId: AgentId;
+  readonly profile: ResolvedModelProfile;
   // workspace, state/session paths, tools, and timeouts omitted here
 }
 ```
@@ -430,25 +420,23 @@ snapshots and events.
 ```ts
 type PiRunOutcome =
   | {
-      readonly _tag: "Completed"
-      readonly result: PiRunResult
+      readonly _tag: "Completed";
+      readonly result: PiRunResult;
     }
   | {
-      readonly _tag: "Suspended"
-    }
+      readonly _tag: "Suspended";
+    };
 
 interface PiRunResult {
-  readonly finalText: string
-  readonly finalMessageId: string | undefined
-  readonly stopReason: "stop"
+  readonly finalText: string;
+  readonly finalMessageId: string | undefined;
+  readonly stopReason: "stop";
 }
 
 interface PiAgent {
-  readonly sessionId: string
-  readonly events: Stream.Stream<PiSessionEvent>
-  readonly run: (
-    prompt: string
-  ) => Effect.Effect<PiRunOutcome, PiRunError | PiProtocolError>
+  readonly sessionId: string;
+  readonly events: Stream.Stream<PiSessionEvent>;
+  readonly run: (prompt: string) => Effect.Effect<PiRunOutcome, PiRunError | PiProtocolError>;
 }
 ```
 
@@ -470,44 +458,44 @@ normalizes it into a bounded `AgentResult`:
 
 ```ts
 interface AgentResult {
-  readonly agentId: AgentId
-  readonly sessionId: string
-  readonly summary: string
-  readonly truncated: boolean
-  readonly originalCharacterCount: number
+  readonly agentId: AgentId;
+  readonly sessionId: string;
+  readonly summary: string;
+  readonly truncated: boolean;
+  readonly originalCharacterCount: number;
 }
 
 interface DrainReport {
-  readonly timedOut: boolean
-  readonly interruptedAgentIds: ReadonlyArray<AgentId>
-  readonly terminalAgentCount: number
+  readonly timedOut: boolean;
+  readonly interruptedAgentIds: ReadonlyArray<AgentId>;
+  readonly terminalAgentCount: number;
 }
 
 interface BroodResult {
-  readonly root: AgentResult
-  readonly drain: DrainReport
+  readonly root: AgentResult;
+  readonly drain: DrainReport;
 }
 
 type DependencyOutcome =
   | {
-      readonly _tag: "Completed"
-      readonly agentId: AgentId
-      readonly name: AgentName
-      readonly result: AgentResult
+      readonly _tag: "Completed";
+      readonly agentId: AgentId;
+      readonly name: AgentName;
+      readonly result: AgentResult;
     }
   | {
-      readonly _tag: "Failed"
-      readonly agentId: AgentId
-      readonly name: AgentName
-      readonly code: string
-      readonly message: string
+      readonly _tag: "Failed";
+      readonly agentId: AgentId;
+      readonly name: AgentName;
+      readonly code: string;
+      readonly message: string;
     }
   | {
-      readonly _tag: "Interrupted"
-      readonly agentId: AgentId
-      readonly name: AgentName
-      readonly reason: string
-    }
+      readonly _tag: "Interrupted";
+      readonly agentId: AgentId;
+      readonly name: AgentName;
+      readonly reason: string;
+    };
 ```
 
 The default limits are:
@@ -569,29 +557,29 @@ normalized values.
 type AgentOutcome =
   | { readonly _tag: "Completed"; readonly result: AgentResult }
   | { readonly _tag: "Failed"; readonly failure: AgentFailure }
-  | { readonly _tag: "Interrupted"; readonly reason: InterruptReason }
+  | { readonly _tag: "Interrupted"; readonly reason: InterruptReason };
 
 type AgentFailure =
   | { readonly _tag: "AgentStartFailed"; readonly error: PiOpenError }
   | { readonly _tag: "AgentRunFailed"; readonly error: PiRunError }
   | { readonly _tag: "AgentProtocolFailed"; readonly error: PiProtocolError }
-  | { readonly _tag: "AgentDefect"; readonly cause: Cause.Cause<unknown> }
+  | { readonly _tag: "AgentDefect"; readonly cause: Cause.Cause<unknown> };
 
 type InterruptReason =
   | { readonly _tag: "OperatorRequested"; readonly source: "cli" | "api" }
   | { readonly _tag: "DrainTimeout"; readonly timeoutMillis: number }
-  | { readonly _tag: "SupervisorShutdown" }
+  | { readonly _tag: "SupervisorShutdown" };
 
 type AgentCommand =
   | {
-      readonly _tag: "InitialGoal"
-      readonly goal: string
+      readonly _tag: "InitialGoal";
+      readonly goal: string;
     }
   | {
-      readonly _tag: "Resume"
-      readonly waitId: WaitId
-      readonly outcomes: ReadonlyArray<DependencyOutcome>
-    }
+      readonly _tag: "Resume";
+      readonly waitId: WaitId;
+      readonly outcomes: ReadonlyArray<DependencyOutcome>;
+    };
 ```
 
 When converting an `AgentOutcome` for a dependency, `AgentFailure._tag` becomes
@@ -684,14 +672,14 @@ Registry state contains:
 
 ```ts
 interface RegistryState {
-  readonly agents: ReadonlyMap<AgentId, AgentEntry>
-  readonly childrenByParent: ReadonlyMap<AgentId, ReadonlyMap<AgentName, AgentId>>
-  readonly seenControlInvocations: ReadonlyMap<AgentId, ReadonlySet<ToolInvocationId>>
-  readonly plannedWaits: ReadonlyMap<WaitPlanKey, PlannedWait>
-  readonly activeWaits: ReadonlyMap<AgentId, ActiveWait>
-  readonly nonterminalCount: number
-  readonly eventSequence: number
-  readonly accepting: boolean
+  readonly agents: ReadonlyMap<AgentId, AgentEntry>;
+  readonly childrenByParent: ReadonlyMap<AgentId, ReadonlyMap<AgentName, AgentId>>;
+  readonly seenControlInvocations: ReadonlyMap<AgentId, ReadonlySet<ToolInvocationId>>;
+  readonly plannedWaits: ReadonlyMap<WaitPlanKey, PlannedWait>;
+  readonly activeWaits: ReadonlyMap<AgentId, ActiveWait>;
+  readonly nonterminalCount: number;
+  readonly eventSequence: number;
+  readonly accepting: boolean;
 }
 ```
 
@@ -716,7 +704,7 @@ latch after commit.
 
 ### 7.1 Terminal settlement
 
-Every controller body runs under an `onExit` boundary *inside* the controller's
+Every controller body runs under an `onExit` boundary _inside_ the controller's
 `Effect.scoped` region. It calls `settleExactlyOnce` before Pi session scope
 finalizers run, so a slow or defective cleanup cannot leave terminal waiters
 hanging. `FiberMap.awaitEmpty` may still wait for actual cleanup. Settlement:
@@ -843,33 +831,33 @@ the nested versioned control value:
 ```ts
 type BroodControl =
   | {
-      readonly version: 1
-      readonly kind: "suspend"
-      readonly invocationId: ToolInvocationId
+      readonly version: 1;
+      readonly kind: "suspend";
+      readonly invocationId: ToolInvocationId;
     }
   | {
-      readonly version: 1
-      readonly kind: "continue"
-      readonly invocationId: ToolInvocationId
-    }
+      readonly version: 1;
+      readonly kind: "continue";
+      readonly invocationId: ToolInvocationId;
+    };
 ```
 
 ```ts
 interface DelegateToolDetails {
-  readonly version: 1
-  readonly batchId: BatchId
+  readonly version: 1;
+  readonly batchId: BatchId;
   readonly agents: ReadonlyArray<{
-    readonly name: AgentName
-    readonly id: AgentId
-    readonly profile: ProfileName
-  }>
-  readonly broodControl: BroodControl
+    readonly name: AgentName;
+    readonly id: AgentId;
+    readonly profile: ProfileName;
+  }>;
+  readonly broodControl: BroodControl;
 }
 
 interface WaitToolDetails {
-  readonly version: 1
-  readonly outcomes: ReadonlyArray<DependencyOutcome>
-  readonly broodControl: BroodControl
+  readonly version: 1;
+  readonly outcomes: ReadonlyArray<DependencyOutcome>;
+  readonly broodControl: BroodControl;
 }
 ```
 
@@ -1006,7 +994,7 @@ an agent's JSONL file.
 8. subscribe to session events before the first run;
 9. expose a scoped `PiAgent`, never the raw session;
 10. finalize in this order: abort compaction, await session abort, unsubscribe the
-   bridge listener, dispose the session, then shut down the bridge queue.
+    bridge listener, dispose the session, then shut down the bridge queue.
 
 Prompt template expansion is disabled for controller-generated prompts. V1 does
 not call low-level `session.agent.continue()` because it bypasses AgentSession's
@@ -1110,45 +1098,41 @@ Conceptually, a controller is:
 ```ts
 const controller = Effect.scoped(
   Effect.gen(function* () {
-    const controllerScope = yield* Effect.scope
-    const first = yield* registry.takePendingCommand(id)
+    const controllerScope = yield* Effect.scope;
+    const first = yield* registry.takePendingCommand(id);
 
     // Acquire lazily under the first permit but pin to controllerScope.
     const { agent, disposition } = yield* slots.withPermit(
       Effect.gen(function* () {
-        yield* registry.markStarting(id)
-        const agent = yield* pi.open(config).pipe(
-          Scope.provide(controllerScope)
-        )
-        yield* registry.markRunning(id)
-        const outcome = yield* agent.run(render(first))
-        const disposition = yield* registry.acceptRunOutcome(id, outcome)
-        return { agent, disposition }
-      })
-    )
+        yield* registry.markStarting(id);
+        const agent = yield* pi.open(config).pipe(Scope.provide(controllerScope));
+        yield* registry.markRunning(id);
+        const outcome = yield* agent.run(render(first));
+        const disposition = yield* registry.acceptRunOutcome(id, outcome);
+        return { agent, disposition };
+      }),
+    );
 
-    if (disposition._tag === "Terminal") return disposition.result
+    if (disposition._tag === "Terminal") return disposition.result;
 
     while (true) {
       // The registry slot is authoritative; the reusable latch is only a wake.
-      const command = yield* registry.takePendingCommand(id)
+      const command = yield* registry.takePendingCommand(id);
 
       const next = yield* slots.withPermit(
         registry.markRunning(id).pipe(
           Effect.andThen(agent.run(render(command))),
-          Effect.flatMap((outcome) =>
-            registry.acceptRunOutcome(id, outcome)
-          )
-        )
-      )
+          Effect.flatMap((outcome) => registry.acceptRunOutcome(id, outcome)),
+        ),
+      );
 
-      if (next._tag === "Terminal") return next.result
+      if (next._tag === "Terminal") return next.result;
     }
   }).pipe(
     // Inside Effect.scoped: terminal awaiters settle before session cleanup.
-    Effect.onExit((exit) => registry.settleControllerExit(id, exit))
-  )
-)
+    Effect.onExit((exit) => registry.settleControllerExit(id, exit)),
+  ),
+);
 ```
 
 `registry.takePendingCommand` closes the reusable latch, then atomically observes
@@ -1183,10 +1167,10 @@ identity:
 
 ```ts
 interface AgentProfileSnapshot {
-  readonly profile: ProfileName
-  readonly provider: string
-  readonly model: string
-  readonly thinkingLevel: ModelThinkingLevel
+  readonly profile: ProfileName;
+  readonly provider: string;
+  readonly model: string;
+  readonly thinkingLevel: ModelThinkingLevel;
 }
 ```
 
@@ -1283,16 +1267,16 @@ The programmatic entry point is primary; a thin CLI can call it.
 ```ts
 const runBrood = (goal: string) =>
   Effect.gen(function* () {
-    const supervisor = yield* AgentSupervisor
-    const rootId = yield* supervisor.startRoot(goal)
+    const supervisor = yield* AgentSupervisor;
+    const rootId = yield* supervisor.startRoot(goal);
 
     // Failure/interruption of an agent is value-level AgentOutcome data.
     // External interruption of this Effect still propagates immediately.
-    const rootOutcome = yield* supervisor.awaitOutcome(rootId)
+    const rootOutcome = yield* supervisor.awaitOutcome(rootId);
 
-    const drain = yield* supervisor.drain
-    return yield* interpretRootOutcome(rootOutcome, drain)
-  })
+    const drain = yield* supervisor.drain;
+    return yield* interpretRootOutcome(rootOutcome, drain);
+  });
 ```
 
 On root success this yields `BroodResult`; on root failure it fails with
@@ -1528,23 +1512,21 @@ The private fixture factory is deliberately convenience, not validation:
 
 ```ts
 // test/support/profiles.ts
-export const testProfile = (
-  overrides?: Partial<ModelProfile>
-): ModelProfile => ({
+export const testProfile = (overrides?: Partial<ModelProfile>): ModelProfile => ({
   description: "test worker",
   provider: "scripted",
   model: "scripted-small",
   thinkingLevel: "off",
-  ...overrides
-})
+  ...overrides,
+});
 
 export const testProfilesConfig = (
-  overrides?: Partial<ProfilesConfigInput>
+  overrides?: Partial<ProfilesConfigInput>,
 ): ProfilesConfigInput => ({
   defaultProfile: "worker",
   profiles: { worker: testProfile() },
-  ...overrides
-})
+  ...overrides,
+});
 ```
 
 It is never exported from `src/` and performs no validation. Tests construct
