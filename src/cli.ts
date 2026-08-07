@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Thin operator shell over main.ts: argument parsing, the interactive
- * status / interrupt / events commands, and newline-delimited JSON output for
+ * status / show / interrupt / events commands, and newline-delimited JSON output for
  * non-interactive callers. No supervisor internals are reachable from here.
  */
 import { readFile } from "node:fs/promises";
@@ -9,14 +9,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Stream } from "effect";
-import {
-  AgentFailed,
-  BroodConfigError,
-  RootInterrupted,
-  RootStartError,
-  decodeAgentId,
-  type AgentId,
-} from "./agent.js";
+import { AgentFailed, BroodConfigError, RootInterrupted, RootStartError } from "./agent.js";
 import { makeBroodApplicationFromUnknown, type BroodApplication } from "./main.js";
 import { formatAgentDetail, formatSwarmStatus } from "./status.js";
 
@@ -29,13 +22,9 @@ export interface CliArguments {
 type ParsedOperatorCommand =
   | { readonly _tag: "Status"; readonly format: "human" | "json" }
   | { readonly _tag: "Show"; readonly reference: string; readonly format: "human" | "json" }
-  | { readonly _tag: "Interrupt"; readonly agentId: string }
+  | { readonly _tag: "Interrupt"; readonly reference: string }
   | { readonly _tag: "Events"; readonly enabled: boolean }
   | { readonly _tag: "Help" };
-
-type OperatorCommand =
-  | Exclude<ParsedOperatorCommand, { readonly _tag: "Interrupt" }>
-  | { readonly _tag: "Interrupt"; readonly agentId: AgentId };
 
 class CliInputError extends Data.TaggedError("CliInputError")<{
   readonly message: string;
@@ -110,10 +99,10 @@ export const parseOperatorCommand = (line: string): ParsedOperatorCommand => {
     }
     case "interrupt": {
       const raw = rest[0];
-      if (raw === undefined || rest.length !== 1) {
-        throw new CliInputError({ message: "Usage: interrupt <agent-id>" });
+      if (raw === undefined || raw.startsWith("-") || rest.length !== 1) {
+        throw new CliInputError({ message: "Usage: interrupt <agent-path-or-id>" });
       }
-      return { _tag: "Interrupt", agentId: raw };
+      return { _tag: "Interrupt", reference: raw };
     }
     case "events":
       if (rest.length === 1 && (rest[0] === "on" || rest[0] === "off")) {
@@ -132,25 +121,14 @@ const causeMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
 export const decodeOperatorCommand = Effect.fn("Brood.Cli.decodeOperatorCommand")(
-  (line: string): Effect.Effect<OperatorCommand, CliInputError> =>
+  (line: string): Effect.Effect<ParsedOperatorCommand, CliInputError> =>
     Effect.try({
       try: () => parseOperatorCommand(line),
       catch: (cause) =>
         cause instanceof CliInputError
           ? cause
           : new CliInputError({ message: causeMessage(cause) }),
-    }).pipe(
-      Effect.flatMap((command) =>
-        command._tag === "Interrupt"
-          ? decodeAgentId(command.agentId).pipe(
-              Effect.map((agentId): OperatorCommand => ({ _tag: "Interrupt", agentId })),
-              Effect.mapError(
-                () => new CliInputError({ message: `Invalid agent ID: ${command.agentId}` }),
-              ),
-            )
-          : Effect.succeed(command),
-      ),
-    ),
+    }),
 );
 
 const writeJson = (value: unknown): Effect.Effect<void> =>
@@ -232,17 +210,18 @@ const executeCommand = (
           : writeMessage(formatAgentDetail(detail));
         break;
       }
-      case "Interrupt":
-        yield* application.controller.interrupt(command.agentId, "cli");
-        yield* writeJson({ type: "interrupt-requested", agentId: command.agentId });
+      case "Interrupt": {
+        const agentId = yield* application.controller.interrupt(command.reference, "cli");
+        yield* writeJson({ type: "interrupt-requested", reference: command.reference, agentId });
         break;
+      }
       case "Events":
         yield* Ref.set(eventDisplay, command.enabled);
         yield* writeMessage(`Event display ${command.enabled ? "enabled" : "disabled"}.`);
         break;
       case "Help":
         yield* writeMessage(
-          "Commands: status [--json] | show <agent-path-or-id> [--json] | interrupt <agent-id> | events on|off | help",
+          "Commands: status [--json] | show <agent-path-or-id> [--json] | interrupt <agent-path-or-id> | events on|off | help",
         );
         break;
     }
@@ -266,7 +245,7 @@ const runApplication = (application: BroodApplication, arguments_: CliArguments)
     );
     if (interactive) {
       yield* writeMessage(
-        "Brood is running. Commands: status | show <agent-path-or-id> | interrupt <agent-id> | events on|off",
+        "Brood is running. Commands: status | show <agent-path-or-id> | interrupt <agent-path-or-id> | events on|off",
       );
       yield* commandLines().pipe(
         Stream.runForEach((line) => executeCommand(application, eventDisplay, line)),

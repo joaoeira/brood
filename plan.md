@@ -250,7 +250,10 @@ interface AgentSupervisorApi {
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
 
   readonly drain: Effect.Effect<DrainReport>;
-  readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
+  readonly interrupt: (
+    reference: string,
+    source: "cli" | "api",
+  ) => Effect.Effect<AgentId, UnknownAgentReference>;
   readonly status: Effect.Effect<SwarmStatus>;
   readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
@@ -827,7 +830,8 @@ interrupts those controllers, and finishes cleanup before returning a
 best-effort disposal. The already-captured root outcome is still returned or
 raised after a timed-out drain; timeout is not allowed to replace it.
 
-Public `interrupt(id, source)` never enqueues a stop command: a running
+Public `interrupt(pathOrId, source)` resolves the canonical path or opaque ID,
+then never enqueues a stop command: a running
 controller would not read it until Pi returned. It records
 `OperatorRequested { source }` and attempts to interrupt/remove the controller
 through `FiberMap`. Drain timeout and supervisor shutdown use the same private
@@ -1319,7 +1323,8 @@ and interrupts queued controllers, active Pi prompts, and waiting agents.
 
 The thin CLI must expose the operator escape hatch in the running process. In an
 interactive terminal it accepts `status [--json]`,
-`show <canonical-path-or-agent-id> [--json]`, `interrupt <agent-id>`, and
+`show <canonical-path-or-agent-id> [--json]`,
+`interrupt <canonical-path-or-agent-id>`, and
 `events on|off` while the goal is running. Human status is the compact default;
 the JSON form is the same stable bounded record exposed by the controller. In
 non-interactive mode the CLI can emit newline-delimited monitor events. V1 does
@@ -1808,7 +1813,7 @@ not add a helper that brands or casts the encoded keys before Schema sees them.
   appear in the generated tool schema/description, system prompt, tool results,
   status, detail, events, or structured registration logs.
 - Interactive CLI `status` reflects authoritative capacity/tree state,
-  `show <path-or-id>` returns bounded agent detail, and `interrupt <id>`
+  `show <path-or-id>` returns bounded agent detail, and `interrupt <path-or-id>`
   interrupts the selected active agent without stopping unrelated agents.
 
 ### 15.7 Optional live smoke test

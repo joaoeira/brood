@@ -68,8 +68,10 @@ import {
 import {
   buildAgentDetail,
   buildSwarmStatus,
+  resolveAgentReference,
   type AgentDetail,
   type RunLifecycle,
+  StatusInvariantDefect,
   type StatusAgentSource,
   type SwarmStatus,
 } from "./status.js";
@@ -149,7 +151,10 @@ export interface AgentSupervisor {
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
   readonly status: Effect.Effect<SwarmStatus>;
   readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
-  readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
+  readonly interrupt: (
+    reference: string,
+    source: "cli" | "api",
+  ) => Effect.Effect<AgentId, UnknownAgentReference>;
   readonly drain: Effect.Effect<DrainReport>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
   readonly toolPort: ControlToolPort;
@@ -551,16 +556,27 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     ),
   );
 
-  const interrupt = Effect.fn("Brood.Supervisor.interrupt")((id: AgentId, source: "cli" | "api") =>
-    Effect.uninterruptible(
+  const interrupt = Effect.fn("Brood.Supervisor.interrupt")(function* (
+    reference: string,
+    source: "cli" | "api",
+  ) {
+    const state = yield* registry.snapshot;
+    const id = resolveAgentReference(state.agents.map(statusAgentSource), reference);
+    if (id === undefined) {
+      return yield* Effect.fail(new UnknownAgentReference({ reference }));
+    }
+    return yield* Effect.uninterruptible(
       Effect.gen(function* () {
         const reason: InterruptReason = { _tag: "OperatorRequested", source };
-        const requested = yield* registry.requestInterrupt(id, reason);
+        const requested = yield* registry
+          .requestInterrupt(id, reason)
+          .pipe(Effect.catchTag("UnknownAgent", Effect.die));
         if (requested) yield* publishInterruptions([{ agentId: id, reason }]);
         yield* FiberMap.remove(controllers, id);
+        return id;
       }),
-    ),
-  );
+    );
+  });
 
   const shutdownWith = Effect.fn("Brood.Supervisor.shutdownWith")(
     (
@@ -637,7 +653,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     return report;
   })();
 
-  const status = Effect.gen(function* () {
+  const status = Effect.fn("Brood.Supervisor.status")(function* () {
     const state = yield* registry.snapshot;
     const currentLifecycle = yield* Ref.get(lifecycle);
     const currentActiveRuns = yield* Ref.get(activeRuns);
@@ -650,20 +666,31 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       activeRuns: currentActiveRuns,
       agents: state.agents.map(statusAgentSource),
     });
-  });
+  })();
 
   const show = Effect.fn("Brood.Supervisor.show")(function* (reference: string) {
     const state = yield* registry.snapshot;
     const now = yield* Clock.currentTimeMillis;
+    const agents = state.agents.map(statusAgentSource);
+    const id = resolveAgentReference(agents, reference);
+    if (id === undefined) {
+      return yield* Effect.fail(new UnknownAgentReference({ reference }));
+    }
+    const selected = state.agents.find((agent) => agent.id === id);
+    if (selected === undefined) {
+      return yield* Effect.die(
+        new StatusInvariantDefect(`Resolved agent ${id} is missing from the registry snapshot`),
+      );
+    }
     const detail = buildAgentDetail(
       {
         now,
-        agents: state.agents.map(detailAgentSource),
+        agents: agents.map((agent) => (agent.id === id ? detailAgentSource(selected) : agent)),
       },
-      reference,
+      id,
     );
     return detail === undefined
-      ? yield* Effect.fail(new UnknownAgentReference({ reference }))
+      ? yield* Effect.die(new StatusInvariantDefect(`Resolved agent ${id} has no detail`))
       : detail;
   });
 

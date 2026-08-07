@@ -473,10 +473,16 @@ it.effect("operator interruption settles the running agent with the requested so
       const rootId = yield* supervisor.startRoot("coordinate");
       yield* fake.nextOpen;
       yield* fake.nextRun;
-      yield* supervisor.interrupt(rootId, "api");
+      const unknown = yield* supervisor.interrupt("root/missing", "api").pipe(Effect.flip);
+      const interruptedId = yield* supervisor.interrupt("root", "api");
       const outcome = yield* supervisor.awaitOutcome(rootId);
       yield* supervisor.drain;
 
+      expect(unknown).toMatchObject({
+        _tag: "UnknownAgentReference",
+        reference: "root/missing",
+      });
+      expect(interruptedId).toBe(rootId);
       expect(outcome).toEqual({
         _tag: "Interrupted",
         reason: { _tag: "OperatorRequested", source: "api" },

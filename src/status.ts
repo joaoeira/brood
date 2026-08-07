@@ -153,6 +153,16 @@ interface IndexedAgent {
   readonly path: string;
 }
 
+const findIndexedAgent = (
+  indexed: ReadonlyMap<AgentId, IndexedAgent>,
+  reference: string,
+): IndexedAgent | undefined => {
+  for (const candidate of indexed.values()) {
+    if (candidate.source.id === reference || candidate.path === reference) return candidate;
+  }
+  return undefined;
+};
+
 const indexAgents = (
   agents: ReadonlyArray<StatusAgentSource>,
 ): ReadonlyMap<AgentId, IndexedAgent> => {
@@ -247,13 +257,7 @@ export const buildAgentDetail = (
   reference: string,
 ): AgentDetail | undefined => {
   const indexed = indexAgents(input.agents);
-  let selected: IndexedAgent | undefined;
-  for (const candidate of indexed.values()) {
-    if (candidate.source.id === reference || candidate.path === reference) {
-      selected = candidate;
-      break;
-    }
-  }
+  const selected = findIndexedAgent(indexed, reference);
   if (selected === undefined) return undefined;
 
   const agent = selected.source;
@@ -289,6 +293,11 @@ export const buildAgentDetail = (
     ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
   };
 };
+
+export const resolveAgentReference = (
+  agents: ReadonlyArray<StatusAgentSource>,
+  reference: string,
+): AgentId | undefined => findIndexedAgent(indexAgents(agents), reference)?.source.id;
 
 export const formatDuration = (milliseconds: number): string => {
   if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`;

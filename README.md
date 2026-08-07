@@ -13,6 +13,7 @@ The module graph is a DAG rooted in three vocabulary files; every other module i
 | `src/agent.ts`      | Shared vocabulary: identifiers, agent outcomes, the control protocol, every error. Imports nothing from `src/`.         |
 | `src/profiles.ts`   | Model-profile config schemas and the one-time catalogue compilation to resolved Pi models.                              |
 | `src/render.ts`     | Everything a model reads: normalization, code-point truncation, the resume envelope.                                    |
+| `src/status.ts`     | Bounded status/detail projections and the compact human renderers.                                                      |
 | `src/registry.ts`   | The serialized state machine: admission, waits, the command mailbox, terminal settlement, shutdown.                     |
 | `src/pi-adapter.ts` | The only module that talks to Pi: session lifecycle, the prompt bridge, settlement classification, the suspension hook. |
 | `src/tools.ts`      | The `delegate` / `wait_for_agents` tools: TypeBox schemas, input normalization, the injected supervisor port.           |
@@ -50,9 +51,9 @@ When stdin is a terminal, Brood accepts these commands while the run is live:
 ```text
 status
 status --json
-show root/vask
+show root/api
 show agent_<id> --json
-interrupt <agent-id>
+interrupt <agent-path-or-id>
 events on
 events off
 ```
@@ -92,6 +93,8 @@ const result = await Effect.runPromise(program);
 ```
 
 For a live UI or operator, use `makeBroodApplication` inside `Effect.scoped`. It exposes only `run` and a narrow controller with `status`, `show`, `events`, and `interrupt`; the supervisor's agent tools and Pi runtime remain private. `status` is an authoritative bounded record of run state, capacity, state counts, and the canonical agent tree. `show(pathOrId)` is the separate bounded detail view for one agent.
+
+The status redesign intentionally removed the earlier public `snapshot` / `AgentSnapshot` surface; v1 callers should use bounded `status` and `show` instead.
 
 ## Agent protocol
 

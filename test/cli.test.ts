@@ -41,13 +41,14 @@ describe("CLI boundaries", () => {
     expect(() => parseOperatorCommand("show")).toThrow("show <agent-path-or-id>");
   });
 
-  it("decodes operator-entered agent IDs at the Effect boundary", async () => {
-    await expect(
-      Effect.runPromise(decodeOperatorCommand("interrupt not-an-agent")),
-    ).rejects.toThrow("Invalid agent ID");
+  it("accepts either a canonical path or ID as an interrupt reference", async () => {
+    await expect(Effect.runPromise(decodeOperatorCommand("interrupt root/api"))).resolves.toEqual({
+      _tag: "Interrupt",
+      reference: "root/api",
+    });
     await expect(Effect.runPromise(decodeOperatorCommand("interrupt agent_123"))).resolves.toEqual({
       _tag: "Interrupt",
-      agentId: "agent_123",
+      reference: "agent_123",
     });
   });
 
@@ -66,7 +67,7 @@ describe("CLI boundaries", () => {
     });
     expect(parseOperatorCommand("interrupt agent_123")).toEqual({
       _tag: "Interrupt",
-      agentId: "agent_123",
+      reference: "agent_123",
     });
     expect(parseOperatorCommand("events off")).toEqual({ _tag: "Events", enabled: false });
   });
