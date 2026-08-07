@@ -1,9 +1,10 @@
 /* oxlint-disable no-underscore-dangle, vitest/no-standalone-expect -- Effect variants use `_tag`; `it.effect` is not recognized by the Vitest lint plugin. */
 import { it } from "@effect/vitest";
-import { Effect, Fiber, Option } from "effect";
+import { Cause, Effect, Exit, Fiber, Option } from "effect";
 import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import {
+  PiRunError,
   makeAgentId,
   makeAgentName,
   makeProfileName,
@@ -42,9 +43,9 @@ const deterministicIds = () => {
   };
 };
 
-it.effect("admits exactly maxAgents and terminal tombstones do not replenish the budget", () =>
+it.effect("admits exactly maxAgentAdmissions and terminal tombstones never replenish", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 3, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -73,17 +74,21 @@ it.effect("admits exactly maxAgents and terminal tombstones do not replenish the
     );
     const snapshot = yield* registry.snapshot;
 
-    expect(rejected._tag).toBe("DelegateRejected");
-    if (rejected._tag === "DelegateRejected") {
-      expect(rejected.reason).toBe("AgentLimitExceeded");
+    expect(rejected._tag).toBe("AgentAdmissionLimitExceeded");
+    if (rejected._tag === "AgentAdmissionLimitExceeded") {
+      expect(rejected.requested).toBe(1);
+      expect(rejected.capacity).toEqual({ limit: 3, used: 3, remaining: 0 });
+      expect(rejected.message).toContain("no agents were created");
+      expect(rejected.message).toContain("Continue without delegation.");
     }
     expect(snapshot.agents).toHaveLength(3);
+    expect(snapshot.admissionCapacity).toEqual({ limit: 3, used: 3, remaining: 0 });
   }),
 );
 
 it.effect("keeps completed child names as tombstones", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 4, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -115,7 +120,7 @@ it.effect("keeps completed child names as tombstones", () =>
 
 it.effect("rejects a duplicate-name batch without creating partial records", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -141,7 +146,7 @@ it.effect("rejects a duplicate-name batch without creating partial records", () 
 
 it.effect("rejects a control invocation already committed by delegation", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -178,7 +183,7 @@ it.effect("rejects a control invocation already committed by delegation", () =>
 
 it.effect("resumes once when a child completes between wait planning and activation", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -213,7 +218,7 @@ it.effect("resumes once when a child completes between wait planning and activat
 
 it.effect("resumes once when a child completes after wait activation", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -249,7 +254,7 @@ it.effect("resumes once when a child completes after wait activation", () =>
 
 it.effect("returns terminal direct children immediately without leaving a stale plan", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -278,7 +283,7 @@ it.effect("returns terminal direct children immediately without leaving a stale 
 
 it.effect("aggregates every planned wait and deduplicates direct-child targets", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -322,7 +327,7 @@ it.effect("aggregates every planned wait and deduplicates direct-child targets",
 
 it.effect("shares duplicate invocation detection between delegation and explicit waits", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 8, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 8, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -353,7 +358,7 @@ it.effect("shares duplicate invocation detection between delegation and explicit
 
 it.effect("settles terminal outcome awaiters exactly once", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -376,7 +381,7 @@ it.effect("settles terminal outcome awaiters exactly once", () =>
 
 it.effect("tracks pending controller installation independently of terminal state", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -396,7 +401,7 @@ it.effect("tracks pending controller installation independently of terminal stat
 
 it.effect("preserves the first interruption request and wakes the mailbox", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -433,7 +438,7 @@ it.effect("preserves the first interruption request and wakes the mailbox", () =
 
 it.effect("shutdown stops admission and pending-installation settlement reaches quiescence", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 4, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
       goal: "coordinate",
@@ -477,7 +482,7 @@ it.effect("shutdown stops admission and pending-installation settlement reaches 
 
 it.effect("timestamps registry transitions with the Effect clock", () =>
   Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
     yield* TestClock.setTime(1_000);
     const root = yield* registry.registerRoot({
       name: makeAgentName("root"),
@@ -490,5 +495,166 @@ it.effect("timestamps registry transitions with the Effect clock", () =>
 
     expect(snapshot.agents[0]?.createdAt).toBe(1_000);
     expect(snapshot.agents[0]?.updatedAt).toBe(2_000);
+  }),
+);
+
+it.effect("reports authoritative capacity and returns it from each batch commit", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
+    expect(yield* registry.admissionCapacity).toEqual({ limit: 4, used: 0, remaining: 4 });
+
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    expect(yield* registry.admissionCapacity).toEqual({ limit: 4, used: 1, remaining: 3 });
+
+    const admitted = yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-capacity"),
+      children: [
+        { name: makeAgentName("api"), goal: "build api", profile },
+        { name: makeAgentName("tests"), goal: "build tests", profile },
+      ],
+      wait: "none",
+    });
+    expect(admitted.capacityAfterCommit).toEqual({ limit: 4, used: 3, remaining: 1 });
+
+    yield* registry.settle(admitted.children[0]!.id, completed(admitted.children[0]!.id));
+    yield* registry.settle(admitted.children[1]!.id, {
+      _tag: "Failed",
+      failure: {
+        _tag: "AgentRunFailed",
+        error: new PiRunError({ agentId: admitted.children[1]!.id, message: "boom" }),
+      },
+    });
+    yield* registry.settle(root.id, {
+      _tag: "Interrupted",
+      reason: { _tag: "OperatorRequested", source: "api" },
+    });
+    expect(yield* registry.admissionCapacity).toEqual({ limit: 4, used: 3, remaining: 1 });
+  }),
+);
+
+it.effect("keeps a limit-rejected invocation retryable with a fitting batch", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const invocationId = makeToolInvocationId("delegate-retry");
+
+    const rejected = yield* Effect.flip(
+      registry.registerBatch({
+        parentId: root.id,
+        invocationId,
+        children: [
+          { name: makeAgentName("a"), goal: "a", profile },
+          { name: makeAgentName("b"), goal: "b", profile },
+          { name: makeAgentName("c"), goal: "c", profile },
+        ],
+        wait: "none",
+      }),
+    );
+    const afterRejection = yield* registry.snapshot;
+
+    expect(rejected._tag).toBe("AgentAdmissionLimitExceeded");
+    if (rejected._tag === "AgentAdmissionLimitExceeded") {
+      expect(rejected.requested).toBe(3);
+      expect(rejected.capacity).toEqual({ limit: 3, used: 1, remaining: 2 });
+      expect(rejected.message).toContain("Re-plan with at most 2 tasks");
+    }
+    expect(afterRejection.agents).toHaveLength(1);
+
+    const retried = yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId,
+      children: [
+        { name: makeAgentName("a"), goal: "a", profile },
+        { name: makeAgentName("b"), goal: "b", profile },
+      ],
+      wait: "none",
+    });
+    expect(retried.capacityAfterCommit).toEqual({ limit: 3, used: 3, remaining: 0 });
+  }),
+);
+
+it.effect("a serialized transition admits one whole batch when two compete for capacity", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const attempt = (tag: string, names: readonly [string, string]) =>
+      Effect.exit(
+        registry.registerBatch({
+          parentId: root.id,
+          invocationId: makeToolInvocationId(tag),
+          children: names.map((name) => ({ name: makeAgentName(name), goal: name, profile })),
+          wait: "none",
+        }),
+      );
+
+    // Note: the registry's check-and-commit is one synchronous Ref.modify with
+    // no yield point, so these attempts serialize under every schedule; this
+    // documents the structural guarantee rather than exercising a real race.
+    const results = yield* Effect.all(
+      [attempt("delegate-a", ["a1", "a2"]), attempt("delegate-b", ["b1", "b2"])],
+      { concurrency: "unbounded" },
+    );
+    const snapshot = yield* registry.snapshot;
+
+    expect(results.filter(Exit.isSuccess)).toHaveLength(1);
+    const failure = results.flatMap((exit) =>
+      Exit.isFailure(exit) ? [Cause.findErrorOption(exit.cause)] : [],
+    )[0];
+    expect(failure !== undefined && Option.isSome(failure)).toBe(true);
+    if (failure !== undefined && Option.isSome(failure)) {
+      const error = failure.value;
+      expect(error._tag).toBe("AgentAdmissionLimitExceeded");
+      if (error._tag === "AgentAdmissionLimitExceeded") {
+        expect(error.requested).toBe(2);
+        expect(error.capacity).toEqual({ limit: 3, used: 3, remaining: 0 });
+      }
+    }
+    const names = snapshot.agents.map(({ name }) => name).sort();
+    expect([
+      ["a1", "a2", "root"],
+      ["b1", "b2", "root"],
+    ]).toContainEqual(names);
+    expect(snapshot.admissionCapacity).toEqual({ limit: 3, used: 3, remaining: 0 });
+  }),
+);
+
+it.effect("concurrent fitting batches serialize their commits and cannot over-admit", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 5, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const attempt = (tag: string, names: readonly [string, string]) =>
+      registry.registerBatch({
+        parentId: root.id,
+        invocationId: makeToolInvocationId(tag),
+        children: names.map((name) => ({ name: makeAgentName(name), goal: name, profile })),
+        wait: "none",
+      });
+
+    const [first, second] = yield* Effect.all(
+      [attempt("delegate-a", ["a1", "a2"]), attempt("delegate-b", ["b1", "b2"])],
+      { concurrency: "unbounded" },
+    );
+    const snapshot = yield* registry.snapshot;
+
+    const observed = [first.capacityAfterCommit.used, second.capacityAfterCommit.used].sort();
+    expect(observed).toEqual([3, 5]);
+    expect(snapshot.admissionCapacity).toEqual({ limit: 5, used: 5, remaining: 0 });
   }),
 );

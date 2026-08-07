@@ -39,7 +39,7 @@ export const testModelLookup = (): ExactModelLookup => ({
 type SupervisorTuning = Pick<
   SupervisorOptions,
   | "maxConcurrency"
-  | "maxAgents"
+  | "maxAgentAdmissions"
   | "maxAgentResultChars"
   | "maxFailureMessageChars"
   | "maxResumePromptChars"
@@ -50,7 +50,7 @@ export const testSupervisorConfig = (
   overrides: Partial<SupervisorTuning> = {},
 ): SupervisorTuning => ({
   maxConcurrency: 1,
-  maxAgents: 8,
+  maxAgentAdmissions: 8,
   maxAgentResultChars: 12_000,
   maxFailureMessageChars: 2_000,
   maxResumePromptChars: 48_000,

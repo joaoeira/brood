@@ -58,7 +58,7 @@ events on
 events off
 ```
 
-With redirected stdin, monitoring and the terminal result are written as newline-delimited JSON. Pass `--events` to show events immediately in an interactive terminal. Ctrl-C interrupts the whole scoped run and closes active sessions.
+Pass `--instructions-file charter.md` to supply an optional operator charter inherited unchanged by every agent. With redirected stdin, monitoring and the terminal result are written as newline-delimited JSON. Pass `--events` to show events immediately in an interactive terminal. Ctrl-C interrupts the whole scoped run and closes active sessions.
 
 ## Programmatic API
 
@@ -66,28 +66,34 @@ With redirected stdin, monitoring and the terminal result are written as newline
 import { Effect } from "effect";
 import { runBrood } from "brood";
 
-const program = runBrood("Implement the feature and verify it", {
-  workspacePath: "/absolute/path/to/workspace",
-  stateDirectory: "/absolute/path/to/brood-state",
-  piAgentDirectory: "/absolute/path/to/brood-state/pi-agent",
-  sessionDirectory: "/absolute/path/to/brood-state/sessions",
-  maxConcurrency: 4,
-  defaultProfile: "worker",
-  rootProfile: "coordinator",
-  profiles: {
-    coordinator: {
-      description: "Plans, delegates, and synthesizes",
-      provider: "anthropic",
-      model: "claude-sonnet-4-5",
-      thinkingLevel: "high",
-    },
-    worker: {
-      description: "General implementation work",
-      provider: "anthropic",
-      model: "claude-sonnet-4-5",
+const program = runBrood(
+  {
+    goal: "Implement the feature and verify it",
+    instructions: "Preserve admission slack for integration and review.",
+  },
+  {
+    workspacePath: "/absolute/path/to/workspace",
+    stateDirectory: "/absolute/path/to/brood-state",
+    piAgentDirectory: "/absolute/path/to/brood-state/pi-agent",
+    sessionDirectory: "/absolute/path/to/brood-state/sessions",
+    maxConcurrency: 4,
+    defaultProfile: "worker",
+    rootProfile: "coordinator",
+    profiles: {
+      coordinator: {
+        description: "Plans, delegates, and synthesizes",
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        thinkingLevel: "high",
+      },
+      worker: {
+        description: "General implementation work",
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+      },
     },
   },
-});
+);
 
 const result = await Effect.runPromise(program);
 ```
@@ -98,7 +104,7 @@ The status redesign intentionally removed the earlier public `snapshot` / `Agent
 
 ## Agent protocol
 
-Agents create one or many children atomically with `delegate({ tasks, wait })`. `wait` defaults to `all`; `none` is explicit fire-and-forget. `wait_for_agents` waits for named direct children created in an earlier turn. Names are unique for a parent's lifetime, admission is bounded by `maxAgents`, and one invalid task rejects the whole batch.
+Agents create one or many children atomically with `delegate({ tasks, wait })`. `wait` defaults to `all`; `none` is explicit fire-and-forget. `wait_for_agents` waits for named direct children created in an earlier turn. Names are unique for a parent's lifetime, admission is bounded by `maxAgentAdmissions`, and one invalid task rejects the whole batch. Every agent sees the run's admission capacity before each model run and after each delegation; capacity never replenishes, and a batch that does not fit is rejected whole with the exact remaining count.
 
 Suspension happens at the end of the current assistant turn after Pi has persisted every tool result. A waiting controller releases its global run permit. When all dependencies settle, the same Pi session resumes with a bounded, delimiter-neutralized outcome envelope. Child failures and interruptions are data, so a parent never hangs waiting for a failed child.
 
@@ -108,7 +114,7 @@ All agents share one workspace. Brood deliberately provides no worktrees, file o
 
 Brood does not recover a live swarm after process failure, steer a model mid-run, enforce a depth or monetary budget, isolate the shared workspace, restrict profiles by role, switch models within a session, or cancel descendants when a parent fails. It also disables Pi's mutable workspace context-file loading; repository-specific instructions should be part of the root goal until Brood can snapshot them once at run start. The provenance tree and dynamic wait relationship are intentionally separate; orphaned agents run to completion and are included in drain.
 
-Configured profiles have equal tools and delegation power. `maxAgents` is a total admission budget for the run, including terminal agents, while `maxConcurrency` limits only simultaneous Pi runs. Monitoring events are bounded and lossy; status is authoritative and Pi JSONL is the transcript audit source.
+Configured profiles have equal tools and delegation power. `maxAgentAdmissions` is a total admission budget for the run, including terminal agents, while `maxConcurrency` limits only simultaneous Pi runs. Optional run `instructions` form a bounded operator charter inherited unchanged by every agent, subordinate only to Brood's fixed system contract. Monitoring events are bounded and lossy; status is authoritative and Pi JSONL is the transcript audit source.
 
 ## Development
 
@@ -119,4 +125,4 @@ pnpm check
 pnpm build
 ```
 
-The default suite is deterministic and offline. Set `BROOD_LIVE_CONFIG=/absolute/path/to/brood.json` and run `pnpm test:live` for the opt-in provider smoke test. Architecture, protocol invariants, test cases, and implementation order are documented in [`plan.md`](./plan.md); pinned Pi observations are in [`docs/phase-0-pi-compatibility.md`](./docs/phase-0-pi-compatibility.md).
+The default suite is deterministic and offline. Set `BROOD_LIVE_CONFIG=/absolute/path/to/brood.json` and run `pnpm test:live` for the opt-in provider smoke test. Architecture, protocol invariants, test cases, and implementation order are documented in [`plan.md`](./plan.md); pinned Pi observations are in [`docs/phase-0-pi-compatibility.md`](./docs/phase-0-pi-compatibility.md). Design records for shipped and pending changes live under [`docs/proposals/`](./docs/proposals/); each carries its own status line. The most recent is [admission awareness and inherited run instructions](./docs/proposals/admission-awareness.md) (implemented).

@@ -97,13 +97,13 @@ it("runs a real offline root-child-grandchild swarm through Pi at concurrency on
             catalogue,
             piAdapter: adapter,
             maxConcurrency: 1,
-            maxAgents: 8,
+            maxAgentAdmissions: 8,
             maxAgentResultChars: 12_000,
             maxFailureMessageChars: 2_000,
             maxResumePromptChars: 48_000,
             drainTimeoutMillis: 60_000,
           });
-          const rootId = yield* supervisor.startRoot("coordinate recursively");
+          const rootId = yield* supervisor.startRoot({ goal: "coordinate recursively" });
           const rootOutcome = yield* supervisor.awaitOutcome(rootId);
           const drain = yield* supervisor.drain;
           const status = yield* supervisor.status;

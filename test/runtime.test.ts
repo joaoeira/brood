@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { mkdtemp, mkdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Duration, Effect } from "effect";
-import { buildBroodRuntime, decodeBroodConfig, type BroodConfigEncoded } from "../src/runtime.js";
+import { minimumResumePromptChars } from "../src/render.js";
+import {
+  buildBroodRuntime,
+  decodeBroodConfig,
+  decodeBroodConfigUnknown,
+  type BroodConfigEncoded,
+} from "../src/runtime.js";
 
 let base: string;
 
@@ -36,7 +42,7 @@ const validConfig = (): BroodConfigEncoded => ({
 describe("Brood runtime configuration", () => {
   it("decodes every programmatic input through defaults and durations", async () => {
     const config = await Effect.runPromise(decodeBroodConfig(validConfig()));
-    expect(config.maxAgents).toBe(128);
+    expect(config.maxAgentAdmissions).toBe(128);
     expect(config.maxAgentResultChars).toBe(12_000);
     expect(config.maxProfileHelpChars).toBe(4_000);
     expect(Duration.toMillis(config.drainTimeout)).toBe(600_000);
@@ -60,11 +66,40 @@ describe("Brood runtime configuration", () => {
     });
 
     await expect(
-      Effect.runPromise(decodeBroodConfig({ ...validConfig(), maxAgents: 1, maxConcurrency: 2 })),
+      Effect.runPromise(
+        decodeBroodConfig({ ...validConfig(), maxAgentAdmissions: 1, maxConcurrency: 2 }),
+      ),
     ).rejects.toMatchObject({
       _tag: "BroodConfigError",
       reason: "DecodeFailed",
       path: "maxConcurrency",
+      message: expect.stringContaining("maxAgentAdmissions"),
+    });
+  });
+
+  it("derives the resume-prompt minimum from maxAgentAdmissions behaviorally", async () => {
+    const budgetForOne = minimumResumePromptChars(1);
+    const small = await Effect.runPromise(
+      decodeBroodConfig({
+        ...validConfig(),
+        maxConcurrency: 1,
+        maxAgentAdmissions: 1,
+        maxResumePromptChars: budgetForOne,
+      }),
+    );
+    expect(small.maxResumePromptChars).toBe(budgetForOne);
+
+    await expect(
+      Effect.runPromise(
+        decodeBroodConfigUnknown({
+          ...validConfig(),
+          maxAgentAdmissions: 100,
+          maxResumePromptChars: budgetForOne,
+        }),
+      ),
+    ).rejects.toMatchObject({
+      path: "maxResumePromptChars",
+      message: expect.stringContaining("maxAgentAdmissions=100"),
     });
   });
 
@@ -136,5 +171,37 @@ describe("Brood runtime configuration", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe("legacy maxAgents tombstone", () => {
+  it("rejects the legacy key with the rename message at its path", async () => {
+    const raw: unknown = { ...validConfig(), maxAgents: 50 };
+    const error = await Effect.runPromise(Effect.flip(decodeBroodConfigUnknown(raw)));
+
+    expect(error._tag).toBe("BroodConfigError");
+    expect(error.reason).toBe("DecodeFailed");
+    expect(error.path).toBe("maxAgents");
+    expect(error.message).toContain("`maxAgents` was renamed to `maxAgentAdmissions`");
+  });
+
+  it("documents the provider-erasure gap: a null legacy value decodes as absent", async () => {
+    const raw: unknown = { ...validConfig(), maxAgents: null };
+    const config = await Effect.runPromise(decodeBroodConfigUnknown(raw));
+
+    expect(config.maxAgentAdmissions).toBe(128);
+  });
+
+  it("rejects the legacy key at compile time for programmatic callers", () => {
+    // @ts-expect-error the legacy maxAgents key is typed `never` in BroodConfigEncoded
+    const rejected = { ...validConfig(), maxAgents: 50 } satisfies BroodConfigEncoded;
+    void rejected;
+    const accepted = validConfig() satisfies BroodConfigEncoded;
+    expect(accepted.maxConcurrency).toBe(2);
+  });
+
+  it("defaults maxRunInstructionsChars to 4000 code points", async () => {
+    const config = await Effect.runPromise(decodeBroodConfig(validConfig()));
+    expect(config.maxRunInstructionsChars).toBe(4_000);
   });
 });

@@ -15,9 +15,9 @@ describe.skipIf(configPath === undefined)("live provider smoke", () => {
         Effect.scoped(
           makeBroodApplicationFromUnknown(raw).pipe(
             Effect.flatMap((application) =>
-              application.run(
-                "Complete a tiny task. Delegate one child, wait for it, and summarize the result.",
-              ),
+              application.run({
+                goal: "Complete a tiny task. Delegate one child, wait for it, and summarize the result.",
+              }),
             ),
           ),
         ),

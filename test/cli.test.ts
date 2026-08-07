@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { Effect } from "effect";
 import {
@@ -10,9 +13,11 @@ import {
 import {
   decodeOperatorCommand,
   exitCodeForSignal,
+  loadInstructions,
   parseCliArguments,
   parseOperatorCommand,
 } from "../src/cli.js";
+import { normalizeRunRequest } from "../src/main.js";
 import {
   formatAgentDetail,
   formatSwarmStatus,
@@ -78,7 +83,7 @@ describe("CLI boundaries", () => {
       state: "running",
       elapsedMillis: 2_500,
       capacity: {
-        agents: { admitted: 2, limit: 8, remaining: 6 },
+        admissions: { limit: 8, used: 2, remaining: 6 },
         runs: { active: 1, limit: 2, available: 1 },
       },
       counts: {
@@ -113,7 +118,8 @@ describe("CLI boundaries", () => {
 
     const rendered = formatSwarmStatus(status);
     expect(rendered).toContain("RUNNING  2.5s");
-    expect(rendered).toContain("Agents 2/8 (6 remaining)");
+    expect(rendered).toContain("Admissions 2/8 (6 remaining)");
+    expect(rendered).toContain("Active runs 1/2 (1 available)");
     expect(rendered).toContain("root/vask  running  1.3s");
     expect(rendered).toContain("→ root/vask");
     expect(rendered).not.toContain("agent_123");
@@ -172,5 +178,64 @@ describe("CLI boundaries", () => {
   it("gives an operator a useful error for an unknown show target", () => {
     const error = new UnknownAgentReference({ reference: "root/typo" });
     expect(error.message).toBe("Unknown agent reference: root/typo");
+  });
+});
+
+describe("instructions file argument", () => {
+  it("parses --instructions-file and resolves its path", () => {
+    const parsed = parseCliArguments([
+      "--config",
+      "brood.json",
+      "--instructions-file",
+      "charter.md",
+      "--goal",
+      "go",
+    ]);
+    expect(parsed.instructionsFile).toBe(resolve("charter.md"));
+  });
+
+  it("treats a missing --instructions-file value as a usage error", () => {
+    expect(() =>
+      parseCliArguments(["--config", "brood.json", "--instructions-file", "--goal", "go"]),
+    ).toThrow("Missing value for --instructions-file");
+  });
+
+  it("leaves instructionsFile undefined when the option is absent", () => {
+    const parsed = parseCliArguments(["--config", "brood.json", "--goal", "go"]);
+    expect(parsed.instructionsFile).toBeUndefined();
+  });
+});
+
+describe("instructions file loading", () => {
+  it("fails a missing charter file as a CLI input error naming the path", async () => {
+    const missing = join(tmpdir(), `brood-cli-missing-${process.pid}`, "absent.md");
+    const error = await Effect.runPromise(Effect.flip(loadInstructions(missing)));
+
+    expect(error._tag).toBe("CliInputError");
+    expect(error.message).toContain("Unable to read instructions file");
+    expect(error.message).toContain(missing);
+    expect(error.message).not.toContain("    at ");
+  });
+
+  it("returns file contents verbatim so the shared gate judges emptiness and bounds", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "brood-cli-instructions-"));
+    try {
+      const path = join(directory, "charter.md");
+      await writeFile(path, "  \n", "utf8");
+      const contents = await Effect.runPromise(loadInstructions(path));
+      // No CLI-local emptiness rule: whitespace content flows to
+      // normalizeRunRequest, which rejects it as InvalidInstructions.
+      expect(contents).toBe("  \n");
+      const rejected = await Effect.runPromise(
+        Effect.flip(normalizeRunRequest({ goal: "go", instructions: contents ?? "" }, 4_000)),
+      );
+      expect(rejected.reason).toBe("InvalidInstructions");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("passes absent instruction paths through as undefined", async () => {
+    expect(await Effect.runPromise(loadInstructions(undefined))).toBeUndefined();
   });
 });

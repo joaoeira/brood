@@ -9,7 +9,13 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Stream } from "effect";
-import { AgentFailed, BroodConfigError, RootInterrupted, RootStartError } from "./agent.js";
+import {
+  AgentFailed,
+  BroodConfigError,
+  RootInterrupted,
+  RootStartError,
+  type BroodRunRequestEncoded,
+} from "./agent.js";
 import { makeBroodApplicationFromUnknown, type BroodApplication } from "./main.js";
 import { formatAgentDetail, formatSwarmStatus } from "./status.js";
 
@@ -17,6 +23,7 @@ export interface CliArguments {
   readonly configPath: string;
   readonly goal: string;
   readonly showEvents: boolean;
+  readonly instructionsFile: string | undefined;
 }
 
 type ParsedOperatorCommand =
@@ -31,12 +38,13 @@ class CliInputError extends Data.TaggedError("CliInputError")<{
 }> {}
 
 const usage =
-  'Usage: brood --config <brood.json> [--events] --goal "<goal>"\n' +
-  "       brood --config <brood.json> [--events] <goal...>";
+  'Usage: brood --config <brood.json> [--events] [--instructions-file <charter.md>] --goal "<goal>"\n' +
+  "       brood --config <brood.json> [--events] [--instructions-file <charter.md>] <goal...>";
 
 export const parseCliArguments = (arguments_: ReadonlyArray<string>): CliArguments => {
   let configPath: string | undefined;
   let explicitGoal: string | undefined;
+  let instructionsFile: string | undefined;
   let showEvents = false;
   const positional: Array<string> = [];
 
@@ -48,6 +56,13 @@ export const parseCliArguments = (arguments_: ReadonlyArray<string>): CliArgumen
         throw new CliInputError({ message: `Missing value for ${argument}.\n${usage}` });
       }
       configPath = value;
+      index += 1;
+    } else if (argument === "--instructions-file") {
+      const value = arguments_[index + 1];
+      if (value === undefined || value.startsWith("-")) {
+        throw new CliInputError({ message: `Missing value for ${argument}.\n${usage}` });
+      }
+      instructionsFile = value;
       index += 1;
     } else if (argument === "--goal" || argument === "-g") {
       const value = arguments_[index + 1];
@@ -67,12 +82,21 @@ export const parseCliArguments = (arguments_: ReadonlyArray<string>): CliArgumen
     }
   }
 
-  const goal = (explicitGoal ?? positional.join(" ")).trim();
   if (configPath === undefined || configPath.trim() === "") {
     throw new CliInputError({ message: `Missing --config.\n${usage}` });
   }
-  if (goal === "") throw new CliInputError({ message: `Missing goal.\n${usage}` });
-  return { configPath: resolve(configPath), goal, showEvents };
+  // Presence only: goal *content* (emptiness, whitespace, control characters)
+  // is judged by normalizeRunRequest, the single semantic gate.
+  if (explicitGoal === undefined && positional.length === 0) {
+    throw new CliInputError({ message: `Missing goal.\n${usage}` });
+  }
+  const goal = explicitGoal ?? positional.join(" ");
+  return {
+    configPath: resolve(configPath),
+    goal,
+    showEvents,
+    instructionsFile: instructionsFile === undefined ? undefined : resolve(instructionsFile),
+  };
 };
 
 export const parseOperatorCommand = (line: string): ParsedOperatorCommand => {
@@ -227,7 +251,27 @@ const executeCommand = (
     }
   }).pipe(Effect.catch((cause) => writeMessage(causeMessage(cause))));
 
-const runApplication = (application: BroodApplication, arguments_: CliArguments) =>
+/** Reads the operator charter once before the run starts. File-read failures
+ * are CLI input errors; the contents pass through exactly the same request
+ * normalization as the programmatic API — no second decoder. */
+export const loadInstructions = (
+  path: string | undefined,
+): Effect.Effect<string | undefined, CliInputError> =>
+  path === undefined
+    ? Effect.succeed(undefined)
+    : Effect.tryPromise({
+        try: () => readFile(path, "utf8"),
+        catch: (cause) =>
+          new CliInputError({
+            message: `Unable to read instructions file ${path}: ${causeMessage(cause)}`,
+          }),
+      });
+
+const runApplication = (
+  application: BroodApplication,
+  arguments_: CliArguments,
+  request: BroodRunRequestEncoded,
+) =>
   Effect.gen(function* () {
     const interactive = process.stdin.isTTY === true;
     const eventDisplay = yield* Ref.make(!interactive || arguments_.showEvents);
@@ -252,7 +296,7 @@ const runApplication = (application: BroodApplication, arguments_: CliArguments)
         Effect.forkScoped,
       );
     }
-    const result = yield* application.run(arguments_.goal);
+    const result = yield* application.run(request);
     yield* writeJson({ type: "completed", result });
     return result;
   });
@@ -270,8 +314,12 @@ export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown
             : new CliInputError({ message: causeMessage(cause) }),
       });
       const rawConfig = yield* loadConfig(parsed.configPath);
+      const instructions = yield* loadInstructions(parsed.instructionsFile);
       const application = yield* makeBroodApplicationFromUnknown(rawConfig);
-      return yield* runApplication(application, parsed);
+      return yield* runApplication(application, parsed, {
+        goal: parsed.goal,
+        ...(instructions === undefined ? {} : { instructions }),
+      });
     }),
   );
 
@@ -293,7 +341,12 @@ const matchPublicFailure = Match.type<CliFailure>().pipe(
     message: error.message,
     path: error.path,
   })),
-  Match.tag("RootStartError", "CliInputError", (error) => ({
+  Match.tag("RootStartError", (error) => ({
+    code: error._tag,
+    reason: error.reason,
+    message: error.message,
+  })),
+  Match.tag("CliInputError", (error) => ({
     code: error._tag,
     message: error.message,
   })),

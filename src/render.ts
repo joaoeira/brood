@@ -7,6 +7,7 @@
  * from a resume payload — bodies shrink before headers do.
  */
 import type {
+  AgentAdmissionCapacity,
   AgentCommand,
   AgentFailure,
   AgentFailureSummary,
@@ -21,11 +22,10 @@ import type {
 export const TRUNCATION_SENTINEL = "\n[truncated by Brood]";
 export const MIN_BOUNDED_TEXT_CHARS = Array.from(TRUNCATION_SENTINEL).length;
 export const DEFAULT_MAX_FAILURE_MESSAGE_CHARS = 2_000;
-export const minimumResumePromptChars = (maxAgents: number): number => 512 + maxAgents * 320;
 
-const codePointLength = (value: string): number => Array.from(value).length;
+export const codePointLength = (value: string): number => Array.from(value).length;
 
-const normalizeText = (value: string): string =>
+export const normalizeText = (value: string): string =>
   value
     .replace(/\r\n?/g, "\n")
     /* oxlint-disable-next-line no-control-regex -- remove unsafe control text at a trust boundary. */
@@ -139,6 +139,62 @@ export const dependencyOutcomeFromAgent = (
 
 const escapeXmlText = (value: string): string =>
   value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// ── Runtime envelope and run instructions ───────────────────────────────────
+// The envelope wording is part of the behavior: it must state that the pool is
+// global, consumption is irreversible, unused capacity has option value, and a
+// snapshot reserves nothing. Tests assert on this exact text.
+
+export const renderRuntimeEnvelope = (capacity: AgentAdmissionCapacity): string =>
+  [
+    '<brood_runtime version="1">',
+    `  <agent_admissions limit="${capacity.limit}" used="${capacity.used}" remaining="${capacity.remaining}" />`,
+    "  <admission_semantics>",
+    "    Admissions are shared by the entire swarm and never replenish.",
+    "    The admission limit is a safety ceiling, not a target.",
+    "    Unused admissions preserve options for later discoveries.",
+    "    Remaining capacity can only decrease after this snapshot.",
+    "    Only a successful delegate call commits admissions.",
+    "  </admission_semantics>",
+    "</brood_runtime>",
+  ].join("\n");
+
+const ENVELOPE_SEPARATOR = "\n\n";
+
+// Worst-case prefix size, derived from the real renderer so the bound and the
+// text cannot drift apart. Capacity values are safe integers by schema.
+export const MAX_RUNTIME_ENVELOPE_CHARS = codePointLength(
+  renderRuntimeEnvelope({
+    limit: Number.MAX_SAFE_INTEGER,
+    used: Number.MAX_SAFE_INTEGER,
+    remaining: Number.MAX_SAFE_INTEGER,
+  }) + ENVELOPE_SEPARATOR,
+);
+
+export const minimumResumePromptChars = (maxAgentAdmissions: number): number =>
+  512 + maxAgentAdmissions * 320 + MAX_RUNTIME_ENVELOPE_CHARS;
+
+/** One agent-facing prompt: fresh capacity envelope, then the rendered command.
+ * On a resume the envelope counts toward `maxResumePromptChars` and the
+ * dependency bodies shrink before it does; an initial goal is not budgeted
+ * here. The envelope is never truncated independently because that could
+ * separate the numbers from their semantics. */
+export const renderAgentPrompt = (
+  command: AgentCommand,
+  capacity: AgentAdmissionCapacity,
+  maxResumePromptChars: number,
+): string => {
+  const prefix = `${renderRuntimeEnvelope(capacity)}${ENVELOPE_SEPARATOR}`;
+  return `${prefix}${renderAgentCommand(command, maxResumePromptChars - codePointLength(prefix))}`;
+};
+
+export const renderRunInstructions = (instructions: string): string =>
+  [
+    "<brood_run_instructions>",
+    // normalizeText is idempotent defense in depth, matching the goal path.
+    escapeXmlText(normalizeText(instructions)),
+    "</brood_run_instructions>",
+  ].join("\n");
 
 const escapeXmlAttribute = (value: string): string =>
   escapeXmlText(value).replace(/"/g, "&quot;").replace(/'/g, "&apos;");

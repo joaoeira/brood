@@ -2,7 +2,7 @@ import { Cause, Effect, Exit } from "effect";
 import { describe, expect, it } from "vitest";
 import { makeAgentId, type AgentOutcome, type DrainReport } from "../src/agent.js";
 import { normalizeAgentResult } from "../src/render.js";
-import { interpretRootOutcome } from "../src/main.js";
+import { interpretRootOutcome, normalizeRunRequest, runBrood } from "../src/main.js";
 
 const drain: DrainReport = {
   timedOut: false,
@@ -52,4 +52,50 @@ describe("root outcome interpretation", () => {
       },
     });
   });
+});
+
+describe("run request normalization", () => {
+  it("rejects an empty normalized goal with InvalidGoal", async () => {
+    const error = await Effect.runPromise(
+      Effect.flip(normalizeRunRequest({ goal: " \r\n " }, 4_000)),
+    );
+    expect(error._tag).toBe("RootStartError");
+    expect(error.reason).toBe("InvalidGoal");
+  });
+
+  it("normalizes line endings and trims while treating absent instructions as valid", async () => {
+    const request = await Effect.runPromise(
+      normalizeRunRequest({ goal: "build\r\nthe wiki " }, 4_000),
+    );
+    expect(request).toEqual({ goal: "build\nthe wiki" });
+  });
+
+  it("rejects explicitly empty instructions with InvalidInstructions", async () => {
+    const error = await Effect.runPromise(
+      Effect.flip(normalizeRunRequest({ goal: "go", instructions: "  \n " }, 4_000)),
+    );
+    expect(error.reason).toBe("InvalidInstructions");
+  });
+
+  it("counts instructions in Unicode code points and fails one over without truncation", async () => {
+    const exact = await Effect.runPromise(
+      normalizeRunRequest({ goal: "go", instructions: "\u{1F600}".repeat(10) }, 10),
+    );
+    expect(exact.instructions).toBe("\u{1F600}".repeat(10));
+
+    const over = await Effect.runPromise(
+      Effect.flip(normalizeRunRequest({ goal: "go", instructions: "\u{1F600}".repeat(11) }, 10)),
+    );
+    expect(over.reason).toBe("InvalidInstructions");
+    expect(over.message).toContain("11 Unicode code points");
+    expect(over.message).toContain("maximum is 10");
+  });
+});
+
+it("no longer accepts a bare string as a programmatic run request", () => {
+  // @ts-expect-error string goals were replaced by the object-shaped request
+  const invalid: Parameters<typeof runBrood>[0] = "goal";
+  void invalid;
+  const valid: Parameters<typeof runBrood>[0] = { goal: "goal" };
+  expect(valid.goal).toBe("goal");
 });

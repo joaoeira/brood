@@ -7,15 +7,22 @@ import { Duration, Effect, References, type PubSub, type Scope } from "effect";
 import {
   AgentFailed,
   RootInterrupted,
+  RootStartError,
   type AgentId,
   type AgentOutcome,
   type BroodResult,
   type BroodConfigError,
+  type BroodRunRequest,
+  type BroodRunRequestEncoded,
   type DrainReport,
-  type RootStartError,
   type UnknownAgentReference,
 } from "./agent.js";
-import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, summarizeAgentFailure } from "./render.js";
+import {
+  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
+  codePointLength,
+  normalizeText,
+  summarizeAgentFailure,
+} from "./render.js";
 import { makePiAdapter } from "./pi-adapter.js";
 import {
   buildBroodRuntime,
@@ -39,9 +46,45 @@ export interface BroodController {
 export interface BroodApplication {
   readonly controller: BroodController;
   readonly run: (
-    goal: string,
+    request: BroodRunRequestEncoded,
   ) => Effect.Effect<BroodResult, AgentFailed | RootInterrupted | RootStartError>;
 }
+
+/** The only semantic gate for run input. Structural shape is Schema's job;
+ * this owns trimming, normalization, and the instruction bound. Rejects rather
+ * than truncates: instructions are operator policy, and executing a truncated
+ * charter would be less honest than failing. */
+export const normalizeRunRequest = Effect.fn("Brood.normalizeRunRequest")((
+  input: BroodRunRequestEncoded,
+  maxRunInstructionsChars: number,
+): Effect.Effect<BroodRunRequest, RootStartError> => {
+  const goal = normalizeText(input.goal).trim();
+  if (goal === "") {
+    return Effect.fail(
+      new RootStartError({ reason: "InvalidGoal", message: "Goal must not be empty" }),
+    );
+  }
+  if (input.instructions === undefined) return Effect.succeed({ goal });
+  const instructions = normalizeText(input.instructions).trim();
+  if (instructions === "") {
+    return Effect.fail(
+      new RootStartError({
+        reason: "InvalidInstructions",
+        message: "Explicitly supplied run instructions must not be empty",
+      }),
+    );
+  }
+  const length = codePointLength(instructions);
+  if (length > maxRunInstructionsChars) {
+    return Effect.fail(
+      new RootStartError({
+        reason: "InvalidInstructions",
+        message: `Run instructions contain ${length} Unicode code points; the maximum is ${maxRunInstructionsChars}`,
+      }),
+    );
+  }
+  return Effect.succeed({ goal, instructions });
+});
 
 export const interpretRootOutcome = Effect.fn("Brood.interpretRootOutcome")((
   outcome: AgentOutcome,
@@ -75,16 +118,20 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
     catalogue: runtime.catalogue,
     piAdapter: adapter,
     maxConcurrency: runtime.config.maxConcurrency,
-    maxAgents: runtime.config.maxAgents,
+    maxAgentAdmissions: runtime.config.maxAgentAdmissions,
     maxAgentResultChars: runtime.config.maxAgentResultChars,
     maxFailureMessageChars: runtime.config.maxFailureMessageChars,
     maxResumePromptChars: runtime.config.maxResumePromptChars,
     drainTimeoutMillis: Duration.toMillis(runtime.config.drainTimeout),
   });
 
-  const run = Effect.fn("Brood.run")((goal: string) => {
+  const run = Effect.fn("Brood.run")((request: BroodRunRequestEncoded) => {
     const operation = Effect.gen(function* () {
-      const rootId = yield* supervisor.startRoot(goal);
+      const normalized = yield* normalizeRunRequest(
+        request,
+        runtime.config.maxRunInstructionsChars,
+      );
+      const rootId = yield* supervisor.startRoot(normalized);
       const rootOutcome = yield* supervisor.awaitOutcome(rootId).pipe(Effect.orDie);
       const drain = yield* supervisor.drain;
       return yield* interpretRootOutcome(rootOutcome, drain, runtime.config.maxFailureMessageChars);
@@ -112,9 +159,9 @@ export const makeBroodApplicationFromUnknown = (input: unknown) =>
   buildBroodRuntimeUnknown(input).pipe(Effect.flatMap(makeApplication));
 
 export const runBrood = (
-  goal: string,
+  request: BroodRunRequestEncoded,
   input: BroodConfigEncoded,
 ): Effect.Effect<BroodResult, BroodConfigError | RootStartError | AgentFailed | RootInterrupted> =>
   Effect.scoped(
-    makeBroodApplication(input).pipe(Effect.flatMap((application) => application.run(goal))),
+    makeBroodApplication(input).pipe(Effect.flatMap((application) => application.run(request))),
   );

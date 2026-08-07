@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Effect, Schema } from "effect";
 import {
+  AgentAdmissionLimitExceeded,
   DelegateToolDetails,
   WaitToolDetails,
   makeAgentId,
@@ -29,7 +30,7 @@ const catalogue = () =>
   );
 
 const delegateDetails = {
-  version: 1 as const,
+  version: 2 as const,
   batchId: makeBatchId("batch_1"),
   agents: [
     {
@@ -38,6 +39,7 @@ const delegateDetails = {
       profile: makeProfileName("worker"),
     },
   ],
+  admissions: { limit: 8, used: 3, remaining: 5 },
   broodControl: {
     version: 1 as const,
     kind: "suspend" as const,
@@ -91,6 +93,12 @@ describe("Brood tools", () => {
     expect(Reflect.get(profile, "enum")).toEqual(["coordinator", "worker"]);
     expect(Reflect.has(profile, "allOf")).toBe(false);
     expect(delegate?.description).toContain("Default profile: worker");
+    expect(delegate?.description).toContain("irreversibly consumes one admission");
+    expect(delegate?.description).toContain("never replenish during the run");
+    expect(delegate?.description).toContain("safety ceiling, not a target");
+    expect(delegate?.description).toContain(
+      "Every child receives the same delegation tools and run instructions.",
+    );
     expect(delegate?.executionMode).toBe("sequential");
   });
 
@@ -112,9 +120,13 @@ describe("Brood tools", () => {
       "all",
     );
     expect(Schema.decodeUnknownSync(DelegateToolDetails)(result.details)).toEqual(delegateDetails);
-    expect(result.content).toEqual([
-      { type: "text", text: expect.stringContaining("research -> agent_2 (profile: worker)") },
-    ]);
+    expect(() =>
+      Schema.decodeUnknownSync(DelegateToolDetails)({ ...delegateDetails, version: 1 }),
+    ).toThrow("Expected 2");
+    const text = (result.content[0] as { readonly text: string }).text;
+    expect(text).toContain("research -> agent_2 (profile: worker)");
+    expect(text).toContain("Agent admissions after this batch: 3 of 8 used; 5 remain.");
+    expect(text).toContain("may decrease concurrently");
   });
 
   it("rejects duplicate normalized names before calling the port", async () => {
@@ -215,5 +227,34 @@ describe("Brood tools", () => {
       type: "text",
       text: expect.stringContaining("while waiting for: first"),
     });
+  });
+});
+
+describe("admission rejection at the tool boundary", () => {
+  it("surfaces the quantitative rejection message to the model", async () => {
+    const port: ControlToolPort = {
+      ...makePort(),
+      delegate: vi.fn<ControlToolPort["delegate"]>(() =>
+        Effect.fail(
+          new AgentAdmissionLimitExceeded({
+            requested: 3,
+            capacity: { limit: 8, used: 7, remaining: 1 },
+          }),
+        ),
+      ),
+    };
+    const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
+
+    await expect(
+      delegate!.execute(
+        "call_reject",
+        { tasks: [{ name: "a", goal: "work" }] },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow(
+      "Requested 3 agent admissions, but only 1 of 8 remain; no agents were created. Re-plan with at most 1 task, or continue directly.",
+    );
   });
 });

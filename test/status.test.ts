@@ -30,7 +30,7 @@ describe("status projections", () => {
       buildSwarmStatus({
         lifecycle: { state: "not_started" },
         now: 10_000,
-        maxAgents: 8,
+        admissions: { limit: 8, used: 0, remaining: 8 },
         maxConcurrency: 2,
         activeRuns: 0,
         agents: [],
@@ -40,7 +40,7 @@ describe("status projections", () => {
       state: "not_started",
       elapsedMillis: 0,
       capacity: {
-        agents: { admitted: 0, limit: 8, remaining: 8 },
+        admissions: { limit: 8, used: 0, remaining: 8 },
         runs: { active: 0, limit: 2, available: 2 },
       },
       counts: {
@@ -78,7 +78,7 @@ describe("status projections", () => {
       buildSwarmStatus({
         lifecycle: { state: "running", startedAt: 1_000 },
         now: 2_000,
-        maxAgents: 8,
+        admissions: { limit: 8, used: 0, remaining: 8 },
         maxConcurrency: 2,
         activeRuns: 0,
         agents: [child, root],

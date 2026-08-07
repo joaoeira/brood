@@ -10,12 +10,15 @@ import type { Deferred as DeferredType } from "effect/Deferred";
 import type { Latch as LatchType } from "effect/Latch";
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
+  AgentAdmissionLimitExceeded,
   DelegateRejected,
   RootStartError,
+  type DelegateError,
   UnknownAgent,
   WaitRejected,
   makeAgentId,
   makeWaitId,
+  type AgentAdmissionCapacity,
   type AgentCommand,
   type AgentId,
   type AgentName,
@@ -56,6 +59,8 @@ export interface RegisterBatchInput {
 
 export interface BatchRegistration {
   readonly children: ReadonlyArray<RegisteredAgent>;
+  /** Capacity produced by this batch's own transition, not a later query. */
+  readonly capacityAfterCommit: AgentAdmissionCapacity;
 }
 
 export interface PlanWaitInput {
@@ -127,6 +132,7 @@ export interface RegistrySnapshot {
   readonly accepting: boolean;
   readonly nonterminalCount: number;
   readonly pendingInstallationCount: number;
+  readonly admissionCapacity: AgentAdmissionCapacity;
 }
 
 interface ActiveWait {
@@ -212,7 +218,7 @@ const dispatchAction = (action: PostCommitAction): Effect.Effect<void> =>
   });
 
 export interface RegistryOptions {
-  readonly maxAgents: number;
+  readonly maxAgentAdmissions: number;
   readonly maxFailureMessageChars?: number;
   readonly nextAgentId?: () => AgentId;
   readonly nextWaitId?: () => WaitId;
@@ -224,7 +230,10 @@ export interface AgentRegistry {
   ) => Effect.Effect<RegisteredAgent, RootStartError>;
   readonly registerBatch: (
     input: RegisterBatchInput,
-  ) => Effect.Effect<BatchRegistration, DelegateRejected | UnknownAgent>;
+  ) => Effect.Effect<BatchRegistration, DelegateError | UnknownAgent>;
+  /** Authoritative snapshot, not a reservation: `used` is monotonic, so a
+   * stale read can only overstate what remains. */
+  readonly admissionCapacity: Effect.Effect<AgentAdmissionCapacity>;
   readonly settle: (
     id: AgentId,
     outcome: AgentOutcome,
@@ -277,9 +286,11 @@ const makeEntry = (
 });
 
 export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: RegistryOptions) {
-  const maxAgents = options.maxAgents;
-  if (!Number.isSafeInteger(maxAgents) || maxAgents <= 0) {
-    return yield* Effect.die(new Error("Registry maxAgents must be a positive safe integer"));
+  const maxAgentAdmissions = options.maxAgentAdmissions;
+  if (!Number.isSafeInteger(maxAgentAdmissions) || maxAgentAdmissions <= 0) {
+    return yield* Effect.die(
+      new Error("Registry maxAgentAdmissions must be a positive safe integer"),
+    );
   }
 
   const maxFailureMessageChars =
@@ -309,6 +320,12 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         ),
       ),
     );
+
+  const capacityOf = (state: RegistryState): AgentAdmissionCapacity => ({
+    limit: maxAgentAdmissions,
+    used: state.agents.size,
+    remaining: maxAgentAdmissions - state.agents.size,
+  });
 
   const withAgent = <A, E>(
     state: RegistryState,
@@ -340,6 +357,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
   // ── Admission ─────────────────────────────────────────────────────────────
 
+  const admissionCapacity = Ref.get(stateRef).pipe(Effect.map(capacityOf));
+
   const registerRoot = Effect.fn("Brood.Registry.registerRoot")(function* (
     input: RegisterRootInput,
   ) {
@@ -361,6 +380,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           state,
           Result.fail(
             new RootStartError({
+              reason: "AlreadyStarted",
               message: "This registry has already admitted or closed its root",
             }),
           ),
@@ -402,136 +422,136 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       }),
     );
 
-    return yield* transact(
-      (state): Transition<BatchRegistration, DelegateRejected | UnknownAgent> => {
-        return withAgent<BatchRegistration, DelegateRejected>(state, input.parentId, (parent) => {
-          if (!state.accepting) {
-            return noChange(
-              state,
-              Result.fail(
-                new DelegateRejected({
-                  reason: "NotAccepting",
-                  message: "The registry is shutting down",
-                }),
-              ),
-            );
-          }
-          if (parent.outcome !== undefined) {
-            return noChange(
-              state,
-              Result.fail(
-                new DelegateRejected({
-                  reason: "InvalidInput",
-                  message: "A terminal agent cannot delegate",
-                }),
-              ),
-            );
-          }
-          if (parent.seenInvocations.has(input.invocationId)) {
-            return noChange(
-              state,
-              Result.fail(
-                new DelegateRejected({
-                  reason: "DuplicateInvocationId",
-                  message: `Control invocation ${input.invocationId} was already committed`,
-                }),
-              ),
-            );
-          }
-          if (input.children.length === 0) {
-            return noChange(
-              state,
-              Result.fail(
-                new DelegateRejected({
-                  reason: "InvalidInput",
-                  message: "Delegation requires at least one child",
-                }),
-              ),
-            );
-          }
-          if (state.agents.size + input.children.length > maxAgents) {
-            return noChange(
-              state,
-              Result.fail(
-                new DelegateRejected({
-                  reason: "AgentLimitExceeded",
-                  message: `Agent limit ${maxAgents} would be exceeded by ${input.children.length} requested children`,
-                }),
-              ),
-            );
-          }
+    return yield* transact((state): Transition<BatchRegistration, DelegateError | UnknownAgent> => {
+      return withAgent<BatchRegistration, DelegateError>(state, input.parentId, (parent) => {
+        if (!state.accepting) {
+          return noChange(
+            state,
+            Result.fail(
+              new DelegateRejected({
+                reason: "NotAccepting",
+                message: "The registry is shutting down",
+              }),
+            ),
+          );
+        }
+        if (parent.outcome !== undefined) {
+          return noChange(
+            state,
+            Result.fail(
+              new DelegateRejected({
+                reason: "InvalidInput",
+                message: "A terminal agent cannot delegate",
+              }),
+            ),
+          );
+        }
+        if (parent.seenInvocations.has(input.invocationId)) {
+          return noChange(
+            state,
+            Result.fail(
+              new DelegateRejected({
+                reason: "DuplicateInvocationId",
+                message: `Control invocation ${input.invocationId} was already committed`,
+              }),
+            ),
+          );
+        }
+        if (input.children.length === 0) {
+          return noChange(
+            state,
+            Result.fail(
+              new DelegateRejected({
+                reason: "InvalidInput",
+                message: "Delegation requires at least one child",
+              }),
+            ),
+          );
+        }
+        if (state.agents.size + input.children.length > maxAgentAdmissions) {
+          return noChange(
+            state,
+            Result.fail(
+              new AgentAdmissionLimitExceeded({
+                requested: input.children.length,
+                capacity: capacityOf(state),
+              }),
+            ),
+          );
+        }
 
-          if (prepared.length !== input.children.length) {
-            throw new RegistryInvariantDefect("Prepared child batch changed length");
+        if (prepared.length !== input.children.length) {
+          throw new RegistryInvariantDefect("Prepared child batch changed length");
+        }
+        const names = new Set<AgentName>();
+        const ids = new Set<AgentId>();
+        for (let index = 0; index < input.children.length; index += 1) {
+          const child = input.children[index];
+          const preparedChild = prepared[index];
+          if (child === undefined || preparedChild === undefined) {
+            throw new RegistryInvariantDefect("Prepared child batch lost an indexed entry");
           }
-          const names = new Set<AgentName>();
-          const ids = new Set<AgentId>();
-          for (let index = 0; index < input.children.length; index += 1) {
-            const child = input.children[index];
-            const preparedChild = prepared[index];
-            if (child === undefined || preparedChild === undefined) {
-              throw new RegistryInvariantDefect("Prepared child batch lost an indexed entry");
-            }
-            if (names.has(child.name) || parent.childrenByName.has(child.name)) {
-              return noChange(
-                state,
-                Result.fail(
-                  new DelegateRejected({
-                    reason: "NameCollision",
-                    message: `Direct-child name ${child.name} has already been used`,
-                  }),
-                ),
-              );
-            }
-            names.add(child.name);
-            if (
-              ids.has(preparedChild.registered.id) ||
-              state.agents.has(preparedChild.registered.id)
-            ) {
-              throw new RegistryInvariantDefect(
-                `Agent ID generator reused ${preparedChild.registered.id}`,
-              );
-            }
-            ids.add(preparedChild.registered.id);
+          if (names.has(child.name) || parent.childrenByName.has(child.name)) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "NameCollision",
+                  message: `Direct-child name ${child.name} has already been used`,
+                }),
+              ),
+            );
           }
+          names.add(child.name);
+          if (
+            ids.has(preparedChild.registered.id) ||
+            state.agents.has(preparedChild.registered.id)
+          ) {
+            throw new RegistryInvariantDefect(
+              `Agent ID generator reused ${preparedChild.registered.id}`,
+            );
+          }
+          ids.add(preparedChild.registered.id);
+        }
 
-          const agents = new Map(state.agents);
-          const childrenByName = new Map(parent.childrenByName);
-          for (const child of prepared) {
-            agents.set(child.registered.id, child.entry);
-            childrenByName.set(child.registered.name, child.registered.id);
-          }
-          const seenInvocations = new Set(parent.seenInvocations);
-          seenInvocations.add(input.invocationId);
-          const plannedTargets =
-            input.wait === "all"
-              ? withTargets(
-                  parent.plannedTargets,
-                  prepared.map(({ registered }) => registered.id),
-                )
-              : parent.plannedTargets;
-          agents.set(parent.id, {
-            ...parent,
-            childrenByName,
-            seenInvocations,
-            plannedTargets,
-            updatedAt: registeredAt,
-          });
-
-          return {
-            next: {
-              ...state,
-              agents,
-              nonterminalCount: state.nonterminalCount + prepared.length,
-            },
-            actions: prepared.map(({ entry }) => PostCommitAction.Open({ latch: entry.mailbox })),
-            result: Result.succeed({
-              children: prepared.map(({ registered }) => registered),
-            }),
-          };
+        const agents = new Map(state.agents);
+        const childrenByName = new Map(parent.childrenByName);
+        for (const child of prepared) {
+          agents.set(child.registered.id, child.entry);
+          childrenByName.set(child.registered.name, child.registered.id);
+        }
+        const seenInvocations = new Set(parent.seenInvocations);
+        seenInvocations.add(input.invocationId);
+        const plannedTargets =
+          input.wait === "all"
+            ? withTargets(
+                parent.plannedTargets,
+                prepared.map(({ registered }) => registered.id),
+              )
+            : parent.plannedTargets;
+        agents.set(parent.id, {
+          ...parent,
+          childrenByName,
+          seenInvocations,
+          plannedTargets,
+          updatedAt: registeredAt,
         });
-      },
-    );
+
+        const next: RegistryState = {
+          ...state,
+          agents,
+          nonterminalCount: state.nonterminalCount + prepared.length,
+        };
+        return {
+          next,
+          actions: prepared.map(({ entry }) => PostCommitAction.Open({ latch: entry.mailbox })),
+          result: Result.succeed({
+            children: prepared.map(({ registered }) => registered),
+            capacityAfterCommit: capacityOf(next),
+          }),
+        };
+      });
+    });
   });
 
   // ── Waits: plan during a turn, activate after suspension ─────────────────
@@ -999,6 +1019,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         nonterminalCount: state.nonterminalCount,
         pendingInstallationCount: agents.filter(({ installation }) => installation === "Pending")
           .length,
+        admissionCapacity: capacityOf(state),
       };
     }),
   );
@@ -1006,6 +1027,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
   return {
     registerRoot,
     registerBatch,
+    admissionCapacity,
     settle,
     planWait,
     activateWaits,

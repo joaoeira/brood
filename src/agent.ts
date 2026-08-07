@@ -51,8 +51,9 @@ export type ProfileName = typeof ProfileName.Type;
 export const makeProfileName = Schema.decodeUnknownSync(ProfileName);
 export const decodeProfileName = Schema.decodeUnknownEffect(ProfileName);
 
+// Non-empty trimmed text for delegated child goals at the tool boundary.
+// Run-request goals are normalized exactly once by main.ts's normalizeRunRequest.
 const Goal = Schema.Trim.check(Schema.isMinLength(1));
-export const decodeGoal = Schema.decodeUnknownEffect(Goal);
 
 // ── Agent outcomes ──────────────────────────────────────────────────────────
 
@@ -165,6 +166,42 @@ export const BroodResult = Schema.Struct({
 });
 export interface BroodResult extends Schema.Schema.Type<typeof BroodResult> {}
 
+// ── Admission capacity and the run request ──────────────────────────────────
+// Admission is cumulative: an admitted agent — running, waiting, or terminal —
+// never returns its admission during the run. `used` is monotonic, so a stale
+// snapshot can only overstate what remains.
+
+// Internal composition export: shared with runtime.ts's config bounds so the
+// positive-integer rule has one definition; deliberately not in index.ts.
+export const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
+
+export const AgentAdmissionCapacity = Schema.Struct({
+  limit: PositiveInt,
+  used: Schema.Natural,
+  remaining: Schema.Natural,
+}).check(
+  Schema.makeFilter((capacity) =>
+    capacity.used <= capacity.limit && capacity.remaining === capacity.limit - capacity.used
+      ? undefined
+      : "admission capacity must satisfy remaining = limit - used",
+  ),
+);
+export interface AgentAdmissionCapacity extends Schema.Schema.Type<typeof AgentAdmissionCapacity> {}
+
+// Type source for the public request shape. Structural enforcement is
+// TypeScript's job in this private package — nothing decodes with this schema
+// today; semantic validation lives in main.ts's normalizeRunRequest.
+export const BroodRunRequestInput = Schema.Struct({
+  goal: Schema.String,
+  instructions: Schema.optionalKey(Schema.String),
+});
+export type BroodRunRequestEncoded = typeof BroodRunRequestInput.Encoded;
+
+export interface BroodRunRequest {
+  readonly goal: string;
+  readonly instructions?: string;
+}
+
 // ── Control protocol ────────────────────────────────────────────────────────
 // The transcript-visible contract between the two Brood tools and the Pi
 // adapter's suspension hook. Details payloads ride on tool results; the
@@ -199,9 +236,10 @@ const DelegatedAgent = Schema.Struct({
 });
 
 export const DelegateToolDetails = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   batchId: BatchId,
   agents: Schema.Array(DelegatedAgent),
+  admissions: AgentAdmissionCapacity,
   broodControl: BroodControl,
 });
 export interface DelegateToolDetails extends Schema.Schema.Type<typeof DelegateToolDetails> {}
@@ -258,12 +296,34 @@ export class DelegateRejected extends Schema.TaggedError<DelegateRejected>()("De
     "InvalidInput",
     "NameCollision",
     "NotAccepting",
-    "AgentLimitExceeded",
     "UnknownProfile",
     "DuplicateInvocationId",
   ]),
   message: Schema.String,
 }) {}
+
+// Internal composition export: crosses the registry-to-tool boundary with
+// quantitative fields; not re-exported from index.ts while no public API
+// exposes direct delegation.
+export class AgentAdmissionLimitExceeded extends Schema.TaggedError<AgentAdmissionLimitExceeded>()(
+  "AgentAdmissionLimitExceeded",
+  {
+    requested: PositiveInt,
+    capacity: AgentAdmissionCapacity,
+  },
+) {
+  get message(): string {
+    const remaining = this.capacity.remaining;
+    const next =
+      remaining === 0
+        ? "Continue without delegation."
+        : `Re-plan with at most ${remaining} task${remaining === 1 ? "" : "s"}, or continue directly.`;
+    return `Requested ${this.requested} agent admissions, but only ${remaining} of ${this.capacity.limit} remain; no agents were created. ${next}`;
+  }
+}
+
+/** The delegation error channel named by the admission proposal (§10). */
+export type DelegateError = DelegateRejected | AgentAdmissionLimitExceeded;
 
 export class WaitRejected extends Schema.TaggedError<WaitRejected>()("WaitRejected", {
   reason: Schema.Literals([
@@ -293,6 +353,7 @@ export class UnknownAgentReference extends Schema.TaggedError<UnknownAgentRefere
 }
 
 export class RootStartError extends Schema.TaggedError<RootStartError>()("RootStartError", {
+  reason: Schema.Literals(["InvalidGoal", "InvalidInstructions", "AlreadyStarted"]),
   message: Schema.String,
 }) {}
 

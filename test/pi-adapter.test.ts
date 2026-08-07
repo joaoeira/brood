@@ -90,9 +90,10 @@ const toolResult = (overrides: Partial<ToolResultMessage> = {}): ToolResultMessa
   isError: false,
   timestamp: Date.now(),
   details: {
-    version: 1,
+    version: 2,
     batchId: makeBatchId("batch_1"),
     agents: [],
+    admissions: { limit: 8, used: 1, remaining: 7 },
     broodControl: {
       version: 1,
       kind: "suspend",
@@ -299,7 +300,7 @@ describe("Pi control-result inspection", () => {
     const port: ControlToolPort = {
       delegate: (_callerId, invocationId) =>
         Effect.succeed({
-          version: 1,
+          version: 2,
           batchId: makeBatchId("batch_suspend"),
           agents: [
             {
@@ -308,6 +309,7 @@ describe("Pi control-result inspection", () => {
               profile: makeProfileName("worker"),
             },
           ],
+          admissions: { limit: 8, used: 2, remaining: 6 },
           broodControl: { version: 1, kind: "suspend", invocationId },
         }),
       waitForAgents: () => Effect.die("unused"),

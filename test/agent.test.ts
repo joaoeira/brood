@@ -1,7 +1,8 @@
 import { it } from "@effect/vitest";
-import { Effect, Exit } from "effect";
+import { Effect, Exit, Schema } from "effect";
 import { expect } from "vitest";
 import {
+  AgentAdmissionCapacity,
   decodeBroodControl,
   decodeAgentName,
   decodeProfileName,
@@ -32,5 +33,25 @@ it.effect("decodes only the versioned Brood control protocol", () =>
 
     expect(control).toEqual({ version: 1, kind: "suspend", invocationId });
     expect(Exit.isFailure(futureVersion)).toBe(true);
+  }),
+);
+
+it.effect("rejects inconsistent admission capacity at the schema boundary", () =>
+  Effect.gen(function* () {
+    const inconsistent = yield* Effect.exit(
+      Schema.decodeUnknownEffect(AgentAdmissionCapacity)({ limit: 8, used: 3, remaining: 6 }),
+    );
+    const overUsed = yield* Effect.exit(
+      Schema.decodeUnknownEffect(AgentAdmissionCapacity)({ limit: 3, used: 5, remaining: -2 }),
+    );
+    const consistent = yield* Schema.decodeUnknownEffect(AgentAdmissionCapacity)({
+      limit: 8,
+      used: 3,
+      remaining: 5,
+    });
+
+    expect(Exit.isFailure(inconsistent)).toBe(true);
+    expect(Exit.isFailure(overUsed)).toBe(true);
+    expect(consistent).toEqual({ limit: 8, used: 3, remaining: 5 });
   }),
 );

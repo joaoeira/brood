@@ -17,6 +17,7 @@ import {
   ToolInvocationId,
   WaitRejected,
   type AgentId,
+  type DelegateError,
   type DelegateToolDetails,
   type DependencyOutcome,
   type WaitToolDetails,
@@ -29,7 +30,7 @@ export interface ControlToolPort {
     invocationId: ToolInvocationId,
     tasks: ReadonlyArray<DelegatedTask>,
     wait: "all" | "none",
-  ) => Effect.Effect<DelegateToolDetails, DelegateRejected>;
+  ) => Effect.Effect<DelegateToolDetails, DelegateError>;
   readonly waitForAgents: (
     callerId: AgentId,
     invocationId: ToolInvocationId,
@@ -123,7 +124,14 @@ const renderDelegate = (details: DelegateToolDetails): string => {
     details.broodControl.kind === "suspend"
       ? "Brood will suspend this agent after every tool call in the current turn completes."
       : "Delegated agents are running independently; this agent will continue.";
-  return [`Delegated batch ${details.batchId}.`, ...correlations, control].join("\n");
+  const { limit, used, remaining } = details.admissions;
+  return [
+    `Delegated batch ${details.batchId}.`,
+    ...correlations,
+    control,
+    `Agent admissions after this batch: ${used} of ${limit} used; ${remaining} remain.`,
+    "Remaining admissions are shared globally and may decrease concurrently.",
+  ].join("\n");
 };
 
 const renderOutcome = (outcome: DependencyOutcome): string => {
@@ -187,6 +195,13 @@ export const compileAgentToolFactory = (catalogue: ProfileCatalogue) => {
     "Create one or more equally capable agents in one atomic batch.",
     "The default is wait=all. Use wait=none only for deliberate fire-and-forget work.",
     "Suspension takes effect after every tool call in the current assistant turn completes. Tool calls later in the same turn must not assume delegated results are available.",
+    [
+      "Each task creates one logical agent and irreversibly consumes one admission from the run-wide pool.",
+      "Admissions are shared across every branch, include completed and failed agents, and never replenish during the run.",
+      "A batch is all-or-nothing. Use the capacity shown in your runtime context and prior delegate results.",
+      "The limit is a safety ceiling, not a target; preserve slack when future work is still uncertain.",
+      "Every child receives the same delegation tools and run instructions.",
+    ].join(" "),
     catalogue.helpText,
   ].join("\n\n");
 

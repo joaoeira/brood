@@ -4,7 +4,13 @@
  * cross the public status boundary.
  */
 import { Schema } from "effect";
-import { AgentId, AgentName, DependencyOutcome, type AgentStatus } from "./agent.js";
+import {
+  AgentAdmissionCapacity,
+  AgentId,
+  AgentName,
+  DependencyOutcome,
+  type AgentStatus,
+} from "./agent.js";
 import { PublicModelProfile } from "./profiles.js";
 
 export const SwarmRunState = Schema.Literals(["not_started", "running", "draining", "completed"]);
@@ -44,11 +50,7 @@ export const SwarmStatus = Schema.Struct({
   state: SwarmRunState,
   elapsedMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   capacity: Schema.Struct({
-    agents: Schema.Struct({
-      admitted: Schema.Natural,
-      limit: Schema.Natural,
-      remaining: Schema.Natural,
-    }),
+    admissions: AgentAdmissionCapacity,
     runs: Schema.Struct({
       active: Schema.Natural,
       limit: Schema.Natural,
@@ -109,7 +111,8 @@ export interface StatusAgentSource {
 export interface StatusProjectionInput {
   readonly lifecycle: RunLifecycle;
   readonly now: number;
-  readonly maxAgents: number;
+  /** Authoritative admission capacity from the same registry snapshot as `agents`. */
+  readonly admissions: AgentAdmissionCapacity;
   readonly maxConcurrency: number;
   readonly activeRuns: number;
   readonly agents: ReadonlyArray<StatusAgentSource>;
@@ -236,11 +239,7 @@ export const buildSwarmStatus = (input: StatusProjectionInput): SwarmStatus => {
     state: input.lifecycle.state,
     elapsedMillis: elapsedMillis(input.lifecycle, input.now),
     capacity: {
-      agents: {
-        admitted: input.agents.length,
-        limit: input.maxAgents,
-        remaining: Math.max(0, input.maxAgents - input.agents.length),
-      },
+      admissions: input.admissions,
       runs: {
         active: input.activeRuns,
         limit: input.maxConcurrency,
@@ -335,11 +334,11 @@ const renderStatusAgent = (
 };
 
 export const formatSwarmStatus = (status: SwarmStatus): string => {
-  const { agents, runs } = status.capacity;
+  const { admissions, runs } = status.capacity;
   const counts = status.counts;
   const lines = [
     `${status.state.toUpperCase()}  ${formatDuration(status.elapsedMillis)}`,
-    `Agents ${agents.admitted}/${agents.limit} (${agents.remaining} remaining)  Runs ${runs.active}/${runs.limit} (${runs.available} available)`,
+    `Admissions ${admissions.used}/${admissions.limit} (${admissions.remaining} remaining)  Active runs ${runs.active}/${runs.limit} (${runs.available} available)`,
     `States starting ${counts.starting} · queued ${counts.queued} · running ${counts.running} · waiting ${counts.waiting} · completed ${counts.completed} · failed ${counts.failed} · interrupted ${counts.interrupted}`,
     "Swarm",
   ];

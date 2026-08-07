@@ -8,7 +8,7 @@ import { chmod, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Duration, Effect, Schema, SchemaIssue } from "effect";
-import { BroodConfigError } from "./agent.js";
+import { BroodConfigError, PositiveInt } from "./agent.js";
 import {
   ModelProfile,
   compileProfileCatalogue,
@@ -21,7 +21,6 @@ import {
   minimumResumePromptChars,
 } from "./render.js";
 
-const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
 const BoundedTextChars = PositiveInt.check(Schema.isGreaterThanOrEqualTo(MIN_BOUNDED_TEXT_CHARS));
 const PositiveFiniteDuration = Schema.DurationFromString.check(
   Schema.makeFilter((duration) => {
@@ -35,11 +34,18 @@ const isWithin = (parent: string, child: string): boolean => {
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 };
 
+const LEGACY_MAX_AGENTS = "`maxAgents` was renamed to `maxAgentAdmissions`; remove the old key";
+
 const BroodConfigFields = Schema.Struct({
   workspacePath: Schema.Trim.check(Schema.isMinLength(1)),
   stateDirectory: Schema.Trim.check(Schema.isMinLength(1)),
   maxConcurrency: PositiveInt,
-  maxAgents: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(128))),
+  maxAgentAdmissions: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(128))),
+  // Declared tombstone: the config cursor materializes only declared keys, so
+  // this is the one mechanism that makes the legacy key a hard failure. A null
+  // value is provider-erased before any schema sees it — a documented gap.
+  maxAgents: Schema.optionalKey(Schema.Never.annotate({ message: LEGACY_MAX_AGENTS })),
+  maxRunInstructionsChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(4_000))),
   maxAgentResultChars: BoundedTextChars.pipe(Schema.withDecodingDefaultKey(Effect.succeed(12_000))),
   maxFailureMessageChars: BoundedTextChars.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(DEFAULT_MAX_FAILURE_MESSAGE_CHARS)),
@@ -85,14 +91,14 @@ export const BroodConfigInput = BroodConfigFields.check(
         issue: "sessionDirectory must be a child of stateDirectory",
       });
     }
-    if (config.maxConcurrency > config.maxAgents) {
-      issues.push({ path: ["maxConcurrency"], issue: "cannot exceed maxAgents" });
+    if (config.maxConcurrency > config.maxAgentAdmissions) {
+      issues.push({ path: ["maxConcurrency"], issue: "cannot exceed maxAgentAdmissions" });
     }
-    const minimumResume = minimumResumePromptChars(config.maxAgents);
+    const minimumResume = minimumResumePromptChars(config.maxAgentAdmissions);
     if (config.maxResumePromptChars < minimumResume) {
       issues.push({
         path: ["maxResumePromptChars"],
-        issue: `must be at least ${minimumResume} for maxAgents=${config.maxAgents}`,
+        issue: `must be at least ${minimumResume} for maxAgentAdmissions=${config.maxAgentAdmissions}`,
       });
     }
     return issues;
@@ -170,18 +176,19 @@ const configErrorPath = (error: Config.ConfigError): string | undefined => {
   return path?.map(String).join(".");
 };
 
-const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")((raw: unknown) =>
-  ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
-    Effect.mapError((error) => {
-      const path = configErrorPath(error);
-      return new BroodConfigError(
-        path === undefined
-          ? { stage: "decode", reason: "DecodeFailed", message: error.message }
-          : { stage: "decode", reason: "DecodeFailed", message: error.message, path },
-      );
-    }),
-    Effect.flatMap(resolveConfigPaths),
-  ),
+export const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")(
+  (raw: unknown) =>
+    ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
+      Effect.mapError((error) => {
+        const path = configErrorPath(error);
+        return new BroodConfigError(
+          path === undefined
+            ? { stage: "decode", reason: "DecodeFailed", message: error.message }
+            : { stage: "decode", reason: "DecodeFailed", message: error.message, path },
+        );
+      }),
+      Effect.flatMap(resolveConfigPaths),
+    ),
 );
 
 export const decodeBroodConfig = (raw: BroodConfigEncoded) => decodeBroodConfigUnknown(raw);
