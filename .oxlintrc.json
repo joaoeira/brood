@@ -5,5 +5,9 @@
     "suspicious": "error"
   },
   "ignorePatterns": ["vendor/**"],
-  "plugins": ["typescript", "vitest"]
+  "plugins": ["typescript", "vitest"],
+  "rules": {
+    "no-underscore-dangle": "off",
+    "vitest/no-standalone-expect": "off"
+  }
 }
