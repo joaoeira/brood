@@ -14,6 +14,7 @@ import {
   type DrainReport,
   type RootStartError,
   type UnknownAgent,
+  type UnknownAgentReference,
 } from "./agent.js";
 import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, summarizeAgentFailure } from "./render.js";
 import { makePiAdapter } from "./pi-adapter.js";
@@ -23,10 +24,12 @@ import {
   type BroodConfigEncoded,
   type BroodRuntime,
 } from "./runtime.js";
-import { makeSupervisor, type AgentSnapshot, type SupervisorEvent } from "./supervisor.js";
+import { makeSupervisor, type SupervisorEvent } from "./supervisor.js";
+import type { AgentDetail, SwarmStatus } from "./status.js";
 
 export interface BroodController {
-  readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
+  readonly status: Effect.Effect<SwarmStatus>;
+  readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
   readonly interrupt: (id: AgentId, source?: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
 }
@@ -90,7 +93,8 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
   });
 
   const controller: BroodController = {
-    snapshot: supervisor.snapshot,
+    status: supervisor.status,
+    show: supervisor.show,
     interrupt: (id: AgentId, source: "cli" | "api" = "api") => supervisor.interrupt(id, source),
     events: supervisor.events,
   };

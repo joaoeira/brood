@@ -18,6 +18,7 @@ import {
   type AgentId,
 } from "./agent.js";
 import { makeBroodApplicationFromUnknown, type BroodApplication } from "./main.js";
+import { formatAgentDetail, formatSwarmStatus } from "./status.js";
 
 export interface CliArguments {
   readonly configPath: string;
@@ -26,7 +27,8 @@ export interface CliArguments {
 }
 
 type ParsedOperatorCommand =
-  | { readonly _tag: "Status" }
+  | { readonly _tag: "Status"; readonly format: "human" | "json" }
+  | { readonly _tag: "Show"; readonly reference: string; readonly format: "human" | "json" }
   | { readonly _tag: "Interrupt"; readonly agentId: string }
   | { readonly _tag: "Events"; readonly enabled: boolean }
   | { readonly _tag: "Help" };
@@ -87,8 +89,25 @@ export const parseCliArguments = (arguments_: ReadonlyArray<string>): CliArgumen
 export const parseOperatorCommand = (line: string): ParsedOperatorCommand => {
   const [command, ...rest] = line.trim().split(/\s+/);
   switch (command) {
-    case "status":
-      return { _tag: "Status" };
+    case "status": {
+      if (rest.length === 0) return { _tag: "Status", format: "human" };
+      if (rest.length === 1 && rest[0] === "--json") {
+        return { _tag: "Status", format: "json" };
+      }
+      throw new CliInputError({ message: "Usage: status [--json]" });
+    }
+    case "show": {
+      const [reference, option] = rest;
+      if (
+        reference === undefined ||
+        reference.startsWith("-") ||
+        rest.length > 2 ||
+        (option !== undefined && option !== "--json")
+      ) {
+        throw new CliInputError({ message: "Usage: show <agent-path-or-id> [--json]" });
+      }
+      return { _tag: "Show", reference, format: option === "--json" ? "json" : "human" };
+    }
     case "interrupt": {
       const raw = rest[0];
       if (raw === undefined || rest.length !== 1) {
@@ -200,8 +219,17 @@ const executeCommand = (
     const command = yield* decodeOperatorCommand(line);
     switch (command._tag) {
       case "Status": {
-        const agents = yield* application.controller.snapshot;
-        yield* writeJson({ type: "status", agents });
+        const status = yield* application.controller.status;
+        yield* command.format === "json"
+          ? writeJson(status)
+          : writeMessage(formatSwarmStatus(status));
+        break;
+      }
+      case "Show": {
+        const detail = yield* application.controller.show(command.reference);
+        yield* command.format === "json"
+          ? writeJson(detail)
+          : writeMessage(formatAgentDetail(detail));
         break;
       }
       case "Interrupt":
@@ -213,7 +241,9 @@ const executeCommand = (
         yield* writeMessage(`Event display ${command.enabled ? "enabled" : "disabled"}.`);
         break;
       case "Help":
-        yield* writeMessage("Commands: status | interrupt <agent-id> | events on|off | help");
+        yield* writeMessage(
+          "Commands: status [--json] | show <agent-path-or-id> [--json] | interrupt <agent-id> | events on|off | help",
+        );
         break;
     }
   }).pipe(Effect.catch((cause) => writeMessage(causeMessage(cause))));
@@ -236,7 +266,7 @@ const runApplication = (application: BroodApplication, arguments_: CliArguments)
     );
     if (interactive) {
       yield* writeMessage(
-        "Brood is running. Commands: status | interrupt <agent-id> | events on|off",
+        "Brood is running. Commands: status | show <agent-path-or-id> | interrupt <agent-id> | events on|off",
       );
       yield* commandLines().pipe(
         Stream.runForEach((line) => executeCommand(application, eventDisplay, line)),

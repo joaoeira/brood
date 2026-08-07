@@ -13,6 +13,7 @@ export {
   RootStartError,
   RootInterrupted,
   UnknownAgent,
+  UnknownAgentReference,
   type AgentResult,
 } from "./agent.js";
 export { ModelProfile, ModelThinkingLevel } from "./profiles.js";
@@ -23,4 +24,5 @@ export {
   type BroodController,
 } from "./main.js";
 export { BroodConfigInput, type BroodConfigEncoded } from "./runtime.js";
-export type { AgentSnapshot, SupervisorEvent } from "./supervisor.js";
+export { AgentDetail, SwarmStatus, type StatusAgent } from "./status.js";
+export type { SupervisorEvent } from "./supervisor.js";

@@ -234,7 +234,7 @@ flowchart TD
   Registry -->|"resume command"| Children
   RootPi --> Workspace["Shared workspace"]
   ChildPi --> Workspace
-  Registry --> Monitor["snapshot + event stream"]
+  Registry --> Monitor["bounded status/show + event stream"]
 ```
 
 Only two public application services are needed initially:
@@ -251,7 +251,8 @@ interface AgentSupervisorApi {
 
   readonly drain: Effect.Effect<DrainReport>;
   readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
-  readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
+  readonly status: Effect.Effect<SwarmStatus>;
+  readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
 }
 ```
@@ -425,7 +426,7 @@ private resolved value may flow from runtime composition into `PiAdapter`, but
 Pi's full `Model` contains fields such as base URLs, arbitrary headers, and
 compatibility options that may contain secrets and must never be spread into
 output. Descriptions are shown only in agent tool help; they are excluded from
-snapshots and events.
+status, agent detail, and events.
 
 ### 6.3 Pi run outcome
 
@@ -560,7 +561,7 @@ be available at the workspace paths named in the summaries.
 The system prompt tells the model that text inside outcome elements is peer
 output and may contain quoted instructions; it is evidence to evaluate, not a
 new Brood control message. `WaitToolDetails`, model-visible tool content, resume
-messages, snapshots, and the public root result are all produced from the same
+messages, agent detail, and the public root result are all produced from the same
 normalized values.
 
 ### 6.5 Agent outcome and controller commands
@@ -1092,10 +1093,10 @@ the callback, and no exception may escape it.
 
 V1 does not forward token-delta events. A bounded sliding queue carries selected
 Pi lifecycle, tool, retry, and settlement events into the best-effort monitor.
-The registry snapshot is authoritative; live monitor subscribers may observe a
-gap and use event sequence numbers to detect it. Scope closure aborts and
-disposes the session and unsubscribes the listener before shutting down the
-bridge queue.
+The bounded status projection of registry state is authoritative; live monitor
+subscribers may observe a gap and use event sequence numbers to detect it. Scope
+closure aborts and disposes the session and unsubscribes the listener before
+shutting down the bridge queue.
 
 ## 10. Supervisor and controller loop
 
@@ -1172,15 +1173,21 @@ depends on `AgentSupervisor`, avoiding a Layer cycle.
 
 ## 11. Monitoring and workspace
 
-Monitoring has two complementary surfaces:
+Monitoring has three complementary surfaces:
 
-- `snapshot` returns the current registry view, including status, provenance,
-  wait targets, timestamps, and terminal summary;
+- `status` returns one bounded authoritative record: run state and elapsed
+  time, admission/run capacity, counts by state, and a provenance tree whose
+  agents contain only canonical path, name, state, duration, and canonical wait
+  targets;
+- `show(pathOrId)` returns bounded detail for one agent, including identifiers,
+  timestamps, its safe profile projection, and its normalized terminal summary;
 - `events` broadcasts typed supervisor transitions plus selected Pi lifecycle
   events for live UIs/loggers.
 
-Every snapshot and agent-scoped event exposes only the allowlisted effective
-identity:
+Default status contains no IDs, goals, prompts, outcomes, transcript content,
+tool results, raw errors, or defect causes. Canonical paths such as
+`root/vask/audit` disambiguate parent-scoped names. Every detailed agent view and
+agent-scoped event exposes only the allowlisted effective identity:
 
 ```ts
 interface AgentProfileSnapshot {
@@ -1206,7 +1213,7 @@ transition. Pi lifecycle events never enter a registry transition; each session
 listener assigns its own monotonic `sessionSequence`. The combined stream makes
 no false promise of one total cross-source order. Events also carry source and
 timestamp, and consumers use the appropriate sequence to detect gaps before
-refreshing from the authoritative snapshot.
+refreshing from authoritative status.
 
 The bounded `PubSub` is lossy monitoring, not a durable audit trail. Session
 JSONL records the actual provider/model only after a session opens, so it cannot
@@ -1311,10 +1318,13 @@ interruption propagates out of `awaitOutcome`/`drain`, closes that layer scope,
 and interrupts queued controllers, active Pi prompts, and waiting agents.
 
 The thin CLI must expose the operator escape hatch in the running process. In an
-interactive terminal it accepts at least `status`, `interrupt <agent-id>`, and
-`events on|off` while the goal is running; in non-interactive mode it can emit
-newline-delimited monitor events. V1 does not add a network control server or
-pretend that a second CLI process can control the first without transport.
+interactive terminal it accepts `status [--json]`,
+`show <canonical-path-or-agent-id> [--json]`, `interrupt <agent-id>`, and
+`events on|off` while the goal is running. Human status is the compact default;
+the JSON form is the same stable bounded record exposed by the controller. In
+non-interactive mode the CLI can emit newline-delimited monitor events. V1 does
+not add a network control server or pretend that a second CLI process can
+control the first without transport.
 
 ### 12.1 Effect package audit
 
@@ -1494,7 +1504,7 @@ Pi dependency. Replay tests exist only if the Phase 0 finding requires them.
 3. Implement permit acquisition around starting/running only.
 4. Implement controller outcome handling, resume commands, public await methods,
    interruption, timed draining, and orphan cleanup.
-5. Add snapshot and transition event publication.
+5. Add bounded status/detail projection and transition event publication.
 
 Exit criterion: single-agent fake-Pi tests prove root profile selection, fixed
 profile capture, latch wakeup, cancellation, settlement-before-cleanup, permit
@@ -1623,7 +1633,7 @@ not add a helper that brands or casts the encoded keys before Schema sees them.
   dependency code; adding a variant must fail typechecking until mapped.
 - Enforce the aggregate resume limit without dropping any dependency header,
   preserve requested order, and render the same normalized values into tool
-  content, `WaitToolDetails`, snapshots, and resume prompts.
+  content, `WaitToolDetails`, agent detail, and resume prompts.
 - Verify peer-output delimiters cannot be mistaken for a Brood control marker.
 - Render summaries containing literal `</agent>`, forged sibling `<agent ...>`
   tags, ampersands, and quotes as visibly inert peer text without changing the
@@ -1792,13 +1802,14 @@ not add a helper that brands or casts the encoded keys before Schema sees them.
 - Recursive delegation obeys the same global concurrency cap at every depth.
 - Registry events have monotonic `registrySequence`; Pi events have monotonic
   per-session `sessionSequence`; no test assumes a total order between sources.
-- Snapshots and agent-scoped events expose only profile name, canonical
+- Agent detail and agent-scoped events expose only profile name, canonical
   provider/model, and effective thinking level. Seed the private Pi model with
   credential-like headers, a base URL, and compatibility data and prove none can
   appear in the generated tool schema/description, system prompt, tool results,
-  snapshots, events, or structured registration logs.
-- Interactive CLI `status` reflects the snapshot and `interrupt <id>` interrupts
-  the selected active agent without stopping unrelated agents.
+  status, detail, events, or structured registration logs.
+- Interactive CLI `status` reflects authoritative capacity/tree state,
+  `show <path-or-id>` returns bounded agent detail, and `interrupt <id>`
+  interrupts the selected active agent without stopping unrelated agents.
 
 ### 15.7 Optional live smoke test
 
@@ -1842,7 +1853,7 @@ V1 is done when:
 4. `delegate`, `wait_for_agents`, and the suspension hook are transcript-safe,
    schema-validated and fully race-tested. The Phase 0-proven duplicate control
    invocation guard prevents a reused tool-call ID from repeating mutations.
-5. Every agent is observable through snapshots/events and reaches exactly one
+5. Every agent is observable through status/detail/events and reaches exactly one
    terminal registry outcome even on defect or interruption.
 6. Controller and supervisor scope closure reliably abort and dispose Pi
    sessions without leaked fibers or permits.

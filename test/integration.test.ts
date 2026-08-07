@@ -106,8 +106,13 @@ it("runs a real offline root-child-grandchild swarm through Pi at concurrency on
           const rootId = yield* supervisor.startRoot("coordinate recursively");
           const rootOutcome = yield* supervisor.awaitOutcome(rootId);
           const drain = yield* supervisor.drain;
-          const snapshot = yield* supervisor.snapshot;
-          return { rootOutcome, drain, snapshot };
+          const status = yield* supervisor.status;
+          const details = yield* Effect.all([
+            supervisor.show("root"),
+            supervisor.show("root/child"),
+            supervisor.show("root/child/grandchild"),
+          ]);
+          return { rootOutcome, drain, status, details };
         }),
       ),
     );
@@ -121,23 +126,29 @@ it("runs a real offline root-child-grandchild swarm through Pi at concurrency on
       interruptedAgentIds: [],
       terminalAgentCount: 3,
     });
-    expect(
-      result.snapshot.map(({ name, profile, status }) => ({
-        name,
-        profile: profile.name,
-        status,
-      })),
-    ).toEqual([
-      { name: "root", profile: "coordinator", status: "Completed" },
-      { name: "child", profile: "researcher", status: "Completed" },
-      { name: "grandchild", profile: "worker", status: "Completed" },
+    expect(result.status.agents).toMatchObject([
+      {
+        path: "root",
+        state: "completed",
+        children: [
+          {
+            path: "root/child",
+            state: "completed",
+            children: [{ path: "root/child/grandchild", state: "completed" }],
+          },
+        ],
+      },
     ]);
-    const root = result.snapshot.find(({ name }) => name === "root");
-    const child = result.snapshot.find(({ name }) => name === "child");
-    const grandchild = result.snapshot.find(({ name }) => name === "grandchild");
-    expect(child?.parentId).toBe(root?.id);
-    expect(grandchild?.parentId).toBe(child?.id);
-    const sessionIds = result.snapshot.flatMap(({ outcome }) =>
+    expect(result.status.state).toBe("completed");
+    expect(result.status.capacity.runs.active).toBe(0);
+    expect(result.details.map(({ profile }) => profile.name)).toEqual([
+      "coordinator",
+      "researcher",
+      "worker",
+    ]);
+    expect(result.details[1]?.parentId).toBe(result.details[0]?.id);
+    expect(result.details[2]?.parentId).toBe(result.details[1]?.id);
+    const sessionIds = result.details.flatMap(({ outcome }) =>
       outcome?._tag === "Completed" ? [outcome.result.sessionId] : [],
     );
     expect(new Set(sessionIds).size).toBe(3);

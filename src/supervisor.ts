@@ -27,6 +27,7 @@ import {
   PiRunError,
   RootStartError,
   UnknownAgent,
+  UnknownAgentReference,
   decodeGoal,
   makeAgentName,
   makeBatchId,
@@ -40,7 +41,6 @@ import {
   type DelegatedTask,
   type DelegateToolDetails,
   type DrainReport,
-  type DependencyOutcome,
   type InterruptReason,
   type PiRunOutcome,
   type WaitId,
@@ -65,6 +65,14 @@ import {
   type RegisteredAgent,
   type ShutdownResult,
 } from "./registry.js";
+import {
+  buildAgentDetail,
+  buildSwarmStatus,
+  type AgentDetail,
+  type RunLifecycle,
+  type StatusAgentSource,
+  type SwarmStatus,
+} from "./status.js";
 import { compileAgentToolFactory, type ControlToolPort } from "./tools.js";
 
 export interface SupervisorOptions {
@@ -136,27 +144,11 @@ export type SupervisorEvent =
     } & SupervisorLifecycleEvent)
   | { readonly source: "pi"; readonly timestamp: number; readonly event: PiSessionEvent };
 
-/** Sanitized, detached monitoring view. Internal defects and mutable registry objects never escape. */
-export interface AgentSnapshot {
-  readonly id: AgentId;
-  readonly name: AgentName;
-  readonly parentId?: AgentId;
-  readonly profile: PublicModelProfile;
-  readonly status: AgentStatus;
-  readonly installation: RegistryAgentSnapshot["installation"];
-  readonly waitTargets: ReadonlyArray<AgentId>;
-  readonly hasPendingCommand: boolean;
-  readonly interruptRequested?: InterruptReason;
-  readonly outcome?: DependencyOutcome;
-  readonly createdAt: number;
-  readonly updatedAt: number;
-  readonly terminalAt?: number;
-}
-
 export interface AgentSupervisor {
   readonly startRoot: (goal: string) => Effect.Effect<AgentId, RootStartError>;
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
-  readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
+  readonly status: Effect.Effect<SwarmStatus>;
+  readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
   readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
   readonly drain: Effect.Effect<DrainReport>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
@@ -227,6 +219,8 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     ...(options.nextWaitId === undefined ? {} : { nextWaitId: options.nextWaitId }),
   });
   const slots = yield* Semaphore.make(options.maxConcurrency);
+  const activeRuns = yield* Ref.make(0);
+  const lifecycle = yield* Ref.make<RunLifecycle>({ state: "not_started" });
   // Serializes admission through controller installation against shutdown's installation barrier.
   const installationGate = yield* Semaphore.make(1);
   // Keeps lifecycle publication sequence identical to publication order on the sliding bus.
@@ -237,6 +231,42 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   const toolFactory = compileAgentToolFactory(options.catalogue);
   const nextBatchId = options.nextBatchId ?? (() => makeBatchId(`batch_${crypto.randomUUID()}`));
   const awaitInstallationsSettled = installationGate.withPermit(Effect.void);
+
+  const withRunSlot = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    slots.withPermit(
+      Effect.acquireUseRelease(
+        Ref.update(activeRuns, (current) => current + 1),
+        () => effect,
+        () => Ref.update(activeRuns, (current) => current - 1),
+      ),
+    );
+
+  const statusAgentSource = (agent: RegistryAgentSnapshot): StatusAgentSource => ({
+    id: agent.id,
+    name: agent.name,
+    ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
+    profile: agent.profile,
+    status: agent.status,
+    waitTargets: agent.waitTargets,
+    createdAt: agent.createdAt,
+    updatedAt: agent.updatedAt,
+    ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
+  });
+
+  const detailAgentSource = (agent: RegistryAgentSnapshot): StatusAgentSource => {
+    if (agent.outcome === undefined) return statusAgentSource(agent);
+    const outcome = dependencyOutcomeFromAgent(
+      agent.id,
+      agent.name,
+      agent.outcome,
+      options.maxFailureMessageChars,
+    );
+    return {
+      ...statusAgentSource(agent),
+      outcome:
+        outcome._tag === "Completed" ? { ...outcome, result: { ...outcome.result } } : outcome,
+    };
+  };
 
   const publishLifecycle = (event: SupervisorLifecycleEvent): Effect.Effect<void> =>
     eventPublication.withPermit(
@@ -335,7 +365,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         Effect.gen(function* () {
           const first = yield* registry.takePendingCommand(registration.id);
           yield* announceCommand(registration.id, first);
-          const opened = yield* slots.withPermit(
+          const opened = yield* withRunSlot(
             Effect.gen(function* () {
               yield* registry.markStarting(registration.id);
               yield* publishStatus(registration.id, "Starting");
@@ -356,7 +386,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           while (true) {
             const command = yield* registry.takePendingCommand(registration.id);
             yield* announceCommand(registration.id, command);
-            const next = yield* slots.withPermit(runTurn(registration.id, opened.agent, command));
+            const next = yield* withRunSlot(runTurn(registration.id, opened.agent, command));
             if (Option.isSome(next)) return next.value;
           }
         }).pipe(
@@ -503,6 +533,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     installationGate.withPermit(
       Effect.uninterruptible(
         Effect.gen(function* () {
+          const startedAt = yield* Clock.currentTimeMillis;
           const normalizedGoal = yield* decodeGoal(goal).pipe(
             Effect.mapError(() => new RootStartError({ message: "Goal must not be empty" })),
           );
@@ -513,6 +544,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           });
           yield* publishRegistration(registration);
           yield* installController(registration, options.catalogue.rootProfile);
+          yield* Ref.set(lifecycle, { state: "running", startedAt });
           return registration.id;
         }),
       ),
@@ -550,6 +582,18 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   );
 
   const drain = Effect.fn("Brood.Supervisor.drain")(function* () {
+    const drainStartedAt = yield* Clock.currentTimeMillis;
+    yield* Ref.update(lifecycle, (current): RunLifecycle => {
+      switch (current.state) {
+        case "not_started":
+          return { state: "draining", startedAt: drainStartedAt };
+        case "running":
+          return { state: "draining", startedAt: current.startedAt };
+        case "draining":
+        case "completed":
+          return current;
+      }
+    });
     yield* publishLifecycle({ type: "DrainStarted" });
     const quiescent = yield* registry.awaitQuiescence.pipe(
       Effect.timeoutOption(options.drainTimeoutMillis),
@@ -577,44 +621,51 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       interruptedAgentIds,
       terminalAgentCount: state.agents.length - state.nonterminalCount,
     };
+    const finishedAt = yield* Clock.currentTimeMillis;
+    yield* Ref.update(lifecycle, (current): RunLifecycle => {
+      switch (current.state) {
+        case "not_started":
+          return { state: "completed", startedAt: finishedAt, finishedAt };
+        case "running":
+        case "draining":
+          return { state: "completed", startedAt: current.startedAt, finishedAt };
+        case "completed":
+          return current;
+      }
+    });
     yield* publishLifecycle({ type: "DrainCompleted", report });
     return report;
   })();
 
-  const publicSnapshot = registry.snapshot.pipe(
-    Effect.map(({ agents }): ReadonlyArray<AgentSnapshot> =>
-      agents.map((agent) => {
-        const outcome =
-          agent.outcome === undefined
-            ? undefined
-            : dependencyOutcomeFromAgent(
-                agent.id,
-                agent.name,
-                agent.outcome,
-                options.maxFailureMessageChars,
-              );
-        const detachedOutcome =
-          outcome?._tag === "Completed" ? { ...outcome, result: { ...outcome.result } } : outcome;
-        return {
-          id: agent.id,
-          name: agent.name,
-          ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
-          profile: agent.profile,
-          status: agent.status,
-          installation: agent.installation,
-          waitTargets: agent.waitTargets,
-          hasPendingCommand: agent.hasPendingCommand,
-          ...(agent.interruptRequested === undefined
-            ? {}
-            : { interruptRequested: { ...agent.interruptRequested } }),
-          ...(detachedOutcome === undefined ? {} : { outcome: detachedOutcome }),
-          createdAt: agent.createdAt,
-          updatedAt: agent.updatedAt,
-          ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
-        };
-      }),
-    ),
-  );
+  const status = Effect.gen(function* () {
+    const state = yield* registry.snapshot;
+    const currentLifecycle = yield* Ref.get(lifecycle);
+    const currentActiveRuns = yield* Ref.get(activeRuns);
+    const now = yield* Clock.currentTimeMillis;
+    return buildSwarmStatus({
+      lifecycle: currentLifecycle,
+      now,
+      maxAgents: options.maxAgents,
+      maxConcurrency: options.maxConcurrency,
+      activeRuns: currentActiveRuns,
+      agents: state.agents.map(statusAgentSource),
+    });
+  });
+
+  const show = Effect.fn("Brood.Supervisor.show")(function* (reference: string) {
+    const state = yield* registry.snapshot;
+    const now = yield* Clock.currentTimeMillis;
+    const detail = buildAgentDetail(
+      {
+        now,
+        agents: state.agents.map(detailAgentSource),
+      },
+      reference,
+    );
+    return detail === undefined
+      ? yield* Effect.fail(new UnknownAgentReference({ reference }))
+      : detail;
+  });
 
   yield* Effect.addFinalizer(() =>
     Effect.gen(function* () {
@@ -627,7 +678,8 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   return {
     startRoot,
     awaitOutcome: registry.awaitOutcome,
-    snapshot: publicSnapshot,
+    status,
+    show,
     interrupt,
     drain,
     events: PubSub.subscribe(eventBus),

@@ -49,6 +49,9 @@ When stdin is a terminal, Brood accepts these commands while the run is live:
 
 ```text
 status
+status --json
+show root/vask
+show agent_<id> --json
 interrupt <agent-id>
 events on
 events off
@@ -88,7 +91,7 @@ const program = runBrood("Implement the feature and verify it", {
 const result = await Effect.runPromise(program);
 ```
 
-For a live UI or operator, use `makeBroodApplication` inside `Effect.scoped`. It exposes only `run` and a narrow controller with `snapshot`, `events`, and `interrupt`; the supervisor's agent tools and Pi runtime remain private.
+For a live UI or operator, use `makeBroodApplication` inside `Effect.scoped`. It exposes only `run` and a narrow controller with `status`, `show`, `events`, and `interrupt`; the supervisor's agent tools and Pi runtime remain private. `status` is an authoritative bounded record of run state, capacity, state counts, and the canonical agent tree. `show(pathOrId)` is the separate bounded detail view for one agent.
 
 ## Agent protocol
 
@@ -102,7 +105,7 @@ All agents share one workspace. Brood deliberately provides no worktrees, file o
 
 Brood does not recover a live swarm after process failure, steer a model mid-run, enforce a depth or monetary budget, isolate the shared workspace, restrict profiles by role, switch models within a session, or cancel descendants when a parent fails. It also disables Pi's mutable workspace context-file loading; repository-specific instructions should be part of the root goal until Brood can snapshot them once at run start. The provenance tree and dynamic wait relationship are intentionally separate; orphaned agents run to completion and are included in drain.
 
-Configured profiles have equal tools and delegation power. `maxAgents` is a total admission budget for the run, including terminal agents, while `maxConcurrency` limits only simultaneous Pi runs. Monitoring is bounded and lossy; snapshots are authoritative and Pi JSONL is the transcript audit source.
+Configured profiles have equal tools and delegation power. `maxAgents` is a total admission budget for the run, including terminal agents, while `maxConcurrency` limits only simultaneous Pi runs. Monitoring events are bounded and lossy; status is authoritative and Pi JSONL is the transcript audit source.
 
 ## Development
 

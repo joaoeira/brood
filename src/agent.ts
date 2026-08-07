@@ -283,6 +283,15 @@ export class UnknownAgent extends Schema.TaggedError<UnknownAgent>()("UnknownAge
   }
 }
 
+export class UnknownAgentReference extends Schema.TaggedError<UnknownAgentReference>()(
+  "UnknownAgentReference",
+  { reference: Schema.String },
+) {
+  get message(): string {
+    return `Unknown agent reference: ${this.reference}`;
+  }
+}
+
 export class RootStartError extends Schema.TaggedError<RootStartError>()("RootStartError", {
   message: Schema.String,
 }) {}

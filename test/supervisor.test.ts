@@ -127,6 +127,88 @@ it.effect(
     ),
 );
 
+it.effect("reports bounded capacity and a canonical wait tree", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* TestClock.setTime(1_000);
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 1, maxAgents: 4 }),
+      });
+
+      const rootId = yield* supervisor.startRoot("coordinate");
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      const delegated = yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-status"),
+        [{ name: makeAgentName("api"), goal: "build the api" }],
+        "all",
+      );
+      const child = delegated.agents[0];
+      if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+      yield* fake.suspend(rootId);
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      yield* TestClock.adjust(2_500);
+
+      const status = yield* supervisor.status;
+
+      expect(JSON.stringify(status)).not.toContain("agent_");
+      expect(status).toEqual({
+        version: 1,
+        state: "running",
+        elapsedMillis: 2_500,
+        capacity: {
+          agents: { admitted: 2, limit: 4, remaining: 2 },
+          runs: { active: 1, limit: 1, available: 0 },
+        },
+        counts: {
+          starting: 0,
+          queued: 0,
+          running: 1,
+          waiting: 1,
+          completed: 0,
+          failed: 0,
+          interrupted: 0,
+        },
+        agents: [
+          {
+            path: "root",
+            name: "root",
+            state: "waiting",
+            durationMillis: 2_500,
+            waitTargets: ["root/api"],
+            children: [
+              {
+                path: "root/api",
+                name: "api",
+                state: "running",
+                durationMillis: 2_500,
+                waitTargets: [],
+                children: [],
+              },
+            ],
+          },
+        ],
+      });
+
+      yield* fake.complete(child.id, "api complete");
+      yield* fake.nextRun;
+      yield* fake.complete(rootId, "root complete");
+      yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+    }),
+  ),
+);
+
 it.effect("enforces one global concurrency limit across root and delegated controllers", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -200,15 +282,65 @@ it.effect("materializes Pi open failures as terminal agent outcomes", () =>
       const rootId = yield* supervisor.startRoot("coordinate");
       yield* fake.nextOpen;
       const outcome = yield* supervisor.awaitOutcome(rootId);
-      const snapshot = yield* supervisor.snapshot;
+      const status = yield* supervisor.status;
       const drain = yield* supervisor.drain;
 
       expect(outcome._tag).toBe("Failed");
       if (outcome._tag === "Failed") {
         expect(outcome.failure._tag).toBe("AgentStartFailed");
       }
-      expect(snapshot[0]?.status).toBe("Failed");
+      expect(status.agents[0]?.state).toBe("failed");
       expect(drain.terminalAgentCount).toBe(1);
+    }),
+  ),
+);
+
+it.effect("keeps status outcome-free and exposes bounded detail by path or ID", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* TestClock.setTime(10_000);
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxAgents: 2 }),
+      });
+
+      const rootId = yield* supervisor.startRoot("coordinate");
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      yield* TestClock.adjust(750);
+      yield* fake.complete(rootId, "bounded result summary");
+      yield* supervisor.awaitOutcome(rootId);
+
+      const status = yield* supervisor.status;
+      const byPath = yield* supervisor.show("root");
+      const byId = yield* supervisor.show(rootId);
+
+      expect(status.counts.completed).toBe(1);
+      expect(status.agents[0]).not.toHaveProperty("outcome");
+      expect(JSON.stringify(status)).not.toContain("bounded result summary");
+      expect(byPath).toEqual(byId);
+      expect(byPath).toMatchObject({
+        version: 1,
+        path: "root",
+        id: rootId,
+        state: "completed",
+        durationMillis: 750,
+        outcome: {
+          _tag: "Completed",
+          result: { summary: "bounded result summary" },
+        },
+      });
+
+      const unknown = yield* supervisor.show("root/missing").pipe(Effect.flip);
+      expect(unknown).toMatchObject({ _tag: "UnknownAgentReference", reference: "root/missing" });
+      yield* supervisor.drain;
     }),
   ),
 );
@@ -436,10 +568,12 @@ it.effect("publishes authoritative interruption and timeout events when operator
       yield* Latch.await(runInterrupted);
       const draining = yield* Effect.forkChild(supervisor.drain);
       yield* Latch.await(drainStarted);
+      const statusWhileDraining = yield* supervisor.status;
       yield* TestClock.adjust(1_000);
       yield* Latch.open(releaseInterruption);
       yield* Fiber.join(interruption);
       const report = yield* Fiber.join(draining);
+      const statusAfterDrain = yield* supervisor.status;
       const outcome = yield* supervisor.awaitOutcome(rootId);
       const events = Array.from(yield* Fiber.join(lifecycle));
       const interruptEvents = events.filter((event) => event.type === "AgentInterruptRequested");
@@ -458,6 +592,8 @@ it.effect("publishes authoritative interruption and timeout events when operator
           interruptedAgentIds: [rootId],
         }),
       );
+      expect(statusWhileDraining.state).toBe("draining");
+      expect(statusAfterDrain.state).toBe("completed");
       expect(outcome).toEqual({
         _tag: "Interrupted",
         reason: { _tag: "OperatorRequested", source: "api" },
@@ -552,15 +688,15 @@ it.effect("rejects an empty normalized root goal before registering an agent", (
       });
 
       const error = yield* supervisor.startRoot(" \n ").pipe(Effect.flip);
-      const snapshot = yield* supervisor.snapshot;
+      const status = yield* supervisor.status;
 
       expect(error._tag).toBe("RootStartError");
-      expect(snapshot).toEqual([]);
+      expect(status.agents).toEqual([]);
     }),
   ),
 );
 
-it.effect("redacts controller defects in the public snapshot", () =>
+it.effect("redacts controller defects in agent detail", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const catalogue = yield* compileProfileCatalogue(
@@ -579,15 +715,17 @@ it.effect("redacts controller defects in the public snapshot", () =>
 
       const rootId = yield* supervisor.startRoot("work");
       yield* supervisor.awaitOutcome(rootId);
-      const snapshot = yield* supervisor.snapshot;
-      const serialized = JSON.stringify(snapshot);
+      const detail = yield* supervisor.show(rootId);
+      const status = yield* supervisor.status;
+      const serialized = JSON.stringify(detail);
 
-      expect(snapshot[0]?.outcome).toMatchObject({
+      expect(detail.outcome).toMatchObject({
         _tag: "Failed",
         code: "AgentDefect",
       });
       expect(serialized).not.toContain("SECRET_TOKEN");
       expect(serialized).not.toContain("/private/operator/path");
+      expect(JSON.stringify(status)).not.toContain("SECRET_TOKEN");
     }),
   ),
 );
