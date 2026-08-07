@@ -1,8 +1,15 @@
 # Brood v1 implementation plan
 
-Status: frozen implementation contract; Phase 0 complete
+Status: v1 implemented; frozen contract retained as the implementation and review record
 Date: 2026-08-07
 Audience: implementers and reviewers
+
+Implementation verification: the deterministic offline suite covers the domain,
+tool protocol, registry races, semaphore/controller lifecycle, real Pi adapter,
+CLI parsing, and an actual Pi-driven root → child → grandchild swarm at global
+concurrency one. The opt-in live-provider smoke test is present but intentionally
+not part of normal CI. `pnpm typecheck`, `pnpm test`, `pnpm check`, and
+`pnpm build` are the release gates.
 
 This document specifies the first implementation of Brood: an Effect-native,
 supervised multi-agent harness built on Pi. It is intentionally more precise
@@ -640,7 +647,8 @@ use lighter tagged types. At minimum:
 - `UnknownAgent`;
 - `AgentFailed`, produced only by `interpretRootOutcome`/`runBrood` when the
   root's value-level outcome is failed; `awaitOutcome` itself never fails because
-  an agent failed. It carries the root failure plus the completed `DrainReport`;
+  an agent failed. It carries a bounded public failure code/message plus the
+  completed `DrainReport`; the raw controller `Cause` remains internal;
 - `RootInterrupted`, produced when the root reaches value-level `Interrupted`
   through the operator/API `interrupt(rootId, source)` path. It carries the
   `InterruptReason` and completed `DrainReport`. External interruption of the
@@ -988,9 +996,12 @@ an agent's JSONL file.
    model. Authentication/preflight rejection discovered by `prompt()` is a
    first-run `PiRunError`;
 7. install `session.agent.shouldStopAfterTurn` immediately;
-   leave `prepareNextTurn` and `prepareNextTurnWithContext` uninstalled so no
-   hook can replace context/model between the persisted tool results and the
-   suspension decision;
+   explicitly clear both `session.agent.prepareNextTurn` and
+   `prepareNextTurnWithContext` immediately after construction (`delete` under
+   exact-optional TypeScript semantics),
+   because Pi `0.84.1` installs `prepareNextTurnWithContext` internally even
+   when the caller supplies no hook. This prevents any hook from replacing
+   context/model between persisted tool results and the suspension decision;
 8. subscribe to session events before the first run;
 9. expose a scoped `PiAgent`, never the raw session;
 10. finalize in this order: abort compaction, await session abort, unsubscribe the
@@ -1182,13 +1193,14 @@ Minimum supervisor events are agent registered, status changed, batch admitted,
 wait planned, agent suspended, agent resumed, Pi run started/settled, and agent
 terminal. Monitoring must not be on the critical path of registry correctness;
 slow subscribers may not block agent execution. Use a bounded sliding `PubSub`
-for lossy live delivery. Registry-derived supervisor events receive one global,
-monotonically increasing `registrySequence` inside the state transition before
-publication. Pi lifecycle events never enter a registry transition; each session
+for lossy live delivery. Supervisor events receive one serialized, monotonically
+increasing publication `sequence`; it deliberately does not claim to be registry
+commit order because event delivery is outside the correctness-critical registry
+transition. Pi lifecycle events never enter a registry transition; each session
 listener assigns its own monotonic `sessionSequence`. The combined stream makes
-no false promise of one total cross-source order. Events also carry `agentId`,
-source, and timestamp, and consumers use the appropriate sequence to detect gaps
-before refreshing from the authoritative snapshot.
+no false promise of one total cross-source order. Events also carry source and
+timestamp, and consumers use the appropriate sequence to detect gaps before
+refreshing from the authoritative snapshot.
 
 The bounded `PubSub` is lossy monitoring, not a durable audit trail. Session
 JSONL records the actual provider/model only after a session opens, so it cannot
@@ -1215,8 +1227,9 @@ Recommended runtime layout:
 
 ## 12. Configuration and application entry point
 
-Every configuration source—file-loaded, environment, or programmatic—uses
-exactly one layer-build pipeline:
+Every supported configuration source—JSON-file-loaded or programmatic—uses
+exactly one layer-build pipeline. A future environment adapter must enter
+through this same boundary; v1 does not ship one:
 
 1. Schema-decode the complete raw encoded shape, including the dynamic profile
    record and non-profile constraints.
@@ -1297,6 +1310,35 @@ interactive terminal it accepts at least `status`, `interrupt <agent-id>`, and
 newline-delimited monitor events. V1 does not add a network control server or
 pretend that a second CLI process can control the first without transport.
 
+### 12.1 Effect package audit
+
+The implementation was reviewed against the packages shipped with pinned
+Effect `4.0.0-beta.105`. Brood already uses the profitable concurrency and
+lifecycle primitives directly: `Semaphore`, `FiberMap`, `PubSub.sliding`,
+`Queue`, `Latch`, `Deferred`, `Ref`, `Schema`, `Config`, `Scope`, and `Stream`.
+The registry's single immutable `Ref` transition remains deliberate: replacing
+it with `SynchronizedRef`, an actor, or Effect collections would obscure the
+commit/post-commit boundary without removing domain code.
+
+V1 deliberately does not adopt `effect/unstable/cli`. Doing so requires the
+exact matching `@effect/platform-node@4.0.0-beta.105`, whose dependency surface
+includes platform-node-shared, Undici, MIME support, and an ioredis peer. More
+importantly, `Command.run` renders human help before returning parse failures,
+which conflicts with Brood's machine-readable non-interactive terminal-record
+contract, while `Terminal.readLine` has different raw-mode and Ctrl-C semantics
+from the scoped operator console. The current boundary is small and tested;
+it handles both SIGINT and SIGTERM, removes handlers, and uses conventional
+signal exit codes. Reconsider Effect CLI when its v4 API stabilizes or when the
+command surface grows enough to justify a custom `CliOutput` policy and PTY
+tests. Do not install the Effect 3-era `@effect/cli` package.
+
+The Node filesystem calls in `runtime.ts` and `pi-adapter.ts` also remain local
+adapters. Migrating them to Effect `FileSystem` and `Path` would propagate new
+service requirements through runtime construction and session acquisition with
+little benefit until Brood needs filesystem fault injection or a non-Node
+platform. XML normalization, admission, wait activation, and resume-envelope
+construction are Brood protocol logic rather than missing library utilities.
+
 ## 13. Initial file layout
 
 Start as one package, not a monorepo:
@@ -1312,8 +1354,10 @@ brood/
     registry.ts        # private serialized state machine
     supervisor.ts      # service, FiberMap, semaphore, controllers
     tools.ts           # TypeBox schemas and Pi custom-tool bridge
-    runtime.ts         # Config and live Layer wiring
-    main.ts            # programmatic entry and thin CLI handoff
+    runtime.ts         # Config and scoped runtime wiring
+    main.ts            # narrow programmatic application entry
+    cli.ts             # thin local operator CLI
+    index.ts           # deliberately narrow package exports
   test/
     support/
       fake-pi-adapter.ts
@@ -1323,7 +1367,10 @@ brood/
     supervisor.test.ts
     tools.test.ts
     pi-adapter.test.ts
+    integration.test.ts
     lifecycle.test.ts
+    cli.test.ts
+    live/smoke.test.ts
   vendor/
     kitlangton-effect-skill/
 ```
@@ -1485,10 +1532,12 @@ reuse across resume with the same exact profile.
 
 ### Phase 7: runtime wiring and end-to-end harness
 
-1. Implement Config-backed live layers, dynamic profile record decoding, and
+1. Implement Config-backed scoped composition, dynamic profile record decoding, and
    separate workspace/state directories.
 2. Create one shared `ModelRuntime`, compile one immutable catalogue, and compose
-   the flat `BroodLive` layer graph around those values.
+   the flat scoped runtime graph around those values. A public service Layer is
+   not required when the direct scoped constructor preserves the same lifetime
+   and capability boundaries with less surface area.
 3. Implement `runBrood` with value-level root outcome capture and orphan drain.
 4. Add the interactive CLI operator commands (`status`, `interrupt`, event
    display), non-interactive event output, and structured logging.

@@ -1,6 +1,6 @@
 import type { Api, Model, ModelThinkingLevel as PiModelThinkingLevel } from "@earendil-works/pi-ai";
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
-import { Cause, Data, Effect, HashMap, Option, Schema } from "effect";
+import { Cause, Effect, HashMap, Option, Schema } from "effect";
 
 const modelFriendlyName = Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/);
 const opaqueAgentId = Schema.isPattern(/^agent_[A-Za-z0-9_-]+$/);
@@ -59,9 +59,13 @@ export const makeProfileName = Schema.decodeUnknownSync(ProfileName);
 export const decodeAgentName = Schema.decodeUnknownEffect(AgentName);
 export const decodeProfileName = Schema.decodeUnknownEffect(ProfileName);
 
+export const Goal = Schema.Trim.check(Schema.isMinLength(1));
+export type Goal = typeof Goal.Type;
+export const decodeGoal = Schema.decodeUnknownEffect(Goal);
+
 export const DelegatedTask = Schema.Struct({
   name: AgentName,
-  goal: Schema.Trim.check(Schema.isMinLength(1)),
+  goal: Goal,
   profile: Schema.optionalKey(ProfileName),
 });
 export interface DelegatedTask extends Schema.Schema.Type<typeof DelegatedTask> {}
@@ -455,10 +459,18 @@ export interface PiRunResult {
   readonly stopReason: "stop";
 }
 
-export type InterruptReason =
-  | { readonly _tag: "OperatorRequested"; readonly source: "cli" | "api" }
-  | { readonly _tag: "DrainTimeout"; readonly timeoutMillis: number }
-  | { readonly _tag: "SupervisorShutdown" };
+export const InterruptReason = Schema.Union([
+  Schema.Struct({
+    _tag: Schema.Literal("OperatorRequested"),
+    source: Schema.Literals(["cli", "api"]),
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("DrainTimeout"),
+    timeoutMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  }),
+  Schema.Struct({ _tag: Schema.Literal("SupervisorShutdown") }),
+]);
+export type InterruptReason = typeof InterruptReason.Type;
 
 export type AgentFailure =
   | { readonly _tag: "AgentStartFailed"; readonly error: PiOpenError }
@@ -493,15 +505,26 @@ export const BroodResult = Schema.Struct({
 });
 export interface BroodResult extends Schema.Schema.Type<typeof BroodResult> {}
 
-export class AgentFailed extends Data.TaggedError("AgentFailed")<{
-  readonly failure: AgentFailure;
-  readonly drain: DrainReport;
-}> {}
+export const AgentFailureSummary = Schema.Struct({
+  code: Schema.Literals([
+    "AgentStartFailed",
+    "AgentRunFailed",
+    "AgentProtocolFailed",
+    "AgentDefect",
+  ]),
+  message: Schema.String,
+});
+export type AgentFailureSummary = typeof AgentFailureSummary.Type;
 
-export class RootInterrupted extends Data.TaggedError("RootInterrupted")<{
-  readonly reason: InterruptReason;
-  readonly drain: DrainReport;
-}> {}
+export class AgentFailed extends Schema.TaggedError<AgentFailed>()("AgentFailed", {
+  failure: AgentFailureSummary,
+  drain: DrainReport,
+}) {}
+
+export class RootInterrupted extends Schema.TaggedError<RootInterrupted>()("RootInterrupted", {
+  reason: InterruptReason,
+  drain: DrainReport,
+}) {}
 
 export const TRUNCATION_SENTINEL = "\n[truncated by Brood]";
 export const MIN_BOUNDED_TEXT_CHARS = Array.from(TRUNCATION_SENTINEL).length;
@@ -564,14 +587,15 @@ const failureText = (failure: AgentFailure): string => {
   }
 };
 
-const interruptCode = (reason: InterruptReason): string => {
-  switch (reason._tag) {
-    case "OperatorRequested":
-    case "DrainTimeout":
-    case "SupervisorShutdown":
-      return reason._tag;
-  }
-};
+export const summarizeAgentFailure = (
+  failure: AgentFailure,
+  maxFailureMessageChars: number,
+): AgentFailureSummary => ({
+  code: failure._tag,
+  message: truncateCodePoints(normalizeText(failureText(failure)), maxFailureMessageChars).text,
+});
+
+const interruptCode = (reason: InterruptReason): string => reason._tag;
 
 export const dependencyOutcomeFromAgent = (
   agentId: AgentId,
@@ -583,11 +607,8 @@ export const dependencyOutcomeFromAgent = (
     case "Completed":
       return { _tag: "Completed", agentId, name, result: outcome.result };
     case "Failed": {
-      const message = truncateCodePoints(
-        normalizeText(failureText(outcome.failure)),
-        maxFailureMessageChars,
-      ).text;
-      return { _tag: "Failed", agentId, name, code: outcome.failure._tag, message };
+      const failure = summarizeAgentFailure(outcome.failure, maxFailureMessageChars);
+      return { _tag: "Failed", agentId, name, code: failure.code, message: failure.message };
     }
     case "Interrupted":
       return { _tag: "Interrupted", agentId, name, reason: interruptCode(outcome.reason) };

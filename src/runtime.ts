@@ -1,4 +1,4 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { chmod, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Duration, Effect, Schema } from "effect";
@@ -145,7 +145,7 @@ const validateConfig = (
   );
 };
 
-export const decodeBroodConfig = Effect.fn("Brood.decodeBroodConfig")((raw: BroodConfigEncoded) =>
+const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")((raw: unknown) =>
   ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
     Effect.mapError(
       (error) =>
@@ -159,6 +159,8 @@ export const decodeBroodConfig = Effect.fn("Brood.decodeBroodConfig")((raw: Broo
   ),
 );
 
+export const decodeBroodConfig = (raw: BroodConfigEncoded) => decodeBroodConfigUnknown(raw);
+
 const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (config: BroodConfig) {
   const paths = [
     config.workspacePath,
@@ -167,7 +169,11 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
     config.sessionDirectory,
   ] as const;
   yield* Effect.tryPromise({
-    try: () => Promise.all(paths.map((path) => mkdir(path, { recursive: true }))),
+    try: () =>
+      Promise.all([
+        mkdir(config.workspacePath, { recursive: true }),
+        ...paths.slice(1).map((path) => mkdir(path, { recursive: true, mode: 0o700 })),
+      ]),
     catch: (cause) =>
       configError(
         `Unable to prepare Brood directories: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -201,6 +207,17 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
       ),
     );
   }
+  yield* Effect.tryPromise({
+    try: () =>
+      Promise.all(
+        [stateDirectory, piAgentDirectory, sessionDirectory].map((path) => chmod(path, 0o700)),
+      ),
+    catch: (cause) =>
+      configError(
+        `Unable to secure Brood state directories: ${cause instanceof Error ? cause.message : String(cause)}`,
+        "stateDirectory",
+      ),
+  });
   return Object.freeze({
     ...config,
     workspacePath,
@@ -228,23 +245,26 @@ const createModelRuntime = Effect.fn("Brood.createModelRuntime")((config: BroodC
   }),
 );
 
-export const buildBroodRuntime = Effect.fn("Brood.buildBroodRuntime")((raw: BroodConfigEncoded) =>
-  Effect.gen(function* () {
-    const decoded = yield* decodeBroodConfig(raw);
-    const config = yield* prepareDirectories(decoded);
-    const modelRuntime = yield* createModelRuntime(config);
-    const profileInput: ProfilesConfigInput = {
-      defaultProfile: config.defaultProfile,
-      profiles: config.profiles,
-      ...(config.rootProfile === undefined ? {} : { rootProfile: config.rootProfile }),
-    };
-    const catalogue = yield* compileProfileCatalogue(
-      profileInput,
-      {
-        getModel: (provider, model) => modelRuntime.getModel(provider, model),
-      },
-      config.maxProfileHelpChars,
-    );
-    return Object.freeze({ config, modelRuntime, catalogue }) satisfies BroodRuntime;
-  }),
+export const buildBroodRuntimeUnknown = Effect.fn("Brood.buildBroodRuntimeUnknown")(
+  (raw: unknown) =>
+    Effect.gen(function* () {
+      const decoded = yield* decodeBroodConfigUnknown(raw);
+      const config = yield* prepareDirectories(decoded);
+      const modelRuntime = yield* createModelRuntime(config);
+      const profileInput: ProfilesConfigInput = {
+        defaultProfile: config.defaultProfile,
+        profiles: config.profiles,
+        ...(config.rootProfile === undefined ? {} : { rootProfile: config.rootProfile }),
+      };
+      const catalogue = yield* compileProfileCatalogue(
+        profileInput,
+        {
+          getModel: (provider, model) => modelRuntime.getModel(provider, model),
+        },
+        config.maxProfileHelpChars,
+      );
+      return Object.freeze({ config, modelRuntime, catalogue }) satisfies BroodRuntime;
+    }),
 );
+
+export const buildBroodRuntime = (raw: BroodConfigEncoded) => buildBroodRuntimeUnknown(raw);

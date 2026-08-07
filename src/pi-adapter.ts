@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AssistantMessage, StopReason, ToolResultMessage } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
@@ -133,7 +133,6 @@ export const inspectControlToolResults = (
 
 interface FinalTurn {
   readonly message: AssistantMessage;
-  readonly toolResults: ReadonlyArray<ToolResultMessage>;
 }
 
 interface RunClassifier {
@@ -326,8 +325,12 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
     yield* Effect.tryPromise({
       try: () =>
         Promise.all([
-          mkdir(options.piAgentDirectory, { recursive: true }),
-          mkdir(agentSessionDirectory, { recursive: true }),
+          mkdir(options.piAgentDirectory, { recursive: true, mode: 0o700 }).then(() =>
+            chmod(options.piAgentDirectory, 0o700),
+          ),
+          mkdir(agentSessionDirectory, { recursive: true, mode: 0o700 }).then(() =>
+            chmod(agentSessionDirectory, 0o700),
+          ),
         ]),
       catch: (cause) => new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
     });
@@ -354,58 +357,63 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
       catch: (cause) => new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
     });
 
-    const created = yield* Effect.tryPromise({
-      try: () =>
-        createAgentSession({
-          cwd: options.workspacePath,
-          agentDir: options.piAgentDirectory,
-          modelRuntime: options.modelRuntime,
-          model: request.profile.model,
-          thinkingLevel: request.profile.public.thinkingLevel,
-          customTools: [...request.tools],
-          resourceLoader,
-          sessionManager,
-          settingsManager,
-        }),
-      catch: (cause) => new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
-    });
-    const session = created.session;
     const queue = yield* Queue.sliding<PiSessionEvent>(options.eventBufferCapacity ?? 256);
+    yield* Effect.addFinalizer(() => Queue.shutdown(queue));
+    let unsubscribe = (): void => {};
+    const acquired = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const created = yield* Effect.tryPromise({
+          try: () =>
+            createAgentSession({
+              cwd: options.workspacePath,
+              agentDir: options.piAgentDirectory,
+              modelRuntime: options.modelRuntime,
+              model: request.profile.model,
+              thinkingLevel: request.profile.public.thinkingLevel,
+              customTools: [...request.tools],
+              resourceLoader,
+              sessionManager,
+              settingsManager,
+            }),
+          catch: (cause) =>
+            new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
+        });
+        const session = created.session;
+        const abortAndAwait = Effect.sync(() => session.abortCompaction()).pipe(
+          Effect.andThen(
+            Effect.tryPromise({
+              try: () => session.abort(),
+              catch: (cause) => cause,
+            }).pipe(Effect.timeout(options.sessionCleanupTimeoutMillis)),
+          ),
+          Effect.catchCause(() =>
+            Effect.logWarning("Pi session cleanup did not finish cleanly", {
+              agentId: request.agentId,
+              sessionId: session.sessionId,
+            }),
+          ),
+        );
+        yield* Effect.addFinalizer(() =>
+          abortAndAwait.pipe(
+            Effect.andThen(Effect.sync(() => unsubscribe())),
+            Effect.andThen(
+              Effect.sync(() => {
+                try {
+                  session.dispose();
+                } catch {
+                  // Disposal is best effort after the awaited abort barrier.
+                }
+              }),
+            ),
+          ),
+        );
+        return { created, session, abortAndAwait };
+      }),
+    );
+    const { abortAndAwait, created, session } = acquired;
     const inFlight = yield* Ref.make(false);
     let classifier = freshClassifier();
     let sessionSequence = 0;
-    let unsubscribe = (): void => {};
-
-    const abortAndAwait = Effect.sync(() => session.abortCompaction()).pipe(
-      Effect.andThen(
-        Effect.tryPromise({
-          try: () => session.abort(),
-          catch: (cause) => cause,
-        }).pipe(Effect.timeout(options.sessionCleanupTimeoutMillis)),
-      ),
-      Effect.catchCause(() =>
-        Effect.logWarning("Pi session cleanup did not finish cleanly", {
-          agentId: request.agentId,
-          sessionId: session.sessionId,
-        }),
-      ),
-    );
-
-    yield* Effect.addFinalizer(() =>
-      abortAndAwait.pipe(
-        Effect.andThen(Effect.sync(() => unsubscribe())),
-        Effect.andThen(
-          Effect.sync(() => {
-            try {
-              session.dispose();
-            } catch {
-              // Disposal is best effort after the awaited abort barrier.
-            }
-          }),
-        ),
-        Effect.andThen(Queue.shutdown(queue)),
-      ),
-    );
 
     delete session.agent.prepareNextTurn;
     delete session.agent.prepareNextTurnWithContext;
@@ -436,9 +444,12 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
                 }),
               );
             } else {
-              const error = validateToolBatch(request.agentId, event.message, event.toolResults);
+              const error =
+                event.message.stopReason === "error" || event.message.stopReason === "aborted"
+                  ? undefined
+                  : validateToolBatch(request.agentId, event.message, event.toolResults);
               if (error !== undefined) setFirstProtocolError(classifier, error);
-              classifier.finalTurn = { message: event.message, toolResults: event.toolResults };
+              classifier.finalTurn = { message: event.message };
             }
             break;
           case "tool_execution_start":
@@ -459,10 +470,13 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
         const monitor = toMonitorEvent(
           request.agentId,
           session.sessionId,
-          ++sessionSequence,
+          sessionSequence + 1,
           event,
         );
-        if (monitor !== undefined) Queue.offerUnsafe(queue, monitor);
+        if (monitor !== undefined) {
+          sessionSequence += 1;
+          Queue.offerUnsafe(queue, monitor);
+        }
       } catch {
         // Pi listeners are synchronous. Monitoring and defensive classification must never escape.
       }

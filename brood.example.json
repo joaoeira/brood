@@ -1,0 +1,29 @@
+{
+  "workspacePath": "/absolute/path/to/workspace",
+  "stateDirectory": "/absolute/path/to/brood-state",
+  "piAgentDirectory": "/absolute/path/to/brood-state/pi-agent",
+  "sessionDirectory": "/absolute/path/to/brood-state/sessions",
+  "maxConcurrency": 4,
+  "maxAgents": 128,
+  "maxAgentResultChars": 12000,
+  "maxFailureMessageChars": 2000,
+  "maxResumePromptChars": 48000,
+  "maxProfileHelpChars": 4000,
+  "drainTimeout": "10 minutes",
+  "sessionCleanupTimeout": "30 seconds",
+  "defaultProfile": "worker",
+  "rootProfile": "coordinator",
+  "profiles": {
+    "coordinator": {
+      "description": "Plans, delegates, and synthesizes",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "thinkingLevel": "high"
+    },
+    "worker": {
+      "description": "General implementation work",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5"
+    }
+  }
+}

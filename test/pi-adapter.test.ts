@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import { Cause, Effect, Exit, Fiber, Stream } from "effect";
 import { describe, expect, it } from "vitest";
 import {
   compileProfileCatalogue,
@@ -134,8 +134,15 @@ describe("Pi control-result inspection", () => {
       modelRuntime.registerNativeProvider(faux.provider);
       await modelRuntime.setRuntimeApiKey("scripted-complete", "offline-test-key");
       await modelRuntime.refresh({ allowNetwork: false, providers: ["scripted-complete"] });
+      let observedSystemPrompt: string | undefined;
       faux.setResponses([
-        fauxAssistantMessage("finished", { stopReason: "stop", responseId: "response-1" }),
+        (context) => {
+          observedSystemPrompt = context.systemPrompt;
+          return fauxAssistantMessage("finished", {
+            stopReason: "stop",
+            responseId: "response-1",
+          });
+        },
       ]);
       const model = modelRuntime.getModel("scripted-complete", "scripted-small")!;
       const profile = {
@@ -178,7 +185,7 @@ describe("Pi control-result inspection", () => {
         modelRuntime,
         sessionCleanupTimeoutMillis: 1_000,
       });
-      const outcome = await Effect.runPromise(
+      const completed = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
             const agent = yield* adapter.open({
@@ -187,11 +194,16 @@ describe("Pi control-result inspection", () => {
               tools: compileAgentToolFactory(catalogue).forCaller(agentId, port),
               systemPrompt: "Brood scripted completion",
             });
-            return yield* agent.run("complete");
+            const monitor = yield* Effect.forkChild(
+              Stream.runCollect(agent.events.pipe(Stream.take(4))),
+            );
+            const outcome = yield* agent.run("complete");
+            const events = yield* Fiber.join(monitor);
+            return { outcome, events: Array.from(events) };
           }),
         ),
       );
-      expect(outcome).toEqual({
+      expect(completed.outcome).toEqual({
         _tag: "Completed",
         result: {
           finalText: "finished",
@@ -199,6 +211,103 @@ describe("Pi control-result inspection", () => {
           stopReason: "stop",
         },
       });
+      expect(completed.events.map(({ sessionSequence }) => sessionSequence)).toEqual([1, 2, 3, 4]);
+      expect(observedSystemPrompt).toContain("Brood scripted completion");
+      expect(observedSystemPrompt).toContain("Current working directory:");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects concurrent runs without disturbing the owning prompt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "brood-pi-concurrent-"));
+    try {
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+      const faux = fauxProvider({
+        provider: "scripted-concurrent",
+        models: [{ id: "scripted-small" }],
+      });
+      modelRuntime.registerNativeProvider(faux.provider);
+      await modelRuntime.setRuntimeApiKey("scripted-concurrent", "offline-test-key");
+      await modelRuntime.refresh({ allowNetwork: false, providers: ["scripted-concurrent"] });
+
+      let releaseResponse: (() => void) | undefined;
+      let announceStarted: (() => void) | undefined;
+      const started = new Promise<void>((resolveStarted) => {
+        announceStarted = resolveStarted;
+      });
+      faux.setResponses([
+        async () => {
+          announceStarted?.();
+          await new Promise<void>((resolveResponse) => {
+            releaseResponse = resolveResponse;
+          });
+          return fauxAssistantMessage("owner complete", { stopReason: "stop" });
+        },
+      ]);
+
+      const model = modelRuntime.getModel("scripted-concurrent", "scripted-small")!;
+      const catalogue = await Effect.runPromise(
+        compileProfileCatalogue(
+          {
+            defaultProfile: "worker",
+            profiles: {
+              worker: {
+                description: "worker",
+                provider: "scripted-concurrent",
+                model: "scripted-small",
+                thinkingLevel: "off",
+              },
+            },
+          },
+          { getModel: (provider, id) => modelRuntime.getModel(provider, id) },
+          4_000,
+        ),
+      );
+      const port: ControlToolPort = {
+        delegate: () => Effect.die("unused"),
+        waitForAgents: () => Effect.die("unused"),
+      };
+      const adapter = makePiAdapter({
+        workspacePath: directory,
+        piAgentDirectory: join(directory, "state", "pi"),
+        sessionDirectory: join(directory, "state", "sessions"),
+        modelRuntime,
+        sessionCleanupTimeoutMillis: 1_000,
+      });
+      const profile = catalogue.defaultProfile;
+
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const agent = yield* adapter.open({
+              agentId,
+              profile,
+              tools: compileAgentToolFactory(catalogue).forCaller(agentId, port),
+              systemPrompt: "Brood concurrent run test",
+            });
+            const owner = yield* Effect.forkChild(agent.run("owner"));
+            yield* Effect.promise(() => started);
+            const second = yield* Effect.exit(agent.run("second"));
+            const third = yield* Effect.exit(agent.run("third"));
+            releaseResponse?.();
+            const ownerOutcome = yield* Fiber.join(owner);
+            return { ownerOutcome, second, third };
+          }),
+        ),
+      );
+
+      expect(result.ownerOutcome).toMatchObject({
+        _tag: "Completed",
+        result: { finalText: "owner complete" },
+      });
+      for (const rejected of [result.second, result.third]) {
+        expect(Exit.isFailure(rejected)).toBe(true);
+        const renderedCause = Exit.isFailure(rejected) ? Cause.pretty(rejected.cause) : "";
+        expect(renderedCause).toContain("Concurrent Pi runs");
+      }
+      expect(faux.state.callCount).toBe(1);
+      expect(model.id).toBe("scripted-small");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -227,6 +336,7 @@ describe("Pi control-result inspection", () => {
           ),
           { stopReason: "toolUse" },
         ),
+        fauxAssistantMessage("resumed and done", { stopReason: "stop" }),
       ]);
       const model = modelRuntime.getModel("scripted-suspend", "scripted-small")!;
       const profile = {
@@ -281,7 +391,7 @@ describe("Pi control-result inspection", () => {
         modelRuntime,
         sessionCleanupTimeoutMillis: 1_000,
       });
-      const outcome = await Effect.runPromise(
+      const outcomes = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
             const agent = yield* adapter.open({
@@ -290,12 +400,18 @@ describe("Pi control-result inspection", () => {
               tools: compileAgentToolFactory(catalogue).forCaller(agentId, port),
               systemPrompt: "Brood scripted suspension",
             });
-            return yield* agent.run("delegate");
+            const suspended = yield* agent.run("delegate");
+            const resumed = yield* agent.run("dependency outcomes");
+            return { suspended, resumed };
           }),
         ),
       );
-      expect(outcome).toEqual({ _tag: "Suspended" });
-      expect(faux.state.callCount).toBe(1);
+      expect(outcomes.suspended).toEqual({ _tag: "Suspended" });
+      expect(outcomes.resumed).toMatchObject({
+        _tag: "Completed",
+        result: { finalText: "resumed and done" },
+      });
+      expect(faux.state.callCount).toBe(2);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

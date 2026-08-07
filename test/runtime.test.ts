@@ -1,5 +1,6 @@
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { Duration, Effect } from "effect";
 import { buildBroodRuntime, decodeBroodConfig, type BroodConfigEncoded } from "../src/runtime.js";
@@ -59,6 +60,13 @@ describe("Brood runtime configuration", () => {
       thinkingLevel: "low",
     });
     expect(runtime.config.workspacePath).toBe(await realpath(join(base, "workspace")));
+    for (const path of [
+      runtime.config.stateDirectory,
+      runtime.config.piAgentDirectory,
+      runtime.config.sessionDirectory,
+    ]) {
+      expect((await stat(path)).mode & 0o777).toBe(0o700);
+    }
   });
 
   it("reports exact-model failures through the single config error family", async () => {
@@ -79,5 +87,37 @@ describe("Brood runtime configuration", () => {
       _tag: "BroodConfigError",
       reason: "UnknownConfiguredModel",
     });
+  });
+
+  it("rejects bounds that cannot preserve truncation and resume envelopes", async () => {
+    await expect(
+      Effect.runPromise(decodeBroodConfig({ ...validConfig(), maxAgentResultChars: 4 })),
+    ).rejects.toMatchObject({ _tag: "BroodConfigError", path: "maxAgentResultChars" });
+    await expect(
+      Effect.runPromise(decodeBroodConfig({ ...validConfig(), maxResumePromptChars: 1_000 })),
+    ).rejects.toMatchObject({ _tag: "BroodConfigError", path: "maxResumePromptChars" });
+  });
+
+  it("rejects a symlink that aliases the state directory into the workspace", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "brood-config-symlink-"));
+    try {
+      const workspace = join(directory, "workspace");
+      const stateAlias = join(directory, "state-link");
+      await mkdir(workspace, { recursive: true });
+      await symlink(workspace, stateAlias, "dir");
+      const input: BroodConfigEncoded = {
+        ...validConfig(),
+        workspacePath: workspace,
+        stateDirectory: stateAlias,
+        piAgentDirectory: join(stateAlias, "pi"),
+        sessionDirectory: join(stateAlias, "sessions"),
+      };
+      await expect(Effect.runPromise(buildBroodRuntime(input))).rejects.toMatchObject({
+        _tag: "BroodConfigError",
+        reason: "InvalidField",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

@@ -2,16 +2,38 @@
   "name": "brood",
   "version": "0.0.0",
   "private": true,
+  "bin": {
+    "brood": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "brood.example.json",
+    "plan.md",
+    "docs",
+    "vendor"
+  ],
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "check": "pnpm run format:check && pnpm run lint",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
     "test": "vitest run",
-    "test:live": "vitest run --passWithNoTests test/live",
+    "test:live": "vitest run test/live",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/cli.js"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",
