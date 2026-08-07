@@ -7,7 +7,12 @@ import { compileProfileCatalogue, makeAgentName, makeToolInvocationId } from "..
 import { makeSupervisor } from "../src/supervisor.js";
 import type { PiAdapter } from "../src/pi-adapter.js";
 import { makeFakePiAdapter } from "./support/fake-pi-adapter.js";
-import { testModelLookup, testProfile, testProfilesConfig } from "./support/profiles.js";
+import {
+  testModelLookup,
+  testProfile,
+  testProfilesConfig,
+  testSupervisorConfig,
+} from "./support/profiles.js";
 
 it.effect("runs the root with its configured profile and settles its normalized result", () =>
   Effect.scoped(
@@ -27,12 +32,7 @@ it.effect("runs the root with its configured profile and settles its normalized 
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 8,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig(),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate the work");
@@ -84,12 +84,7 @@ it.effect(
         const supervisor = yield* makeSupervisor({
           catalogue,
           piAdapter: fake,
-          maxConcurrency: 1,
-          maxAgents: 8,
-          maxAgentResultChars: 12_000,
-          maxFailureMessageChars: 2_000,
-          maxResumePromptChars: 48_000,
-          drainTimeoutMillis: 60_000,
+          ...testSupervisorConfig(),
         });
 
         const rootId = yield* supervisor.startRoot("coordinate the work");
@@ -143,12 +138,7 @@ it.effect("enforces one global concurrency limit across root and delegated contr
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 2,
-        maxAgents: 8,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxConcurrency: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -203,12 +193,7 @@ it.effect("materializes Pi open failures as terminal agent outcomes", () =>
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -239,12 +224,7 @@ it.effect("materializes Pi run failures and still closes the opened session", ()
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -276,12 +256,7 @@ it.effect("settles the registry before a blocked Pi scope finalizer completes", 
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -313,12 +288,7 @@ it.effect("returns completed direct-child outcomes immediately through the wait 
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 2,
-        maxAgents: 4,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxConcurrency: 2, maxAgents: 4 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -364,12 +334,7 @@ it.effect("operator interruption settles the running agent with the requested so
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -399,12 +364,7 @@ it.effect("drain timeout interrupts stragglers and reports their IDs", () =>
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 1_000,
+        ...testSupervisorConfig({ maxAgents: 2, drainTimeoutMillis: 1_000 }),
       });
 
       const rootId = yield* supervisor.startRoot("coordinate");
@@ -457,14 +417,10 @@ it.effect("publishes authoritative interruption and timeout events when operator
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: blockingAdapter,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 1_000,
+        ...testSupervisorConfig({ maxAgents: 2, drainTimeoutMillis: 1_000 }),
       });
-      const lifecycle = yield* supervisor.events.pipe(
+      const lifecycleSubscription = yield* supervisor.events;
+      const lifecycle = yield* Stream.fromSubscription(lifecycleSubscription).pipe(
         Stream.filter((event) => event.source === "supervisor"),
         Stream.tap((event) =>
           event.type === "DrainStarted" ? Latch.open(drainStarted) : Effect.void,
@@ -473,8 +429,6 @@ it.effect("publishes authoritative interruption and timeout events when operator
         Stream.runCollect,
         Effect.forkChild,
       );
-      yield* Effect.yieldNow;
-
       const rootId = yield* supervisor.startRoot("coordinate");
       yield* Latch.await(runStarted);
       const interruption = yield* Effect.forkChild(supervisor.interrupt(rootId, "api"));
@@ -524,26 +478,21 @@ it.effect("publishes sequenced lifecycle metadata and forwards Pi session events
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
-      const lifecycle = yield* supervisor.events.pipe(
+      const lifecycleSubscription = yield* supervisor.events;
+      const lifecycle = yield* Stream.fromSubscription(lifecycleSubscription).pipe(
         Stream.filter((event) => event.source === "supervisor"),
         Stream.take(6),
         Stream.runCollect,
         Effect.forkChild,
       );
-      const piEvent = yield* supervisor.events.pipe(
+      const piSubscription = yield* supervisor.events;
+      const piEvent = yield* Stream.fromSubscription(piSubscription).pipe(
         Stream.filter((event) => event.source === "pi"),
         Stream.runHead,
         Effect.forkChild,
       );
-      yield* Effect.yieldNow;
-
       const rootId = yield* supervisor.startRoot("coordinate");
       yield* fake.nextOpen;
       yield* fake.nextRun;
@@ -598,12 +547,7 @@ it.effect("rejects an empty normalized root goal before registering an agent", (
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const error = yield* supervisor.startRoot(" \n ").pipe(Effect.flip);
@@ -615,7 +559,7 @@ it.effect("rejects an empty normalized root goal before registering an agent", (
   ),
 );
 
-it.effect("redacts and detaches controller defects in the public snapshot", () =>
+it.effect("redacts controller defects in the public snapshot", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const catalogue = yield* compileProfileCatalogue(
@@ -629,12 +573,7 @@ it.effect("redacts and detaches controller defects in the public snapshot", () =
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: defectingAdapter,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
       });
 
       const rootId = yield* supervisor.startRoot("work");
@@ -648,8 +587,6 @@ it.effect("redacts and detaches controller defects in the public snapshot", () =
       });
       expect(serialized).not.toContain("SECRET_TOKEN");
       expect(serialized).not.toContain("/private/operator/path");
-      expect(Object.isFrozen(snapshot)).toBe(true);
-      expect(Object.isFrozen(snapshot[0])).toBe(true);
     }),
   ),
 );
@@ -666,18 +603,14 @@ it.effect("keeps the newest lifecycle event when a bounded monitor falls behind"
       const supervisor = yield* makeSupervisor({
         catalogue,
         piAdapter: fake,
-        maxConcurrency: 1,
-        maxAgents: 2,
-        maxAgentResultChars: 12_000,
-        maxFailureMessageChars: 2_000,
-        maxResumePromptChars: 48_000,
-        drainTimeoutMillis: 60_000,
+        ...testSupervisorConfig({ maxAgents: 2 }),
         eventBufferCapacity: 1,
       });
       const firstSeen = yield* Latch.make(false);
       const releaseFirst = yield* Latch.make(false);
       const count = yield* Ref.make(0);
-      const monitor = yield* supervisor.events.pipe(
+      const monitorSubscription = yield* supervisor.events;
+      const monitor = yield* Stream.fromSubscription(monitorSubscription).pipe(
         Stream.filter((event) => event.source === "supervisor"),
         Stream.mapEffect((event) =>
           Ref.getAndUpdate(count, (current) => current + 1).pipe(
@@ -693,20 +626,17 @@ it.effect("keeps the newest lifecycle event when a bounded monitor falls behind"
         Stream.runCollect,
         Effect.forkChild,
       );
-      yield* Effect.yieldNow;
-
       const rootId = yield* supervisor.startRoot("work");
-      yield* Latch.await(firstSeen);
       yield* fake.nextOpen;
       yield* fake.nextRun;
-      yield* Latch.open(releaseFirst);
-      const events = Array.from(yield* Fiber.join(monitor));
+      yield* Latch.await(firstSeen);
       yield* fake.complete(rootId, "done");
       yield* supervisor.awaitOutcome(rootId);
       yield* supervisor.drain;
+      yield* Latch.open(releaseFirst);
+      const events = Array.from(yield* Fiber.join(monitor));
 
-      expect(events.map(({ type }) => type)).toEqual(["AgentRegistered", "AgentStatusChanged"]);
-      expect(events[1]).toMatchObject({ status: "Running", sequence: 3 });
+      expect(events[1]).toMatchObject({ type: "DrainCompleted", sequence: 6 });
     }),
   ),
 );

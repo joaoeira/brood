@@ -252,9 +252,14 @@ interface AgentSupervisorApi {
   readonly drain: Effect.Effect<DrainReport>;
   readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
   readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
-  readonly events: Stream.Stream<SupervisorEvent>;
+  readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
 }
 ```
+
+`events` acquires the non-replay subscription in the caller's scope. Consumers
+then use `Stream.fromSubscription(subscription)`. This makes subscription
+happen before agents can publish and avoids relying on a scheduler yield to win
+a late-subscriber race.
 
 The registry is a private implementation object inside the supervisor layer,
 not a third public service. Tool handlers receive a narrow, already-provided
@@ -681,19 +686,20 @@ Registry state contains:
 ```ts
 interface RegistryState {
   readonly agents: ReadonlyMap<AgentId, AgentEntry>;
-  readonly childrenByParent: ReadonlyMap<AgentId, ReadonlyMap<AgentName, AgentId>>;
-  readonly seenControlInvocations: ReadonlyMap<AgentId, ReadonlySet<ToolInvocationId>>;
-  readonly plannedWaits: ReadonlyMap<WaitPlanKey, PlannedWait>;
-  readonly activeWaits: ReadonlyMap<AgentId, ActiveWait>;
+  readonly rootId: AgentId | undefined;
   readonly nonterminalCount: number;
-  readonly eventSequence: number;
   readonly accepting: boolean;
 }
 ```
 
 `AgentEntry` contains metadata, the selected safe `PublicModelProfile`, status,
 at most one `pendingCommand`, a reusable wake `Latch`, terminal deferred,
-timestamps, and `interruptRequested: InterruptReason | undefined`.
+timestamps, `interruptRequested: InterruptReason | undefined`, its
+`childrenByName`, `seenInvocations`, one order-preserving deduplicated
+`plannedTargets` array, and at most one `activeWait`. Those agent-local indexes
+encode the v1 rule that an agent may wait only on its own direct children; a
+global wait graph and invocation map would add indirection without adding
+expressive power.
 It does not contain a Pi session or controller fiber. `FiberMap` owns controller
 fibers; each controller exclusively owns its Pi session.
 

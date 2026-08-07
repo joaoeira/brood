@@ -1,9 +1,10 @@
 import { chmod, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { Config, ConfigProvider, Duration, Effect, Schema } from "effect";
+import { Config, ConfigProvider, Duration, Effect, Schema, SchemaIssue } from "effect";
 import {
   BroodConfigError,
+  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   MIN_BOUNDED_TEXT_CHARS,
   ModelProfile,
   compileProfileCatalogue,
@@ -13,20 +14,34 @@ import {
 } from "./agent.js";
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
+const BoundedTextChars = PositiveInt.check(Schema.isGreaterThanOrEqualTo(MIN_BOUNDED_TEXT_CHARS));
+const PositiveFiniteDuration = Schema.DurationFromString.check(
+  Schema.makeFilter((duration) => {
+    const millis = Duration.toMillis(duration);
+    return Number.isFinite(millis) && millis > 0 ? undefined : "must be finite and positive";
+  }),
+);
 
-export const BroodConfigInput = Schema.Struct({
+const isWithin = (parent: string, child: string): boolean => {
+  const path = relative(parent, child);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+};
+
+const BroodConfigFields = Schema.Struct({
   workspacePath: Schema.Trim.check(Schema.isMinLength(1)),
   stateDirectory: Schema.Trim.check(Schema.isMinLength(1)),
   maxConcurrency: PositiveInt,
   maxAgents: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(128))),
-  maxAgentResultChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(12_000))),
-  maxFailureMessageChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(2_000))),
+  maxAgentResultChars: BoundedTextChars.pipe(Schema.withDecodingDefaultKey(Effect.succeed(12_000))),
+  maxFailureMessageChars: BoundedTextChars.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(DEFAULT_MAX_FAILURE_MESSAGE_CHARS)),
+  ),
   maxResumePromptChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(48_000))),
   maxProfileHelpChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(4_000))),
-  drainTimeout: Schema.DurationFromString.pipe(
+  drainTimeout: PositiveFiniteDuration.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed("10 minutes")),
   ),
-  sessionCleanupTimeout: Schema.DurationFromString.pipe(
+  sessionCleanupTimeout: PositiveFiniteDuration.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed("30 seconds")),
   ),
   defaultProfile: Schema.String,
@@ -37,15 +52,48 @@ export const BroodConfigInput = Schema.Struct({
   logLevel: Schema.optionalKey(Config.LogLevel),
 });
 
+export const BroodConfigInput = BroodConfigFields.check(
+  Schema.makeFilter((config) => {
+    const issues: Array<Schema.FilterIssue> = [];
+    const workspacePath = resolve(config.workspacePath);
+    const stateDirectory = resolve(config.stateDirectory);
+    const piAgentDirectory = resolve(config.piAgentDirectory);
+    const sessionDirectory = resolve(config.sessionDirectory);
+    if (isWithin(workspacePath, stateDirectory) || isWithin(stateDirectory, workspacePath)) {
+      issues.push({
+        path: ["stateDirectory"],
+        issue: "workspacePath and stateDirectory must be disjoint",
+      });
+    }
+    if (!isWithin(stateDirectory, piAgentDirectory) || piAgentDirectory === stateDirectory) {
+      issues.push({
+        path: ["piAgentDirectory"],
+        issue: "piAgentDirectory must be a child of stateDirectory",
+      });
+    }
+    if (!isWithin(stateDirectory, sessionDirectory) || sessionDirectory === stateDirectory) {
+      issues.push({
+        path: ["sessionDirectory"],
+        issue: "sessionDirectory must be a child of stateDirectory",
+      });
+    }
+    if (config.maxConcurrency > config.maxAgents) {
+      issues.push({ path: ["maxConcurrency"], issue: "cannot exceed maxAgents" });
+    }
+    const minimumResume = minimumResumePromptChars(config.maxAgents);
+    if (config.maxResumePromptChars < minimumResume) {
+      issues.push({
+        path: ["maxResumePromptChars"],
+        issue: `must be at least ${minimumResume} for maxAgents=${config.maxAgents}`,
+      });
+    }
+    return issues;
+  }),
+);
+
 export type BroodConfigEncoded = typeof BroodConfigInput.Encoded;
 type DecodedBroodConfig = typeof BroodConfigInput.Type;
-
-export interface BroodConfig extends DecodedBroodConfig {
-  readonly workspacePath: string;
-  readonly stateDirectory: string;
-  readonly piAgentDirectory: string;
-  readonly sessionDirectory: string;
-}
+export type BroodConfig = DecodedBroodConfig;
 
 export interface BroodRuntime {
   readonly config: BroodConfig;
@@ -62,76 +110,13 @@ const configError = (message: string, path?: string): BroodConfigError =>
       : { stage: "decode", reason: "InvalidField", message, path },
   );
 
-const isWithin = (parent: string, child: string): boolean => {
-  const path = relative(parent, child);
-  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
-};
-
-const validateConfig = (
+const resolveConfigPaths = (
   decoded: DecodedBroodConfig,
 ): Effect.Effect<BroodConfig, BroodConfigError> => {
   const workspacePath = resolve(decoded.workspacePath);
   const stateDirectory = resolve(decoded.stateDirectory);
   const piAgentDirectory = resolve(decoded.piAgentDirectory);
   const sessionDirectory = resolve(decoded.sessionDirectory);
-
-  if (isWithin(workspacePath, stateDirectory) || isWithin(stateDirectory, workspacePath)) {
-    return Effect.fail(
-      configError("workspacePath and stateDirectory must be disjoint", "stateDirectory"),
-    );
-  }
-  if (!isWithin(stateDirectory, piAgentDirectory) || piAgentDirectory === stateDirectory) {
-    return Effect.fail(
-      configError("piAgentDirectory must be a child of stateDirectory", "piAgentDirectory"),
-    );
-  }
-  if (!isWithin(stateDirectory, sessionDirectory) || sessionDirectory === stateDirectory) {
-    return Effect.fail(
-      configError("sessionDirectory must be a child of stateDirectory", "sessionDirectory"),
-    );
-  }
-  if (decoded.maxConcurrency > decoded.maxAgents) {
-    return Effect.fail(configError("maxConcurrency cannot exceed maxAgents", "maxConcurrency"));
-  }
-  if (decoded.maxAgentResultChars < MIN_BOUNDED_TEXT_CHARS) {
-    return Effect.fail(
-      configError(
-        `maxAgentResultChars must be at least ${MIN_BOUNDED_TEXT_CHARS}`,
-        "maxAgentResultChars",
-      ),
-    );
-  }
-  if (decoded.maxFailureMessageChars < MIN_BOUNDED_TEXT_CHARS) {
-    return Effect.fail(
-      configError(
-        `maxFailureMessageChars must be at least ${MIN_BOUNDED_TEXT_CHARS}`,
-        "maxFailureMessageChars",
-      ),
-    );
-  }
-  const minimumResume = minimumResumePromptChars(decoded.maxAgents);
-  if (decoded.maxResumePromptChars < minimumResume) {
-    return Effect.fail(
-      configError(
-        `maxResumePromptChars must be at least ${minimumResume} for maxAgents=${decoded.maxAgents}`,
-        "maxResumePromptChars",
-      ),
-    );
-  }
-  if (
-    !Number.isFinite(Duration.toMillis(decoded.drainTimeout)) ||
-    Duration.toMillis(decoded.drainTimeout) <= 0
-  ) {
-    return Effect.fail(configError("drainTimeout must be finite and positive", "drainTimeout"));
-  }
-  if (
-    !Number.isFinite(Duration.toMillis(decoded.sessionCleanupTimeout)) ||
-    Duration.toMillis(decoded.sessionCleanupTimeout) <= 0
-  ) {
-    return Effect.fail(
-      configError("sessionCleanupTimeout must be finite and positive", "sessionCleanupTimeout"),
-    );
-  }
 
   return Effect.succeed(
     Object.freeze({
@@ -145,17 +130,49 @@ const validateConfig = (
   );
 };
 
+const firstIssuePath = (issue: SchemaIssue.Issue): ReadonlyArray<PropertyKey> | undefined => {
+  switch (issue._tag) {
+    case "Pointer": {
+      const nested = firstIssuePath(issue.issue);
+      return nested === undefined ? issue.path : [...issue.path, ...nested];
+    }
+    case "Filter":
+    case "Encoding":
+      return firstIssuePath(issue.issue);
+    case "Composite":
+    case "AnyOf":
+      for (const child of issue.issues) {
+        const path = firstIssuePath(child);
+        if (path !== undefined) return path;
+      }
+      return undefined;
+    case "InvalidType":
+    case "InvalidValue":
+    case "MissingKey":
+    case "UnexpectedKey":
+    case "Forbidden":
+    case "OneOf":
+      return undefined;
+  }
+};
+
+const configErrorPath = (error: Config.ConfigError): string | undefined => {
+  if (!Schema.isSchemaError(error.cause)) return undefined;
+  const path = firstIssuePath(error.cause.issue);
+  return path?.map(String).join(".");
+};
+
 const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")((raw: unknown) =>
   ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
-    Effect.mapError(
-      (error) =>
-        new BroodConfigError({
-          stage: "decode",
-          reason: "DecodeFailed",
-          message: String(error),
-        }),
-    ),
-    Effect.flatMap(validateConfig),
+    Effect.mapError((error) => {
+      const path = configErrorPath(error);
+      return new BroodConfigError(
+        path === undefined
+          ? { stage: "decode", reason: "DecodeFailed", message: error.message }
+          : { stage: "decode", reason: "DecodeFailed", message: error.message, path },
+      );
+    }),
+    Effect.flatMap(resolveConfigPaths),
   ),
 );
 

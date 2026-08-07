@@ -1,3 +1,4 @@
+// Plain Vitest is intentional: this is the real offline Pi/session integration boundary.
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

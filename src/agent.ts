@@ -11,8 +11,8 @@ export const AgentId = Schema.String.check(opaqueAgentId, Schema.isMaxLength(80)
   Schema.brand("AgentId"),
 );
 export type AgentId = typeof AgentId.Type;
-
 export const makeAgentId = Schema.decodeUnknownSync(AgentId);
+export const decodeAgentId = Schema.decodeUnknownEffect(AgentId);
 
 export const WaitId = Schema.String.check(opaqueWaitId, Schema.isMaxLength(80)).pipe(
   Schema.brand("WaitId"),
@@ -59,8 +59,7 @@ export const makeProfileName = Schema.decodeUnknownSync(ProfileName);
 export const decodeAgentName = Schema.decodeUnknownEffect(AgentName);
 export const decodeProfileName = Schema.decodeUnknownEffect(ProfileName);
 
-export const Goal = Schema.Trim.check(Schema.isMinLength(1));
-export type Goal = typeof Goal.Type;
+const Goal = Schema.Trim.check(Schema.isMinLength(1));
 export const decodeGoal = Schema.decodeUnknownEffect(Goal);
 
 export const DelegatedTask = Schema.Struct({
@@ -72,7 +71,7 @@ export interface DelegatedTask extends Schema.Schema.Type<typeof DelegatedTask> 
 
 export type ModelThinkingLevel = PiModelThinkingLevel;
 
-export const THINKING_LEVELS = [
+const THINKING_LEVELS = [
   "off",
   "minimal",
   "low",
@@ -81,13 +80,6 @@ export const THINKING_LEVELS = [
   "xhigh",
   "max",
 ] as const satisfies ReadonlyArray<ModelThinkingLevel>;
-
-type AssertNever<T extends never> = T;
-type MissingThinkingLevels = AssertNever<
-  Exclude<ModelThinkingLevel, (typeof THINKING_LEVELS)[number]>
->;
-const noMissingThinkingLevels: MissingThinkingLevels | undefined = undefined;
-void noMissingThinkingLevels;
 
 const exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
   off: true,
@@ -117,26 +109,20 @@ export const ProfilesConfigInput = Schema.Struct({
 });
 export interface ProfilesConfigInput extends Schema.Schema.Type<typeof ProfilesConfigInput> {}
 
-export type BroodConfigErrorReason =
-  | "DecodeFailed"
-  | "InvalidField"
-  | "ProfileReferenceNotFound"
-  | "UnknownConfiguredModel"
-  | "UnsupportedThinkingLevel"
-  | "ProfileHelpTooLarge"
-  | "ModelRuntimeInitializationFailed";
+const BROOD_CONFIG_ERROR_REASONS = [
+  "DecodeFailed",
+  "InvalidField",
+  "ProfileReferenceNotFound",
+  "UnknownConfiguredModel",
+  "UnsupportedThinkingLevel",
+  "ProfileHelpTooLarge",
+  "ModelRuntimeInitializationFailed",
+] as const;
+type BroodConfigErrorReason = (typeof BROOD_CONFIG_ERROR_REASONS)[number];
 
 export class BroodConfigError extends Schema.TaggedError<BroodConfigError>()("BroodConfigError", {
   stage: Schema.Literals(["decode", "compile"]),
-  reason: Schema.Literals([
-    "DecodeFailed",
-    "InvalidField",
-    "ProfileReferenceNotFound",
-    "UnknownConfiguredModel",
-    "UnsupportedThinkingLevel",
-    "ProfileHelpTooLarge",
-    "ModelRuntimeInitializationFailed",
-  ]),
+  reason: Schema.Literals(BROOD_CONFIG_ERROR_REASONS),
   message: Schema.String,
   path: Schema.optionalKey(Schema.String),
 }) {}
@@ -181,7 +167,11 @@ export class WaitRejected extends Schema.TaggedError<WaitRejected>()("WaitReject
 
 export class UnknownAgent extends Schema.TaggedError<UnknownAgent>()("UnknownAgent", {
   agentId: AgentId,
-}) {}
+}) {
+  get message(): string {
+    return `Unknown agent: ${this.agentId}`;
+  }
+}
 
 export class RootStartError extends Schema.TaggedError<RootStartError>()("RootStartError", {
   message: Schema.String,
@@ -227,177 +217,193 @@ const compileError = (
       : { stage: "compile", reason, message, path },
   );
 
-export const compileProfileCatalogue = Effect.fn("Brood.compileProfileCatalogue")(function* (
-  input: ProfilesConfigInput,
-  models: ExactModelLookup,
-  maxProfileHelpChars: number,
-) {
-  if (!Number.isSafeInteger(maxProfileHelpChars) || maxProfileHelpChars <= 0) {
-    return yield* Effect.fail(
-      compileError(
-        "InvalidField",
-        "maxProfileHelpChars must be a positive safe integer",
-        "maxProfileHelpChars",
-      ),
-    );
-  }
+interface ValidatedProfile {
+  readonly name: ProfileName;
+  readonly rawName: string;
+  readonly profile: ModelProfile;
+}
 
-  const rawNames = Object.keys(input.profiles);
+const validateProfileHelpBudget = (maximum: number): Effect.Effect<void, BroodConfigError> =>
+  Number.isSafeInteger(maximum) && maximum > 0
+    ? Effect.void
+    : Effect.fail(
+        compileError(
+          "InvalidField",
+          "maxProfileHelpChars must be a positive safe integer",
+          "maxProfileHelpChars",
+        ),
+      );
+
+const validateProfileDefinitions = Effect.fn("Brood.validateProfileDefinitions")(function* (
+  profiles: Readonly<Record<string, ModelProfile>>,
+) {
+  const rawNames = Object.keys(profiles).sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
   if (rawNames.length === 0) {
     return yield* Effect.fail(
       compileError("InvalidField", "profiles must contain at least one entry", "profiles"),
     );
   }
-
-  const validated: Array<{
-    readonly name: ProfileName;
-    readonly rawName: string;
-    readonly profile: ModelProfile;
-  }> = [];
-  for (const rawName of rawNames.sort((left, right) =>
-    left < right ? -1 : left > right ? 1 : 0,
-  )) {
-    const name = yield* decodeProfileName(rawName).pipe(
-      Effect.mapError(() =>
-        compileError("InvalidField", `Invalid profile name: ${rawName}`, `profiles.${rawName}`),
-      ),
-    );
-    const profile = input.profiles[rawName];
-    if (profile === undefined) {
-      return yield* Effect.fail(
-        compileError("InvalidField", `Missing profile value: ${rawName}`, `profiles.${rawName}`),
-      );
-    }
-    if (codePointLength(profile.description) === 0 || codePointLength(profile.description) > 512) {
-      return yield* Effect.fail(
-        compileError(
-          "InvalidField",
-          `Profile ${rawName} description must contain 1 to 512 Unicode code points`,
-          `profiles.${rawName}.description`,
+  return yield* Effect.forEach(rawNames, (rawName) =>
+    Effect.gen(function* () {
+      const name = yield* decodeProfileName(rawName).pipe(
+        Effect.mapError(() =>
+          compileError("InvalidField", `Invalid profile name: ${rawName}`, `profiles.${rawName}`),
         ),
       );
-    }
-    if (profile.provider.trim().length === 0 || profile.model.trim().length === 0) {
-      return yield* Effect.fail(
-        compileError(
-          "InvalidField",
-          `Profile ${rawName} provider and model must be non-empty`,
-          `profiles.${rawName}`,
-        ),
-      );
-    }
-    validated.push({ name, rawName, profile: { ...profile } });
-  }
+      const profile = profiles[rawName];
+      if (profile === undefined) {
+        return yield* Effect.fail(
+          compileError("InvalidField", `Missing profile value: ${rawName}`, `profiles.${rawName}`),
+        );
+      }
+      const descriptionLength = codePointLength(profile.description);
+      if (descriptionLength === 0 || descriptionLength > 512) {
+        return yield* Effect.fail(
+          compileError(
+            "InvalidField",
+            `Profile ${rawName} description must contain 1 to 512 Unicode code points`,
+            `profiles.${rawName}.description`,
+          ),
+        );
+      }
+      if (profile.provider.trim().length === 0 || profile.model.trim().length === 0) {
+        return yield* Effect.fail(
+          compileError(
+            "InvalidField",
+            `Profile ${rawName} provider and model must be non-empty`,
+            `profiles.${rawName}`,
+          ),
+        );
+      }
+      return { name, rawName, profile } satisfies ValidatedProfile;
+    }),
+  );
+});
 
-  const defaultName = yield* decodeProfileName(input.defaultProfile).pipe(
+const resolveProfileReference = Effect.fn("Brood.resolveProfileReference")(function* (
+  rawName: string,
+  path: "defaultProfile" | "rootProfile",
+  validated: ReadonlyArray<ValidatedProfile>,
+) {
+  const label = path === "defaultProfile" ? "Default" : "Root";
+  const name = yield* decodeProfileName(rawName).pipe(
     Effect.mapError(() =>
       compileError(
         "ProfileReferenceNotFound",
-        `Invalid default profile: ${input.defaultProfile}`,
-        "defaultProfile",
+        `Invalid ${label.toLowerCase()} profile: ${rawName}`,
+        path,
       ),
     ),
   );
-  if (!validated.some(({ name }) => name === defaultName)) {
+  if (!validated.some((profile) => profile.name === name)) {
     return yield* Effect.fail(
-      compileError(
-        "ProfileReferenceNotFound",
-        `Default profile does not exist: ${input.defaultProfile}`,
-        "defaultProfile",
-      ),
+      compileError("ProfileReferenceNotFound", `${label} profile does not exist: ${rawName}`, path),
     );
   }
+  return name;
+});
 
-  const rootName =
-    input.rootProfile === undefined
-      ? defaultName
-      : yield* decodeProfileName(input.rootProfile).pipe(
-          Effect.mapError(() =>
-            compileError(
-              "ProfileReferenceNotFound",
-              `Invalid root profile: ${input.rootProfile}`,
-              "rootProfile",
-            ),
+const compileResolvedProfiles = Effect.fn("Brood.compileResolvedProfiles")(function* (
+  validated: ReadonlyArray<ValidatedProfile>,
+  models: ExactModelLookup,
+) {
+  const entries = yield* Effect.forEach(validated, ({ name, profile, rawName }) =>
+    Effect.gen(function* () {
+      const model = models.getModel(profile.provider, profile.model);
+      if (model === undefined) {
+        return yield* Effect.fail(
+          compileError(
+            "UnknownConfiguredModel",
+            `Unknown configured model ${profile.provider}/${profile.model} for profile ${rawName}`,
+            `profiles.${rawName}`,
           ),
         );
-  if (!validated.some(({ name }) => name === rootName)) {
-    return yield* Effect.fail(
-      compileError(
-        "ProfileReferenceNotFound",
-        `Root profile does not exist: ${input.rootProfile}`,
-        "rootProfile",
-      ),
-    );
-  }
-
-  const compiled = new Map<ProfileName, ResolvedModelProfile>();
-  for (const { name, profile, rawName } of validated) {
-    const model = models.getModel(profile.provider, profile.model);
-    if (model === undefined) {
-      return yield* Effect.fail(
-        compileError(
-          "UnknownConfiguredModel",
-          `Unknown configured model ${profile.provider}/${profile.model} for profile ${rawName}`,
-          `profiles.${rawName}`,
-        ),
-      );
-    }
-    const requestedThinking = profile.thinkingLevel ?? "medium";
-    const effectiveThinking = clampThinkingLevel(model, requestedThinking);
-    if (profile.thinkingLevel !== undefined && effectiveThinking !== profile.thinkingLevel) {
-      return yield* Effect.fail(
-        compileError(
-          "UnsupportedThinkingLevel",
-          `Model ${model.provider}/${model.id} clamps ${profile.thinkingLevel} to ${effectiveThinking}`,
-          `profiles.${rawName}.thinkingLevel`,
-        ),
-      );
-    }
-
-    const publicProfile = Object.freeze({
-      name,
-      provider: model.provider,
-      model: model.id,
-      thinkingLevel: effectiveThinking,
-    });
-    compiled.set(
-      name,
-      Object.freeze({
-        public: publicProfile,
+      }
+      const requestedThinking = profile.thinkingLevel ?? "medium";
+      const effectiveThinking = clampThinkingLevel(model, requestedThinking);
+      if (profile.thinkingLevel !== undefined && effectiveThinking !== profile.thinkingLevel) {
+        return yield* Effect.fail(
+          compileError(
+            "UnsupportedThinkingLevel",
+            `Model ${model.provider}/${model.id} clamps ${profile.thinkingLevel} to ${effectiveThinking}`,
+            `profiles.${rawName}.thinkingLevel`,
+          ),
+        );
+      }
+      const resolved = Object.freeze({
+        public: Object.freeze({
+          name,
+          provider: model.provider,
+          model: model.id,
+          thinkingLevel: effectiveThinking,
+        }),
         description: profile.description,
         model,
-      }),
-    );
-  }
+      }) satisfies ResolvedModelProfile;
+      return [name, resolved] as const;
+    }),
+  );
+  return new Map(entries);
+});
 
-  const defaultProfile = compiled.get(defaultName);
-  if (defaultProfile === undefined) {
-    return yield* Effect.die(
-      new Error(`Validated default profile ${defaultName} was not compiled`),
-    );
-  }
-  const rootProfile = compiled.get(rootName);
-  if (rootProfile === undefined) {
-    return yield* Effect.die(new Error(`Validated root profile ${rootName} was not compiled`));
-  }
+const requireCompiledProfile = (
+  profiles: ReadonlyMap<ProfileName, ResolvedModelProfile>,
+  name: ProfileName,
+  role: "default" | "root",
+): Effect.Effect<ResolvedModelProfile> => {
+  const profile = profiles.get(name);
+  return profile === undefined
+    ? Effect.die(new Error(`Validated ${role} profile ${name} was not compiled`))
+    : Effect.succeed(profile);
+};
 
-  const names = Object.freeze(Array.from(compiled.keys()));
+const renderProfileHelp = (
+  names: ReadonlyArray<ProfileName>,
+  profiles: ReadonlyMap<ProfileName, ResolvedModelProfile>,
+  defaultName: ProfileName,
+  maximum: number,
+): Effect.Effect<string, BroodConfigError> => {
   const helpText = [
     `Default profile: ${defaultName}`,
     "Omitting a delegated task profile always uses the global default; profiles are not inherited.",
     "Available profiles:",
-    ...names.map((name) => `- ${name}: ${compiled.get(name)?.description ?? ""}`),
+    ...names.map((name) => `- ${name}: ${profiles.get(name)?.description ?? ""}`),
   ].join("\n");
-  if (codePointLength(helpText) > maxProfileHelpChars) {
-    return yield* Effect.fail(
-      compileError(
-        "ProfileHelpTooLarge",
-        `Rendered profile help contains ${codePointLength(helpText)} code points; maximum is ${maxProfileHelpChars}`,
-        "profiles",
-      ),
-    );
-  }
+  const length = codePointLength(helpText);
+  return length <= maximum
+    ? Effect.succeed(helpText)
+    : Effect.fail(
+        compileError(
+          "ProfileHelpTooLarge",
+          `Rendered profile help contains ${length} code points; maximum is ${maximum}`,
+          "profiles",
+        ),
+      );
+};
 
+export const compileProfileCatalogue = Effect.fn("Brood.compileProfileCatalogue")(function* (
+  input: ProfilesConfigInput,
+  models: ExactModelLookup,
+  maxProfileHelpChars: number,
+) {
+  yield* validateProfileHelpBudget(maxProfileHelpChars);
+  const validated = yield* validateProfileDefinitions(input.profiles);
+  const defaultName = yield* resolveProfileReference(
+    input.defaultProfile,
+    "defaultProfile",
+    validated,
+  );
+  const rootName =
+    input.rootProfile === undefined
+      ? defaultName
+      : yield* resolveProfileReference(input.rootProfile, "rootProfile", validated);
+  const compiled = yield* compileResolvedProfiles(validated, models);
+  const defaultProfile = yield* requireCompiledProfile(compiled, defaultName, "default");
+  const rootProfile = yield* requireCompiledProfile(compiled, rootName, "root");
+  const names = Object.freeze(Array.from(compiled.keys()));
+  const helpText = yield* renderProfileHelp(names, compiled, defaultName, maxProfileHelpChars);
   const profiles = HashMap.fromIterable(compiled.entries());
   return Object.freeze({
     names,
@@ -453,7 +459,7 @@ export type PiRunOutcome =
   | { readonly _tag: "Completed"; readonly result: PiRunResult }
   | { readonly _tag: "Suspended" };
 
-export interface PiRunResult {
+interface PiRunResult {
   readonly finalText: string;
   readonly finalMessageId: string | undefined;
   readonly stopReason: "stop";
@@ -472,7 +478,7 @@ export const InterruptReason = Schema.Union([
 ]);
 export type InterruptReason = typeof InterruptReason.Type;
 
-export type AgentFailure =
+type AgentFailure =
   | { readonly _tag: "AgentStartFailed"; readonly error: PiOpenError }
   | { readonly _tag: "AgentRunFailed"; readonly error: PiRunError }
   | { readonly _tag: "AgentProtocolFailed"; readonly error: PiProtocolError }
@@ -526,15 +532,43 @@ export class RootInterrupted extends Schema.TaggedError<RootInterrupted>()("Root
   drain: DrainReport,
 }) {}
 
-export const TRUNCATION_SENTINEL = "\n[truncated by Brood]";
+const TRUNCATION_SENTINEL = "\n[truncated by Brood]";
 export const MIN_BOUNDED_TEXT_CHARS = Array.from(TRUNCATION_SENTINEL).length;
+export const DEFAULT_MAX_FAILURE_MESSAGE_CHARS = 2_000;
 export const minimumResumePromptChars = (maxAgents: number): number => 512 + maxAgents * 320;
 
-export const normalizeText = (value: string): string =>
+const normalizeText = (value: string): string =>
   value
     .replace(/\r\n?/g, "\n")
     /* oxlint-disable-next-line no-control-regex -- remove unsafe control text at a trust boundary. */
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+
+interface BudgetSelection {
+  readonly prefixLength: number;
+  readonly totalCost: number;
+}
+
+const truncateToBudget = (
+  points: ReadonlyArray<string>,
+  costOf: (point: string) => number,
+  budget: number,
+): BudgetSelection => {
+  let prefixLength = 0;
+  let prefixCost = 0;
+  let totalCost = 0;
+  let acceptingPrefix = true;
+  for (const point of points) {
+    const cost = costOf(point);
+    totalCost += cost;
+    if (acceptingPrefix && prefixCost + cost <= budget) {
+      prefixCost += cost;
+      prefixLength += 1;
+    } else {
+      acceptingPrefix = false;
+    }
+  }
+  return { prefixLength, totalCost };
+};
 
 const truncateCodePoints = (
   value: string,
@@ -545,13 +579,13 @@ const truncateCodePoints = (
   readonly originalCharacterCount: number;
 } => {
   const points = Array.from(value);
-  if (points.length <= maxCodePoints) {
+  const sentinel = Array.from(TRUNCATION_SENTINEL);
+  const selection = truncateToBudget(points, () => 1, Math.max(0, maxCodePoints - sentinel.length));
+  if (selection.totalCost <= maxCodePoints) {
     return { text: value, truncated: false, originalCharacterCount: points.length };
   }
-  const sentinel = Array.from(TRUNCATION_SENTINEL);
-  const prefixLength = Math.max(0, maxCodePoints - sentinel.length);
   return {
-    text: [...points.slice(0, prefixLength), ...sentinel.slice(0, maxCodePoints)]
+    text: [...points.slice(0, selection.prefixLength), ...sentinel.slice(0, maxCodePoints)]
       .slice(0, maxCodePoints)
       .join(""),
     truncated: true,
@@ -622,25 +656,19 @@ const escapeXmlAttribute = (value: string): string =>
   escapeXmlText(value).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
 const escapeXmlTextWithin = (value: string, maximum: number): string => {
-  const escaped = escapeXmlText(value);
-  if (codePointLength(escaped) <= maximum) return escaped;
-
-  const sentinel = TRUNCATION_SENTINEL;
-  const sentinelLength = codePointLength(sentinel);
+  const points = Array.from(value);
+  const sentinelLength = codePointLength(TRUNCATION_SENTINEL);
+  const selection = truncateToBudget(
+    points,
+    (point) => codePointLength(escapeXmlText(point)),
+    Math.max(0, maximum - sentinelLength),
+  );
+  if (selection.totalCost <= maximum) return points.map(escapeXmlText).join("");
   if (maximum < sentinelLength) {
     throw new RangeError("Resume body budget cannot fit the truncation sentinel");
   }
-  const budget = maximum - sentinelLength;
-  const parts: string[] = [];
-  let used = 0;
-  for (const point of Array.from(value)) {
-    const encoded = escapeXmlText(point);
-    const encodedLength = codePointLength(encoded);
-    if (used + encodedLength > budget) break;
-    parts.push(encoded);
-    used += encodedLength;
-  }
-  return `${parts.join("")}${sentinel}`;
+  const encodedPrefix = points.slice(0, selection.prefixLength).map(escapeXmlText).join("");
+  return `${encodedPrefix}${TRUNCATION_SENTINEL}`;
 };
 
 interface RenderedDependency {

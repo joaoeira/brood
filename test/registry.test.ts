@@ -1,6 +1,7 @@
 /* oxlint-disable no-underscore-dangle, vitest/no-standalone-expect -- Effect variants use `_tag`; `it.effect` is not recognized by the Vitest lint plugin. */
 import { it } from "@effect/vitest";
-import { Effect, Fiber } from "effect";
+import { Effect, Fiber, Option } from "effect";
+import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import {
   makeAgentId,
@@ -205,7 +206,7 @@ it.effect("resumes once when a child completes between wait planning and activat
 
     expect(activation._tag).toBe("Resumed");
     expect(command._tag).toBe("Resume");
-    expect(duplicate).toBe(false);
+    expect(Option.isNone(duplicate)).toBe(true);
     expect(snapshot.agents.find(({ id }) => id === root.id)?.hasPendingCommand).toBe(false);
   }),
 );
@@ -272,28 +273,6 @@ it.effect("returns terminal direct children immediately without leaving a stale 
     if (planned._tag === "Ready") {
       expect(planned.outcomes.map(({ agentId }) => agentId)).toEqual([admitted.children[0]!.id]);
     }
-  }),
-);
-
-it.effect("treats repeated early mailbox wakes as hints and still consumes one command", () =>
-  Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
-    const root = yield* registry.registerRoot({
-      name: makeAgentName("root"),
-      goal: "coordinate",
-      profile,
-    });
-
-    yield* registry.signalMailbox(root.id);
-    yield* registry.signalMailbox(root.id);
-    const command = yield* registry.takePendingCommand(root.id);
-    const secondTake = yield* Effect.forkChild(Effect.exit(registry.takePendingCommand(root.id)));
-    yield* registry.signalMailbox(root.id);
-    yield* registry.requestInterrupt(root.id, { _tag: "SupervisorShutdown" });
-    const secondExit = yield* Fiber.join(secondTake);
-
-    expect(command._tag).toBe("InitialGoal");
-    expect(secondExit._tag).toBe("Failure");
   }),
 );
 
@@ -388,8 +367,8 @@ it.effect("settles terminal outcome awaiters exactly once", () =>
     const observed = yield* Fiber.join(awaiter);
     const snapshot = yield* registry.snapshot;
 
-    expect(firstSettlement).toBe(true);
-    expect(duplicateSettlement).toBe(false);
+    expect(Option.getOrUndefined(firstSettlement)).toEqual(first);
+    expect(Option.isNone(duplicateSettlement)).toBe(true);
     expect(observed).toEqual(first);
     expect(snapshot.agents[0]?.status).toBe("Completed");
   }),
@@ -404,14 +383,12 @@ it.effect("tracks pending controller installation independently of terminal stat
       profile,
     });
     const before = yield* registry.snapshot;
-    const installed = yield* registry.markInstalled(root.id);
-    const duplicate = yield* registry.markInstalled(root.id);
+    yield* registry.markInstalled(root.id);
+    yield* registry.markInstalled(root.id);
     const after = yield* registry.snapshot;
 
     expect(before.pendingInstallationCount).toBe(1);
     expect(before.agents[0]?.installation).toBe("Pending");
-    expect(installed).toBe(true);
-    expect(duplicate).toBe(false);
     expect(after.pendingInstallationCount).toBe(0);
     expect(after.agents[0]?.installation).toBe("Installed");
   }),
@@ -491,9 +468,27 @@ it.effect("shutdown stops admission and pending-installation settlement reaches 
       ],
     });
     expect(rejected._tag).toBe("DelegateRejected");
-    expect(settledIds).toEqual(shutdown.activeIds);
+    expect(settledIds.map(({ agentId }) => agentId)).toEqual(shutdown.activeIds);
     expect(snapshot.accepting).toBe(false);
     expect(snapshot.nonterminalCount).toBe(0);
     expect(snapshot.pendingInstallationCount).toBe(0);
+  }),
+);
+
+it.effect("timestamps registry transitions with the Effect clock", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgents: 2, ...deterministicIds() });
+    yield* TestClock.setTime(1_000);
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    yield* TestClock.setTime(2_000);
+    yield* registry.markInstalled(root.id);
+    const snapshot = yield* registry.snapshot;
+
+    expect(snapshot.agents[0]?.createdAt).toBe(1_000);
+    expect(snapshot.agents[0]?.updatedAt).toBe(2_000);
   }),
 );

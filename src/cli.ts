@@ -3,8 +3,15 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
-import { Cause, Data, Effect, Exit, Option, Queue, Ref, Stream } from "effect";
-import { makeAgentId, type AgentId } from "./agent.js";
+import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Stream } from "effect";
+import {
+  AgentFailed,
+  BroodConfigError,
+  RootInterrupted,
+  RootStartError,
+  decodeAgentId,
+  type AgentId,
+} from "./agent.js";
 import { makeBroodApplicationFromUnknown, type BroodApplication } from "./main.js";
 
 export interface CliArguments {
@@ -13,11 +20,15 @@ export interface CliArguments {
   readonly showEvents: boolean;
 }
 
-type OperatorCommand =
+type ParsedOperatorCommand =
   | { readonly _tag: "Status" }
-  | { readonly _tag: "Interrupt"; readonly agentId: AgentId }
+  | { readonly _tag: "Interrupt"; readonly agentId: string }
   | { readonly _tag: "Events"; readonly enabled: boolean }
   | { readonly _tag: "Help" };
+
+type OperatorCommand =
+  | Exclude<ParsedOperatorCommand, { readonly _tag: "Interrupt" }>
+  | { readonly _tag: "Interrupt"; readonly agentId: AgentId };
 
 class CliInputError extends Data.TaggedError("CliInputError")<{
   readonly message: string;
@@ -68,7 +79,7 @@ export const parseCliArguments = (arguments_: ReadonlyArray<string>): CliArgumen
   return { configPath: resolve(configPath), goal, showEvents };
 };
 
-export const parseOperatorCommand = (line: string): OperatorCommand => {
+export const parseOperatorCommand = (line: string): ParsedOperatorCommand => {
   const [command, ...rest] = line.trim().split(/\s+/);
   switch (command) {
     case "status":
@@ -78,11 +89,7 @@ export const parseOperatorCommand = (line: string): OperatorCommand => {
       if (raw === undefined || rest.length !== 1) {
         throw new CliInputError({ message: "Usage: interrupt <agent-id>" });
       }
-      try {
-        return { _tag: "Interrupt", agentId: makeAgentId(raw) };
-      } catch {
-        throw new CliInputError({ message: `Invalid agent ID: ${raw}` });
-      }
+      return { _tag: "Interrupt", agentId: raw };
     }
     case "events":
       if (rest.length === 1 && (rest[0] === "on" || rest[0] === "off")) {
@@ -96,6 +103,31 @@ export const parseOperatorCommand = (line: string): OperatorCommand => {
       throw new CliInputError({ message: `Unknown command: ${command}` });
   }
 };
+
+const causeMessage = (cause: unknown): string =>
+  cause instanceof Error ? cause.message : String(cause);
+
+export const decodeOperatorCommand = Effect.fn("Brood.Cli.decodeOperatorCommand")(
+  (line: string): Effect.Effect<OperatorCommand, CliInputError> =>
+    Effect.try({
+      try: () => parseOperatorCommand(line),
+      catch: (cause) =>
+        cause instanceof CliInputError
+          ? cause
+          : new CliInputError({ message: causeMessage(cause) }),
+    }).pipe(
+      Effect.flatMap((command) =>
+        command._tag === "Interrupt"
+          ? decodeAgentId(command.agentId).pipe(
+              Effect.map((agentId): OperatorCommand => ({ _tag: "Interrupt", agentId })),
+              Effect.mapError(
+                () => new CliInputError({ message: `Invalid agent ID: ${command.agentId}` }),
+              ),
+            )
+          : Effect.succeed(command),
+      ),
+    ),
+);
 
 const writeJson = (value: unknown): Effect.Effect<void> =>
   Effect.sync(() => {
@@ -112,7 +144,7 @@ const loadConfig = (path: string): Effect.Effect<unknown, CliInputError> =>
     try: () => readFile(path, "utf8"),
     catch: (cause) =>
       new CliInputError({
-        message: `Unable to read config ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        message: `Unable to read config ${path}: ${causeMessage(cause)}`,
       }),
   }).pipe(
     Effect.flatMap((text) =>
@@ -120,7 +152,7 @@ const loadConfig = (path: string): Effect.Effect<unknown, CliInputError> =>
         try: (): unknown => JSON.parse(text),
         catch: (cause) =>
           new CliInputError({
-            message: `Invalid JSON in ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+            message: `Invalid JSON in ${path}: ${causeMessage(cause)}`,
           }),
       }),
     ),
@@ -160,13 +192,7 @@ const executeCommand = (
   line: string,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const command = yield* Effect.try({
-      try: () => parseOperatorCommand(line),
-      catch: (cause) =>
-        cause instanceof CliInputError
-          ? cause
-          : new CliInputError({ message: cause instanceof Error ? cause.message : String(cause) }),
-    });
+    const command = yield* decodeOperatorCommand(line);
     switch (command._tag) {
       case "Status": {
         const agents = yield* application.controller.snapshot;
@@ -185,16 +211,15 @@ const executeCommand = (
         yield* writeMessage("Commands: status | interrupt <agent-id> | events on|off | help");
         break;
     }
-  }).pipe(
-    Effect.catch((cause) => writeMessage(cause instanceof Error ? cause.message : String(cause))),
-  );
+  }).pipe(Effect.catch((cause) => writeMessage(causeMessage(cause))));
 
 const runApplication = (application: BroodApplication, arguments_: CliArguments) =>
   Effect.gen(function* () {
     const interactive = process.stdin.isTTY === true;
     const eventDisplay = yield* Ref.make(!interactive || arguments_.showEvents);
 
-    yield* application.controller.events.pipe(
+    const eventSubscription = yield* application.controller.events;
+    yield* Stream.fromSubscription(eventSubscription).pipe(
       Stream.runForEach((event) =>
         Ref.get(eventDisplay).pipe(
           Effect.flatMap((enabled) =>
@@ -213,18 +238,22 @@ const runApplication = (application: BroodApplication, arguments_: CliArguments)
         Effect.forkScoped,
       );
     }
-    yield* Effect.yieldNow;
     const result = yield* application.run(arguments_.goal);
     yield* writeJson({ type: "completed", result });
     return result;
   });
 
-export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown, unknown> =>
+type CliFailure = CliInputError | BroodConfigError | AgentFailed | RootInterrupted | RootStartError;
+
+export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown, CliFailure> =>
   Effect.scoped(
     Effect.gen(function* () {
       const parsed = yield* Effect.try({
         try: () => parseCliArguments(arguments_),
-        catch: (cause) => cause,
+        catch: (cause) =>
+          cause instanceof CliInputError
+            ? cause
+            : new CliInputError({ message: causeMessage(cause) }),
       });
       const rawConfig = yield* loadConfig(parsed.configPath);
       const application = yield* makeBroodApplicationFromUnknown(rawConfig);
@@ -232,38 +261,47 @@ export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown
     }),
   );
 
-const publicFailure = (error: unknown): Readonly<Record<string, unknown>> => {
-  if (typeof error !== "object" || error === null || !("_tag" in error)) {
-    return { code: "UnexpectedFailure", message: "Brood failed unexpectedly" };
-  }
-  const tagged = Object.fromEntries(Object.entries(error));
-  const code = typeof tagged._tag === "string" ? tagged._tag : "UnexpectedFailure";
-  const message =
-    typeof tagged.message === "string"
-      ? tagged.message
-      : error instanceof Error
-        ? error.message
-        : "Brood failed";
-  switch (code) {
-    case "AgentFailed":
-      return { code, failure: tagged.failure, drain: tagged.drain };
-    case "RootInterrupted":
-      return { code, reason: tagged.reason, drain: tagged.drain };
-    case "BroodConfigError":
-      return {
-        code,
-        stage: tagged.stage,
-        reason: tagged.reason,
-        message,
-        path: tagged.path,
-      };
-    case "RootStartError":
-    case "CliInputError":
-      return { code, message };
-    default:
-      return { code, message: "Brood failed" };
-  }
-};
+const matchPublicFailure = Match.type<CliFailure>().pipe(
+  Match.tag("AgentFailed", (error) => ({
+    code: error._tag,
+    failure: error.failure,
+    drain: error.drain,
+  })),
+  Match.tag("RootInterrupted", (error) => ({
+    code: error._tag,
+    reason: error.reason,
+    drain: error.drain,
+  })),
+  Match.tag("BroodConfigError", (error) => ({
+    code: error._tag,
+    stage: error.stage,
+    reason: error.reason,
+    message: error.message,
+    path: error.path,
+  })),
+  Match.tag("RootStartError", "CliInputError", (error) => ({
+    code: error._tag,
+    message: error.message,
+  })),
+  Match.orElse(() => ({ code: "UnexpectedFailure", message: "Brood failed unexpectedly" })),
+);
+
+const CLI_FAILURE_TAGS = new Set([
+  "AgentFailed",
+  "RootInterrupted",
+  "BroodConfigError",
+  "RootStartError",
+  "CliInputError",
+]);
+
+const publicFailure = (error: unknown): Readonly<Record<string, unknown>> =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  typeof error._tag === "string" &&
+  CLI_FAILURE_TAGS.has(error._tag)
+    ? matchPublicFailure(error as CliFailure)
+    : { code: "UnexpectedFailure", message: "Brood failed unexpectedly" };
 
 const reportNonInteractiveExit = (exit: Exit.Exit<unknown, unknown>): Effect.Effect<void> => {
   if (process.stdin.isTTY === true || Exit.isSuccess(exit)) return Effect.void;
@@ -302,7 +340,7 @@ if (isMain) {
     void Effect.runPromise(program, { signal: controller.signal })
       .catch((cause: unknown) => {
         if (receivedSignal === undefined && process.stdin.isTTY === true) {
-          process.stderr.write(`${cause instanceof Error ? cause.message : String(cause)}\n`);
+          process.stderr.write(`${causeMessage(cause)}\n`);
         }
         process.exitCode = receivedSignal === undefined ? 1 : exitCodeForSignal(receivedSignal);
       })

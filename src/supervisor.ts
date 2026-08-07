@@ -1,5 +1,6 @@
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
+  Array as EffectArray,
   Cause,
   Clock,
   Effect,
@@ -27,27 +28,38 @@ import {
   normalizeAgentResult,
   renderAgentCommand,
   type AgentId,
+  type AgentCommand,
   type AgentName,
   type AgentOutcome,
   type AgentResult,
   type AgentStatus,
+  type BatchId,
   type DelegatedTask,
   type DrainReport,
   type DependencyOutcome,
   type InterruptReason,
+  type PiRunOutcome,
   type ProfileCatalogue,
   type PublicModelProfile,
   type ResolvedModelProfile,
   type WaitId,
   type ToolInvocationId,
 } from "./agent.js";
-import type { PiAdapter, PiAgent, PiOpenRequest, PiSessionEvent } from "./pi-adapter.js";
+import {
+  DEFAULT_EVENT_BUFFER_CAPACITY,
+  type PiAdapter,
+  type PiAgent,
+  type PiOpenRequest,
+  type PiSessionEvent,
+} from "./pi-adapter.js";
 import {
   makeRegistry,
   type AgentSnapshot as RegistryAgentSnapshot,
+  type CommittedSettlement,
   type CommittedInterruptRequest,
   type CommandInterrupted,
   type RegisteredAgent,
+  type ShutdownResult,
 } from "./registry.js";
 import {
   compileAgentToolFactory,
@@ -68,7 +80,7 @@ export interface SupervisorOptions {
   readonly eventBufferCapacity?: number;
   readonly nextAgentId?: () => AgentId;
   readonly nextWaitId?: () => WaitId;
-  readonly nextBatchId?: () => ReturnType<typeof makeBatchId>;
+  readonly nextBatchId?: () => BatchId;
 }
 
 export type SupervisorLifecycleEvent =
@@ -93,7 +105,7 @@ export type SupervisorLifecycleEvent =
   | {
       readonly type: "BatchAdmitted";
       readonly parentId: AgentId;
-      readonly batchId: ReturnType<typeof makeBatchId>;
+      readonly batchId: BatchId;
       readonly agentIds: ReadonlyArray<AgentId>;
     }
   | {
@@ -148,7 +160,7 @@ export interface AgentSupervisor {
   readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
   readonly interrupt: (id: AgentId, source: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
   readonly drain: Effect.Effect<DrainReport>;
-  readonly events: Stream.Stream<SupervisorEvent>;
+  readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
   readonly toolPort: ControlToolPort;
 }
 
@@ -159,16 +171,6 @@ type ControllerError =
   | UnknownAgent
   | CommandInterrupted;
 
-type RunDisposition =
-  | { readonly _tag: "Terminal"; readonly outcome: AgentOutcome }
-  | { readonly _tag: "Suspended" };
-
-const isCommandInterrupted = (value: unknown): value is CommandInterrupted =>
-  typeof value === "object" &&
-  value !== null &&
-  "_tag" in value &&
-  value._tag === "CommandInterrupted";
-
 const controllerOutcome = (exit: ExitType<AgentOutcome, ControllerError>): AgentOutcome => {
   if (Exit.isSuccess(exit)) return exit.value;
   if (Cause.hasInterruptsOnly(exit.cause)) {
@@ -177,17 +179,17 @@ const controllerOutcome = (exit: ExitType<AgentOutcome, ControllerError>): Agent
   const failure = Cause.findErrorOption(exit.cause);
   if (Option.isSome(failure)) {
     const error = failure.value;
-    if (error instanceof PiOpenError) {
-      return { _tag: "Failed", failure: { _tag: "AgentStartFailed", error } };
-    }
-    if (error instanceof PiRunError) {
-      return { _tag: "Failed", failure: { _tag: "AgentRunFailed", error } };
-    }
-    if (error instanceof PiProtocolError) {
-      return { _tag: "Failed", failure: { _tag: "AgentProtocolFailed", error } };
-    }
-    if (isCommandInterrupted(error)) {
-      return { _tag: "Interrupted", reason: error.reason };
+    switch (error._tag) {
+      case "PiOpenError":
+        return { _tag: "Failed", failure: { _tag: "AgentStartFailed", error } };
+      case "PiRunError":
+        return { _tag: "Failed", failure: { _tag: "AgentRunFailed", error } };
+      case "PiProtocolError":
+        return { _tag: "Failed", failure: { _tag: "AgentProtocolFailed", error } };
+      case "CommandInterrupted":
+        return { _tag: "Interrupted", reason: error.reason };
+      case "UnknownAgent":
+        break;
     }
   }
   return { _tag: "Failed", failure: { _tag: "AgentDefect", cause: exit.cause } };
@@ -213,16 +215,7 @@ const terminalStatus = (
 export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   options: SupervisorOptions,
 ) {
-  if (!Number.isSafeInteger(options.maxConcurrency) || options.maxConcurrency <= 0) {
-    return yield* Effect.die(new Error("maxConcurrency must be a positive safe integer"));
-  }
-  if (!Number.isFinite(options.drainTimeoutMillis) || options.drainTimeoutMillis <= 0) {
-    return yield* Effect.die(new Error("drainTimeoutMillis must be finite and positive"));
-  }
-  const eventBufferCapacity = options.eventBufferCapacity ?? 256;
-  if (!Number.isSafeInteger(eventBufferCapacity) || eventBufferCapacity <= 0) {
-    return yield* Effect.die(new Error("eventBufferCapacity must be a positive safe integer"));
-  }
+  const eventBufferCapacity = options.eventBufferCapacity ?? DEFAULT_EVENT_BUFFER_CAPACITY;
 
   const registry = yield* makeRegistry({
     maxAgents: options.maxAgents,
@@ -231,31 +224,34 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     ...(options.nextWaitId === undefined ? {} : { nextWaitId: options.nextWaitId }),
   });
   const slots = yield* Semaphore.make(options.maxConcurrency);
+  // Serializes admission through controller installation against shutdown's installation barrier.
   const installationGate = yield* Semaphore.make(1);
+  // Keeps lifecycle publication sequence identical to publication order on the sliding bus.
   const eventPublication = yield* Semaphore.make(1);
   const controllers = yield* FiberMap.make<AgentId, void, never>();
   const eventBus = yield* PubSub.sliding<SupervisorEvent>(eventBufferCapacity);
   const eventSequence = yield* Ref.make(0);
   const toolFactory = compileAgentToolFactory(options.catalogue);
   const nextBatchId = options.nextBatchId ?? (() => makeBatchId(`batch_${crypto.randomUUID()}`));
+  const awaitInstallationsSettled = installationGate.withPermit(Effect.void);
 
-  const publishLifecycle = Effect.fn("Brood.Supervisor.publishLifecycle")(
-    (event: SupervisorLifecycleEvent) =>
-      eventPublication.withPermit(
-        Effect.gen(function* () {
-          const sequence = yield* Ref.updateAndGet(eventSequence, (current) => current + 1);
-          const timestamp = yield* Clock.currentTimeMillis;
-          yield* PubSub.publish(eventBus, { source: "supervisor", sequence, timestamp, ...event });
-        }),
-      ),
-  );
+  const publishLifecycle = (event: SupervisorLifecycleEvent): Effect.Effect<void> =>
+    eventPublication.withPermit(
+      Effect.gen(function* () {
+        const sequence = yield* Ref.updateAndGet(eventSequence, (current) => current + 1);
+        const timestamp = yield* Clock.currentTimeMillis;
+        yield* PubSub.publish(eventBus, { source: "supervisor", sequence, timestamp, ...event });
+      }),
+    );
 
-  const publishPiEvent = Effect.fn("Brood.Supervisor.publishPiEvent")((event: PiSessionEvent) =>
+  const publishPiEvent = (event: PiSessionEvent): Effect.Effect<void> =>
     Effect.gen(function* () {
       const timestamp = yield* Clock.currentTimeMillis;
       yield* PubSub.publish(eventBus, { source: "pi", timestamp, event });
-    }),
-  );
+    });
+
+  const publishStatus = (agentId: AgentId, status: AgentStatus): Effect.Effect<void> =>
+    publishLifecycle({ type: "AgentStatusChanged", agentId, status });
 
   const publishRegistration = (registration: RegisteredAgent): Effect.Effect<void> =>
     publishLifecycle({
@@ -266,16 +262,12 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       profile: registration.profile,
     });
 
-  const publishSettlement = Effect.fn("Brood.Supervisor.publishSettlement")(function* (
-    id: AgentId,
-  ) {
-    const outcome = yield* registry.awaitOutcome(id).pipe(Effect.orDie);
-    yield* publishLifecycle({
+  const publishSettlement = ({ agentId, outcome }: CommittedSettlement): Effect.Effect<void> =>
+    publishLifecycle({
       type: "AgentSettled",
-      agentId: id,
+      agentId,
       status: terminalStatus(outcome),
     });
-  });
 
   const publishInterruptions = (
     requests: ReadonlyArray<CommittedInterruptRequest>,
@@ -287,10 +279,10 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       { discard: true },
     );
 
-  const disposition = Effect.fn("Brood.Supervisor.acceptRunOutcome")(function* (
+  const acceptRunOutcome = Effect.fn("Brood.Supervisor.acceptRunOutcome")(function* (
     id: AgentId,
     agent: PiAgent,
-    outcome: import("./agent.js").PiRunOutcome,
+    outcome: PiRunOutcome,
   ) {
     if (outcome._tag === "Completed") {
       const result: AgentResult = normalizeAgentResult(
@@ -299,15 +291,11 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         outcome.result.finalText,
         options.maxAgentResultChars,
       );
-      return { _tag: "Terminal", outcome: { _tag: "Completed", result } } satisfies RunDisposition;
+      return Option.some<AgentOutcome>({ _tag: "Completed", result });
     }
     const activation = yield* registry.activateWaits(id);
     if (activation._tag === "Waiting") {
-      yield* publishLifecycle({
-        type: "AgentStatusChanged",
-        agentId: id,
-        status: "Waiting",
-      });
+      yield* publishStatus(id, "Waiting");
       yield* publishLifecycle({
         type: "AgentSuspended",
         agentId: id,
@@ -315,93 +303,73 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         targetIds: activation.targetIds,
       });
     } else {
-      yield* publishLifecycle({ type: "AgentStatusChanged", agentId: id, status: "Queued" });
+      yield* publishStatus(id, "Queued");
     }
-    return { _tag: "Suspended" } satisfies RunDisposition;
+    return Option.none<AgentOutcome>();
   });
 
-  const announceCommand = (id: AgentId, command: import("./agent.js").AgentCommand) =>
+  const announceCommand = (id: AgentId, command: AgentCommand) =>
     command._tag === "Resume"
       ? publishLifecycle({ type: "AgentResumed", agentId: id, waitId: command.waitId })
       : Effect.void;
 
-  function controllerBody(
-    registration: RegisteredAgent,
-    profile: ResolvedModelProfile,
-  ): Effect.Effect<AgentOutcome, ControllerError, Scope.Scope> {
-    return Effect.gen(function* () {
-      const controllerScope = yield* Effect.scope;
-      const first = yield* registry.takePendingCommand(registration.id);
-      yield* announceCommand(registration.id, first);
-      const opened = yield* slots.withPermit(
-        Effect.gen(function* () {
-          yield* registry.markStarting(registration.id);
-          yield* publishLifecycle({
-            type: "AgentStatusChanged",
-            agentId: registration.id,
-            status: "Starting",
-          });
-          const request: PiOpenRequest = {
-            agentId: registration.id,
-            profile,
-            tools: toolFactory.forCaller(registration.id, toolPort),
-            systemPrompt: systemPromptFor(profile),
-          };
-          const agent = yield* Scope.provide(controllerScope)(options.piAdapter.open(request));
-          yield* agent.events.pipe(Stream.runForEach(publishPiEvent), Effect.forkScoped);
-          yield* registry.markRunning(registration.id);
-          yield* publishLifecycle({
-            type: "AgentStatusChanged",
-            agentId: registration.id,
-            status: "Running",
-          });
-          const outcome = yield* agent.run(renderAgentCommand(first, options.maxResumePromptChars));
-          const next = yield* disposition(registration.id, agent, outcome);
-          return { agent, next };
-        }),
-      );
-      if (opened.next._tag === "Terminal") return opened.next.outcome;
+  const runTurn = Effect.fn("Brood.Supervisor.runTurn")(function* (
+    agentId: AgentId,
+    agent: PiAgent,
+    command: AgentCommand,
+  ) {
+    yield* registry.markRunning(agentId);
+    yield* publishStatus(agentId, "Running");
+    const outcome = yield* agent.run(renderAgentCommand(command, options.maxResumePromptChars));
+    return yield* acceptRunOutcome(agentId, agent, outcome);
+  });
 
-      while (true) {
-        const command = yield* registry.takePendingCommand(registration.id);
-        yield* announceCommand(registration.id, command);
-        const next = yield* slots.withPermit(
-          Effect.gen(function* () {
-            yield* registry.markRunning(registration.id);
-            yield* publishLifecycle({
-              type: "AgentStatusChanged",
-              agentId: registration.id,
-              status: "Running",
-            });
-            const outcome = yield* opened.agent.run(
-              renderAgentCommand(command, options.maxResumePromptChars),
-            );
-            return yield* disposition(registration.id, opened.agent, outcome);
-          }),
-        );
-        if (next._tag === "Terminal") return next.outcome;
-      }
-    });
-  }
-
-  function controller(
-    registration: RegisteredAgent,
-    profile: ResolvedModelProfile,
-  ): Effect.Effect<void> {
-    const body = controllerBody(registration, profile).pipe(
-      Effect.onExit((exit) =>
+  const controller = Effect.fn("Brood.Supervisor.controller")(
+    (registration: RegisteredAgent, profile: ResolvedModelProfile): Effect.Effect<void> =>
+      Effect.scoped(
         Effect.gen(function* () {
-          const settled = yield* registry
-            .settle(registration.id, controllerOutcome(exit))
-            .pipe(Effect.orDie);
-          if (settled) yield* publishSettlement(registration.id);
-        }),
+          const first = yield* registry.takePendingCommand(registration.id);
+          yield* announceCommand(registration.id, first);
+          const opened = yield* slots.withPermit(
+            Effect.gen(function* () {
+              yield* registry.markStarting(registration.id);
+              yield* publishStatus(registration.id, "Starting");
+              const request: PiOpenRequest = {
+                agentId: registration.id,
+                profile,
+                tools: toolFactory.forCaller(registration.id, toolPort),
+                systemPrompt: systemPromptFor(profile),
+              };
+              const agent = yield* options.piAdapter.open(request);
+              yield* agent.events.pipe(Stream.runForEach(publishPiEvent), Effect.forkScoped);
+              const next = yield* runTurn(registration.id, agent, first);
+              return { agent, next };
+            }),
+          );
+          if (Option.isSome(opened.next)) return opened.next.value;
+
+          while (true) {
+            const command = yield* registry.takePendingCommand(registration.id);
+            yield* announceCommand(registration.id, command);
+            const next = yield* slots.withPermit(runTurn(registration.id, opened.agent, command));
+            if (Option.isSome(next)) return next.value;
+          }
+        }).pipe(
+          Effect.onExit((exit) =>
+            registry.settle(registration.id, controllerOutcome(exit)).pipe(
+              Effect.orDie,
+              Effect.flatMap((settled) =>
+                Option.isSome(settled)
+                  ? publishSettlement({ agentId: registration.id, outcome: settled.value })
+                  : Effect.void,
+              ),
+            ),
+          ),
+          Effect.exit,
+          Effect.asVoid,
+        ),
       ),
-      Effect.exit,
-      Effect.asVoid,
-    );
-    return Effect.scoped(body);
-  }
+  );
 
   const installController = Effect.fn("Brood.Supervisor.installController")(function* (
     registration: RegisteredAgent,
@@ -416,26 +384,20 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   const resolveTasks = Effect.fn("Brood.Supervisor.resolveTasks")(function* (
     tasks: ReadonlyArray<DelegatedTask>,
   ) {
-    const resolved: Array<{
-      readonly task: DelegatedTask;
-      readonly profile: ResolvedModelProfile;
-    }> = [];
-    for (const task of tasks) {
+    return yield* Effect.forEach(tasks, (task) => {
       const profile =
         task.profile === undefined
           ? options.catalogue.defaultProfile
           : Option.getOrUndefined(options.catalogue.get(task.profile));
-      if (profile === undefined) {
-        return yield* Effect.fail(
-          new DelegateRejected({
-            reason: "UnknownProfile",
-            message: `Unknown profile: ${task.profile}`,
-          }),
-        );
-      }
-      resolved.push({ task, profile });
-    }
-    return resolved;
+      return profile === undefined
+        ? Effect.fail(
+            new DelegateRejected({
+              reason: "UnknownProfile",
+              message: `Unknown profile: ${task.profile}`,
+            }),
+          )
+        : Effect.succeed({ task, profile });
+    });
   });
 
   const toolPort: ControlToolPort = {
@@ -443,7 +405,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       function* (callerId, invocationId, tasks, wait) {
         const resolved = yield* resolveTasks(tasks);
         return yield* installationGate.withPermit(
-          Effect.uninterruptibleMask(() =>
+          Effect.uninterruptible(
             Effect.gen(function* () {
               const batch = yield* registry
                 .registerBatch({
@@ -459,16 +421,16 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
                 .pipe(Effect.catchTag("UnknownAgent", Effect.die));
               const batchId = nextBatchId();
               yield* Effect.forEach(batch.children, publishRegistration, { discard: true });
-              for (let index = 0; index < batch.children.length; index += 1) {
-                const child = batch.children[index];
-                const childProfile = resolved[index]?.profile;
-                if (child === undefined || childProfile === undefined) {
-                  return yield* Effect.die(
-                    new Error("Registry batch did not preserve resolved child correlation"),
-                  );
-                }
-                yield* installController(child, childProfile);
+              if (batch.children.length !== resolved.length) {
+                return yield* Effect.die(
+                  new Error("Registry batch did not preserve resolved child correlation"),
+                );
               }
+              yield* Effect.forEach(
+                EffectArray.zip(batch.children, resolved),
+                ([child, { profile }]) => installController(child, profile),
+                { discard: true },
+              );
               yield* publishLifecycle({
                 type: "BatchAdmitted",
                 parentId: callerId,
@@ -532,7 +494,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
 
   const startRoot = Effect.fn("Brood.Supervisor.startRoot")((goal: string) =>
     installationGate.withPermit(
-      Effect.uninterruptibleMask(() =>
+      Effect.uninterruptible(
         Effect.gen(function* () {
           const normalizedGoal = yield* decodeGoal(goal).pipe(
             Effect.mapError(() => new RootStartError({ message: "Goal must not be empty" })),
@@ -550,19 +512,35 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     ),
   );
 
-  const interrupt = Effect.fn("Brood.Supervisor.interrupt")(function* (
-    id: AgentId,
-    source: "cli" | "api",
-  ) {
-    return yield* Effect.uninterruptible(
+  const interrupt = Effect.fn("Brood.Supervisor.interrupt")((id: AgentId, source: "cli" | "api") =>
+    Effect.uninterruptible(
       Effect.gen(function* () {
         const reason: InterruptReason = { _tag: "OperatorRequested", source };
         const requested = yield* registry.requestInterrupt(id, reason);
         if (requested) yield* publishInterruptions([{ agentId: id, reason }]);
         yield* FiberMap.remove(controllers, id);
       }),
-    );
-  });
+    ),
+  );
+
+  const shutdownWith = Effect.fn("Brood.Supervisor.shutdownWith")(
+    (
+      reason: InterruptReason,
+      afterBarrier: (shutdown: ShutdownResult) => Effect.Effect<void>,
+    ): Effect.Effect<ShutdownResult> =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const shutdown = yield* registry.beginShutdown(reason);
+          yield* awaitInstallationsSettled;
+          yield* afterBarrier(shutdown);
+          yield* publishInterruptions(shutdown.newlyRequested);
+          const settledPending = yield* registry.settlePendingInstallations(reason);
+          yield* Effect.forEach(settledPending, publishSettlement, { discard: true });
+          yield* FiberMap.clear(controllers);
+          return shutdown;
+        }),
+      ),
+  );
 
   const drain = Effect.fn("Brood.Supervisor.drain")(function* () {
     yield* publishLifecycle({ type: "DrainStarted" });
@@ -571,37 +549,26 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     );
     let interruptedAgentIds: ReadonlyArray<AgentId> = [];
     if (Option.isNone(quiescent)) {
-      interruptedAgentIds = yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const reason: InterruptReason = {
-            _tag: "DrainTimeout",
-            timeoutMillis: options.drainTimeoutMillis,
-          };
-          const shutdown = yield* registry.beginShutdown(reason);
-          yield* installationGate.withPermit(Effect.void);
-          yield* publishLifecycle({
-            type: "DrainTimedOut",
-            timeoutMillis: options.drainTimeoutMillis,
-            interruptedAgentIds: Object.freeze([...shutdown.activeIds]),
-          });
-          yield* publishInterruptions(shutdown.newlyRequested);
-          const settledPending = yield* registry.settlePendingInstallations(reason);
-          yield* Effect.forEach(settledPending, publishSettlement, { discard: true });
-          yield* Effect.forEach(shutdown.activeIds, (id) => FiberMap.remove(controllers, id), {
-            concurrency: "unbounded",
-            discard: true,
-          });
-          yield* registry.awaitQuiescence;
-          return shutdown.activeIds;
+      const reason: InterruptReason = {
+        _tag: "DrainTimeout",
+        timeoutMillis: options.drainTimeoutMillis,
+      };
+      const shutdown = yield* shutdownWith(reason, (committed) =>
+        publishLifecycle({
+          type: "DrainTimedOut",
+          timeoutMillis: options.drainTimeoutMillis,
+          interruptedAgentIds: [...committed.activeIds],
         }),
       );
+      interruptedAgentIds = shutdown.activeIds;
+      yield* registry.awaitQuiescence;
     }
     yield* FiberMap.awaitEmpty(controllers);
     const state = yield* registry.snapshot;
     const report: DrainReport = {
       timedOut: Option.isNone(quiescent),
       interruptedAgentIds,
-      terminalAgentCount: state.agents.filter(({ outcome }) => outcome !== undefined).length,
+      terminalAgentCount: state.agents.length - state.nonterminalCount,
     };
     yield* publishLifecycle({ type: "DrainCompleted", report });
     return report;
@@ -609,57 +576,43 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
 
   const publicSnapshot = registry.snapshot.pipe(
     Effect.map(({ agents }): ReadonlyArray<AgentSnapshot> =>
-      Object.freeze(
-        agents.map((agent) => {
-          const outcome =
-            agent.outcome === undefined
-              ? undefined
-              : dependencyOutcomeFromAgent(
-                  agent.id,
-                  agent.name,
-                  agent.outcome,
-                  options.maxFailureMessageChars,
-                );
-          const detachedOutcome =
-            outcome?._tag === "Completed"
-              ? Object.freeze({
-                  ...outcome,
-                  result: Object.freeze({ ...outcome.result }),
-                })
-              : outcome === undefined
-                ? undefined
-                : Object.freeze({ ...outcome });
-          return Object.freeze({
-            id: agent.id,
-            name: agent.name,
-            ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
-            profile: Object.freeze({ ...agent.profile }),
-            status: agent.status,
-            installation: agent.installation,
-            waitTargets: Object.freeze([...agent.waitTargets]),
-            hasPendingCommand: agent.hasPendingCommand,
-            ...(agent.interruptRequested === undefined
-              ? {}
-              : { interruptRequested: Object.freeze({ ...agent.interruptRequested }) }),
-            ...(detachedOutcome === undefined ? {} : { outcome: detachedOutcome }),
-            createdAt: agent.createdAt,
-            updatedAt: agent.updatedAt,
-            ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
-          });
-        }),
-      ),
+      agents.map((agent) => {
+        const outcome =
+          agent.outcome === undefined
+            ? undefined
+            : dependencyOutcomeFromAgent(
+                agent.id,
+                agent.name,
+                agent.outcome,
+                options.maxFailureMessageChars,
+              );
+        const detachedOutcome =
+          outcome?._tag === "Completed" ? { ...outcome, result: { ...outcome.result } } : outcome;
+        return {
+          id: agent.id,
+          name: agent.name,
+          ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
+          profile: agent.profile,
+          status: agent.status,
+          installation: agent.installation,
+          waitTargets: agent.waitTargets,
+          hasPendingCommand: agent.hasPendingCommand,
+          ...(agent.interruptRequested === undefined
+            ? {}
+            : { interruptRequested: { ...agent.interruptRequested } }),
+          ...(detachedOutcome === undefined ? {} : { outcome: detachedOutcome }),
+          createdAt: agent.createdAt,
+          updatedAt: agent.updatedAt,
+          ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
+        };
+      }),
     ),
   );
 
   yield* Effect.addFinalizer(() =>
     Effect.gen(function* () {
       const reason: InterruptReason = { _tag: "SupervisorShutdown" };
-      const shutdown = yield* registry.beginShutdown(reason);
-      yield* installationGate.withPermit(Effect.void);
-      yield* publishInterruptions(shutdown.newlyRequested);
-      const settledPending = yield* registry.settlePendingInstallations(reason);
-      yield* Effect.forEach(settledPending, publishSettlement, { discard: true });
-      yield* FiberMap.clear(controllers);
+      yield* shutdownWith(reason, () => Effect.void);
       yield* PubSub.shutdown(eventBus);
     }),
   );
@@ -670,7 +623,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     snapshot: publicSnapshot,
     interrupt,
     drain,
-    events: Stream.fromPubSub(eventBus),
+    events: PubSub.subscribe(eventBus),
     toolPort,
   } satisfies AgentSupervisor;
 });

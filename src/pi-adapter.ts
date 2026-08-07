@@ -12,7 +12,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Effect, Queue, Ref, Result, Schema, Scope, Stream } from "effect";
+import { Data, Effect, Queue, Ref, Result, Schema, Scope, Stream } from "effect";
 import {
   AgentId,
   PiOpenError,
@@ -69,6 +69,8 @@ export interface PiAdapterOptions {
   readonly eventBufferCapacity?: number;
 }
 
+export const DEFAULT_EVENT_BUFFER_CAPACITY = 256;
+
 export class ConcurrentPiRunDefect extends Error {
   readonly _tag = "ConcurrentPiRunDefect";
 
@@ -77,82 +79,75 @@ export class ConcurrentPiRunDefect extends Error {
   }
 }
 
-export interface ControlInspection {
-  readonly suspend: boolean;
-  readonly protocolError?: PiProtocolError;
-}
+export type ControlInspection = Data.TaggedEnum<{
+  Continue: Record<never, never>;
+  Suspend: Record<never, never>;
+  Malformed: { readonly error: PiProtocolError };
+}>;
+
+const ControlInspection = Data.taggedEnum<ControlInspection>();
 
 export const inspectControlToolResults = (
   agentId: AgentId,
   toolResults: ReadonlyArray<ToolResultMessage>,
 ): ControlInspection => {
-  try {
-    let suspend = false;
-    for (const result of toolResults) {
-      if (result.toolName !== "delegate" && result.toolName !== "wait_for_agents") continue;
-      if (result.isError) continue;
-      const decodeFailure = (failure: unknown): ControlInspection => ({
-        suspend: false,
-        protocolError: new PiProtocolError({
+  let suspend = false;
+  for (const result of toolResults) {
+    if (result.toolName !== "delegate" && result.toolName !== "wait_for_agents") continue;
+    if (result.isError) continue;
+    const malformed = (message: string): ControlInspection =>
+      ControlInspection.Malformed({
+        error: new PiProtocolError({
           agentId,
-          message: `Malformed ${result.toolName} control details: ${String(failure)}`,
+          message,
         }),
       });
-      let control;
-      if (result.toolName === "delegate") {
-        const decoded = Schema.decodeUnknownResult(DelegateToolDetails)(result.details);
-        if (Result.isFailure(decoded)) return decodeFailure(decoded.failure);
-        control = decoded.success.broodControl;
-      } else {
-        const decoded = Schema.decodeUnknownResult(WaitToolDetails)(result.details);
-        if (Result.isFailure(decoded)) return decodeFailure(decoded.failure);
-        control = decoded.success.broodControl;
+    let control;
+    if (result.toolName === "delegate") {
+      const decoded = Schema.decodeUnknownResult(DelegateToolDetails)(result.details);
+      if (Result.isFailure(decoded)) {
+        return malformed(
+          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
+        );
       }
-      if (control.invocationId !== result.toolCallId) {
-        return {
-          suspend: false,
-          protocolError: new PiProtocolError({
-            agentId,
-            message: `${result.toolName} invocation ${control.invocationId} does not match tool call ${result.toolCallId}`,
-          }),
-        };
+      control = decoded.success.broodControl;
+    } else {
+      const decoded = Schema.decodeUnknownResult(WaitToolDetails)(result.details);
+      if (Result.isFailure(decoded)) {
+        return malformed(
+          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
+        );
       }
-      suspend = suspend || control.kind === "suspend";
+      control = decoded.success.broodControl;
     }
-    return { suspend };
-  } catch (cause) {
-    return {
-      suspend: false,
-      protocolError: new PiProtocolError({
-        agentId,
-        message: `Control-result inspection defect: ${safeMessage(cause)}`,
-      }),
-    };
+    if (control.invocationId !== result.toolCallId) {
+      return malformed(
+        `${result.toolName} invocation ${control.invocationId} does not match tool call ${result.toolCallId}`,
+      );
+    }
+    suspend = suspend || control.kind === "suspend";
   }
+  return suspend ? ControlInspection.Suspend() : ControlInspection.Continue();
 };
 
-interface FinalTurn {
-  readonly message: AssistantMessage;
-}
+type Suspension = Data.TaggedEnum<{
+  None: Record<never, never>;
+  Marked: { readonly turn: AssistantMessage };
+  Continued: Record<never, never>;
+}>;
+
+const Suspension = Data.taggedEnum<Suspension>();
 
 interface RunClassifier {
-  finalTurn: FinalTurn | undefined;
+  finalTurn: AssistantMessage | undefined;
   protocolError: PiProtocolError | undefined;
-  suspended: boolean;
-  settled: boolean;
-  unexpectedContinuation: boolean;
-  queuedMessages: boolean;
-  readonly pendingTools: Set<string>;
+  suspension: Suspension;
 }
 
 const freshClassifier = (): RunClassifier => ({
   finalTurn: undefined,
   protocolError: undefined,
-  suspended: false,
-  settled: false,
-  unexpectedContinuation: false,
-  queuedMessages: false,
-  pendingTools: new Set(),
+  suspension: Suspension.None(),
 });
 
 const safeMessage = (cause: unknown): string =>
@@ -198,20 +193,9 @@ const assertNeverStopReason = (reason: never): never => {
 const classifySettledRun = (
   agentId: AgentId,
   state: RunClassifier,
-  pendingMessageCount: number,
 ): Effect.Effect<PiRunOutcome, PiRunError | PiProtocolError> => {
   if (state.protocolError !== undefined) return Effect.fail(state.protocolError);
-  if (!state.settled) {
-    return Effect.fail(
-      new PiRunError({ agentId, message: "Pi prompt resolved before agent_settled" }),
-    );
-  }
-  if (state.pendingTools.size > 0) {
-    return Effect.fail(
-      new PiRunError({ agentId, message: "Pi prompt settled with pending tool executions" }),
-    );
-  }
-  if (state.unexpectedContinuation || state.queuedMessages || pendingMessageCount > 0) {
+  if (state.suspension._tag === "Continued") {
     return Effect.fail(
       new PiProtocolError({ agentId, message: "Pi continued or queued input after suspension" }),
     );
@@ -222,8 +206,8 @@ const classifySettledRun = (
       new PiRunError({ agentId, message: "Pi prompt settled without an assistant turn" }),
     );
   }
-  if (state.suspended) {
-    if (turn.message.stopReason !== "toolUse") {
+  if (state.suspension._tag === "Marked") {
+    if (state.suspension.turn.stopReason !== "toolUse") {
       return Effect.fail(
         new PiProtocolError({ agentId, message: "Suspension marker was not on a toolUse turn" }),
       );
@@ -231,10 +215,10 @@ const classifySettledRun = (
     return Effect.succeed({ _tag: "Suspended" });
   }
 
-  const stopReason: StopReason = turn.message.stopReason;
+  const stopReason: StopReason = turn.stopReason;
   switch (stopReason) {
     case "stop":
-      if (turn.message.content.some((entry) => entry.type === "toolCall")) {
+      if (turn.content.some((entry) => entry.type === "toolCall")) {
         return Effect.fail(
           new PiProtocolError({
             agentId,
@@ -245,8 +229,8 @@ const classifySettledRun = (
       return Effect.succeed({
         _tag: "Completed",
         result: {
-          finalText: contentText(turn.message.content),
-          finalMessageId: turn.message.responseId,
+          finalText: contentText(turn.content),
+          finalMessageId: turn.responseId,
           stopReason: "stop",
         },
       });
@@ -259,7 +243,7 @@ const classifySettledRun = (
       return Effect.fail(
         new PiRunError({
           agentId,
-          message: turn.message.errorMessage ?? `Pi ended with stop reason ${stopReason}`,
+          message: turn.errorMessage ?? `Pi ended with stop reason ${stopReason}`,
           stopReason,
         }),
       );
@@ -268,72 +252,61 @@ const classifySettledRun = (
   }
 };
 
-const toMonitorEvent = (
-  agentId: AgentId,
-  sessionId: string,
-  sessionSequence: number,
-  event: AgentSessionEvent,
-): PiSessionEvent | undefined => {
-  const base = { agentId, sessionId, sessionSequence };
+type PiSessionEventKind = Omit<PiSessionEvent, "agentId" | "sessionId" | "sessionSequence">;
+
+const toMonitorEventKind = (event: AgentSessionEvent): PiSessionEventKind | undefined => {
   switch (event.type) {
     case "agent_start":
-      return { ...base, type: "AgentStart" };
+      return { type: "AgentStart" };
     case "agent_settled":
-      return { ...base, type: "AgentSettled" };
+      return { type: "AgentSettled" };
     case "turn_start":
-      return { ...base, type: "TurnStart" };
+      return { type: "TurnStart" };
     case "turn_end":
-      return { ...base, type: "TurnEnd" };
+      return { type: "TurnEnd" };
     case "tool_execution_start":
       return {
-        ...base,
         type: "ToolStart",
         toolCallId: event.toolCallId,
         toolName: event.toolName,
       };
     case "tool_execution_end":
       return {
-        ...base,
         type: "ToolEnd",
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         isError: event.isError,
       };
     case "auto_retry_start":
-      return { ...base, type: "RetryStart" };
+      return { type: "RetryStart" };
     case "auto_retry_end":
-      return { ...base, type: "RetryEnd" };
+      return { type: "RetryEnd" };
     case "compaction_start":
-      return { ...base, type: "CompactionStart" };
+      return { type: "CompactionStart" };
     case "compaction_end":
-      return { ...base, type: "CompactionEnd" };
+      return { type: "CompactionEnd" };
     default:
       return undefined;
   }
 };
 
-const sameStrings = (left: ReadonlyArray<string>, right: ReadonlyArray<string>): boolean => {
-  if (left.length !== right.length) return false;
-  const sortedLeft = [...left].sort();
-  const sortedRight = [...right].sort();
-  return sortedLeft.every((value, index) => value === sortedRight[index]);
-};
+const piOpenError = (agentId: AgentId, cause: unknown): PiOpenError =>
+  new PiOpenError({ agentId, message: safeMessage(cause) });
+
+const secureDirectory = (path: string, agentId: AgentId): Effect.Effect<void, PiOpenError> =>
+  Effect.tryPromise({
+    try: () => mkdir(path, { recursive: true, mode: 0o700 }).then(() => chmod(path, 0o700)),
+    catch: (cause) => piOpenError(agentId, cause),
+  }).pipe(Effect.asVoid);
 
 export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
   open: Effect.fn("Brood.PiAdapter.open")(function* (request) {
     const agentSessionDirectory = join(options.sessionDirectory, request.agentId);
-    yield* Effect.tryPromise({
-      try: () =>
-        Promise.all([
-          mkdir(options.piAgentDirectory, { recursive: true, mode: 0o700 }).then(() =>
-            chmod(options.piAgentDirectory, 0o700),
-          ),
-          mkdir(agentSessionDirectory, { recursive: true, mode: 0o700 }).then(() =>
-            chmod(agentSessionDirectory, 0o700),
-          ),
-        ]),
-      catch: (cause) => new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
-    });
+    yield* Effect.forEach(
+      [options.piAgentDirectory, agentSessionDirectory],
+      (path) => secureDirectory(path, request.agentId),
+      { discard: true },
+    );
 
     const settingsManager = SettingsManager.create(
       options.workspacePath,
@@ -354,13 +327,18 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
     });
     yield* Effect.tryPromise({
       try: () => resourceLoader.reload(),
-      catch: (cause) => new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
+      catch: (cause) => piOpenError(request.agentId, cause),
     });
 
-    const queue = yield* Queue.sliding<PiSessionEvent>(options.eventBufferCapacity ?? 256);
+    const queue = yield* Queue.sliding<PiSessionEvent>(
+      options.eventBufferCapacity ?? DEFAULT_EVENT_BUFFER_CAPACITY,
+    );
     yield* Effect.addFinalizer(() => Queue.shutdown(queue));
-    let unsubscribe = (): void => {};
-    const acquired = yield* Effect.uninterruptible(
+    const inFlight = yield* Ref.make(false);
+    let classifier = freshClassifier();
+    let sessionSequence = 0;
+
+    const acquired = yield* Effect.acquireRelease(
       Effect.gen(function* () {
         const created = yield* Effect.tryPromise({
           try: () =>
@@ -375,140 +353,133 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
               sessionManager,
               settingsManager,
             }),
-          catch: (cause) =>
-            new PiOpenError({ agentId: request.agentId, message: safeMessage(cause) }),
+          catch: (cause) => piOpenError(request.agentId, cause),
         });
         const session = created.session;
-        const abortAndAwait = Effect.sync(() => session.abortCompaction()).pipe(
+        const abortAndAwait = Effect.try({
+          try: () => session.abortCompaction(),
+          catch: (cause) => cause,
+        }).pipe(
           Effect.andThen(
             Effect.tryPromise({
               try: () => session.abort(),
               catch: (cause) => cause,
             }).pipe(Effect.timeout(options.sessionCleanupTimeoutMillis)),
           ),
-          Effect.catchCause(() =>
-            Effect.logWarning("Pi session cleanup did not finish cleanly", {
-              agentId: request.agentId,
-              sessionId: session.sessionId,
-            }),
-          ),
-        );
-        yield* Effect.addFinalizer(() =>
-          abortAndAwait.pipe(
-            Effect.andThen(Effect.sync(() => unsubscribe())),
-            Effect.andThen(
-              Effect.sync(() => {
-                try {
-                  session.dispose();
-                } catch {
-                  // Disposal is best effort after the awaited abort barrier.
-                }
+          Effect.catch((cause) =>
+            Effect.logWarning("Pi session cleanup did not finish cleanly").pipe(
+              Effect.annotateLogs({
+                agentId: request.agentId,
+                sessionId: session.sessionId,
+                cause: safeMessage(cause),
               }),
             ),
           ),
         );
-        return { created, session, abortAndAwait };
+        delete session.agent.prepareNextTurn;
+        delete session.agent.prepareNextTurnWithContext;
+
+        session.agent.shouldStopAfterTurn = ({ message, toolResults }) =>
+          ControlInspection.$match(inspectControlToolResults(request.agentId, toolResults), {
+            Continue: () => false,
+            Suspend: () => {
+              classifier.suspension = Suspension.Marked({ turn: message });
+              return true;
+            },
+            Malformed: ({ error }) => {
+              setFirstProtocolError(classifier, error);
+              return true;
+            },
+          });
+
+        const unsubscribe = session.subscribe((event) => {
+          try {
+            switch (event.type) {
+              case "turn_start":
+                if (classifier.suspension._tag === "Marked") {
+                  classifier.suspension = Suspension.Continued();
+                }
+                break;
+              case "turn_end":
+                if (!isAssistant(event.message)) {
+                  setFirstProtocolError(
+                    classifier,
+                    new PiProtocolError({
+                      agentId: request.agentId,
+                      message: "Pi turn ended without an assistant message",
+                    }),
+                  );
+                } else {
+                  const error =
+                    event.message.stopReason === "error" || event.message.stopReason === "aborted"
+                      ? undefined
+                      : validateToolBatch(request.agentId, event.message, event.toolResults);
+                  if (error !== undefined) setFirstProtocolError(classifier, error);
+                  classifier.finalTurn = event.message;
+                }
+                break;
+            }
+            const kind = toMonitorEventKind(event);
+            if (kind !== undefined) {
+              sessionSequence += 1;
+              Queue.offerUnsafe(queue, {
+                agentId: request.agentId,
+                sessionId: session.sessionId,
+                sessionSequence,
+                ...kind,
+              });
+            }
+          } catch {
+            // Pi listeners are synchronous. Monitoring and defensive classification must never escape.
+          }
+        });
+        return { created, session, abortAndAwait, unsubscribe };
       }),
+      ({ abortAndAwait, session, unsubscribe }) =>
+        abortAndAwait.pipe(
+          Effect.andThen(Effect.sync(unsubscribe)),
+          Effect.andThen(
+            Effect.sync(() => {
+              try {
+                session.dispose();
+              } catch {
+                // Disposal is best effort after the awaited abort barrier.
+              }
+            }),
+          ),
+        ),
     );
     const { abortAndAwait, created, session } = acquired;
-    const inFlight = yield* Ref.make(false);
-    let classifier = freshClassifier();
-    let sessionSequence = 0;
 
-    delete session.agent.prepareNextTurn;
-    delete session.agent.prepareNextTurnWithContext;
-
-    session.agent.shouldStopAfterTurn = ({ toolResults }) => {
-      const inspection = inspectControlToolResults(request.agentId, toolResults);
-      if (inspection.protocolError !== undefined) {
-        setFirstProtocolError(classifier, inspection.protocolError);
-        return true;
-      }
-      if (inspection.suspend) classifier.suspended = true;
-      return inspection.suspend;
-    };
-
-    unsubscribe = session.subscribe((event) => {
-      try {
-        switch (event.type) {
-          case "turn_start":
-            if (classifier.suspended) classifier.unexpectedContinuation = true;
-            break;
-          case "turn_end":
-            if (!isAssistant(event.message)) {
-              setFirstProtocolError(
-                classifier,
-                new PiProtocolError({
-                  agentId: request.agentId,
-                  message: "Pi turn ended without an assistant message",
-                }),
-              );
-            } else {
-              const error =
-                event.message.stopReason === "error" || event.message.stopReason === "aborted"
-                  ? undefined
-                  : validateToolBatch(request.agentId, event.message, event.toolResults);
-              if (error !== undefined) setFirstProtocolError(classifier, error);
-              classifier.finalTurn = { message: event.message };
-            }
-            break;
-          case "tool_execution_start":
-            classifier.pendingTools.add(event.toolCallId);
-            break;
-          case "tool_execution_end":
-            classifier.pendingTools.delete(event.toolCallId);
-            break;
-          case "agent_settled":
-            classifier.settled = true;
-            break;
-          case "queue_update":
-            if (event.steering.length > 0 || event.followUp.length > 0) {
-              classifier.queuedMessages = true;
-            }
-            break;
-        }
-        const monitor = toMonitorEvent(
-          request.agentId,
-          session.sessionId,
-          sessionSequence + 1,
-          event,
-        );
-        if (monitor !== undefined) {
-          sessionSequence += 1;
-          Queue.offerUnsafe(queue, monitor);
-        }
-      } catch {
-        // Pi listeners are synchronous. Monitoring and defensive classification must never escape.
-      }
-    });
-
-    if (created.modelFallbackMessage !== undefined) {
-      return yield* Effect.die(
-        new Error(`Explicit Pi model unexpectedly fell back for ${request.agentId}`),
-      );
-    }
-    if (
-      session.model?.provider !== request.profile.model.provider ||
-      session.model.id !== request.profile.model.id ||
-      session.thinkingLevel !== request.profile.public.thinkingLevel
-    ) {
-      return yield* Effect.die(new Error(`Pi session profile mismatch for ${request.agentId}`));
-    }
+    const invariant = (condition: boolean, message: string): Effect.Effect<void> =>
+      condition ? Effect.void : Effect.die(new Error(message));
+    yield* invariant(
+      created.modelFallbackMessage === undefined,
+      `Explicit Pi model unexpectedly fell back for ${request.agentId}`,
+    );
+    yield* invariant(
+      session.model?.provider === request.profile.model.provider &&
+        session.model.id === request.profile.model.id &&
+        session.thinkingLevel === request.profile.public.thinkingLevel,
+      `Pi session profile mismatch for ${request.agentId}`,
+    );
     const expectedTools = ["read", "bash", "edit", "write", "delegate", "wait_for_agents"];
-    if (!sameStrings(session.getActiveToolNames(), expectedTools)) {
-      return yield* Effect.die(
-        new Error(
-          `Unexpected active Pi tools for ${request.agentId}: ${session.getActiveToolNames().join(", ")}`,
-        ),
-      );
-    }
-    if (created.extensionsResult.extensions.length > 0) {
-      return yield* Effect.die(new Error(`Pi extensions loaded for ${request.agentId}`));
-    }
+    const activeTools = session.getActiveToolNames();
+    const sortedActiveTools = [...activeTools].sort();
+    const sortedExpectedTools = [...expectedTools].sort();
+    const toolsMatch =
+      sortedActiveTools.length === sortedExpectedTools.length &&
+      sortedActiveTools.every((value, index) => value === sortedExpectedTools[index]);
+    yield* invariant(
+      toolsMatch,
+      `Unexpected active Pi tools for ${request.agentId}: ${activeTools.join(", ")}`,
+    );
+    yield* invariant(
+      created.extensionsResult.extensions.length === 0,
+      `Pi extensions loaded for ${request.agentId}`,
+    );
 
-    const acquireRun = Ref.modify(inFlight, (active) =>
-      active ? ([true, true] as const) : ([false, true] as const),
-    ).pipe(
+    const acquireRun = Ref.getAndSet(inFlight, true).pipe(
       Effect.flatMap((alreadyActive) =>
         alreadyActive ? Effect.die(new ConcurrentPiRunDefect(request.agentId)) : Effect.void,
       ),
@@ -518,7 +489,8 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
       Effect.acquireUseRelease(
         acquireRun,
         () => {
-          classifier = freshClassifier();
+          const state = freshClassifier();
+          classifier = state;
           return Effect.tryPromise({
             try: () =>
               session.prompt(prompt, {
@@ -529,11 +501,7 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
               new PiRunError({ agentId: request.agentId, message: safeMessage(cause) }),
           }).pipe(
             Effect.onInterrupt(() => abortAndAwait),
-            Effect.andThen(
-              Effect.suspend(() =>
-                classifySettledRun(request.agentId, classifier, session.pendingMessageCount),
-              ),
-            ),
+            Effect.andThen(Effect.suspend(() => classifySettledRun(request.agentId, state))),
           );
         },
         () => Ref.set(inFlight, false),

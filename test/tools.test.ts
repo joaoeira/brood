@@ -14,7 +14,7 @@ import {
   makeAgentTools,
   type ControlToolPort,
 } from "../src/tools.js";
-import { testModelLookup, testProfilesConfig } from "./support/profiles.js";
+import { testModelLookup, testProfile, testProfilesConfig } from "./support/profiles.js";
 import { compileProfileCatalogue } from "../src/agent.js";
 
 const catalogue = () =>
@@ -22,18 +22,8 @@ const catalogue = () =>
     compileProfileCatalogue(
       testProfilesConfig({
         profiles: {
-          worker: {
-            description: "general work",
-            provider: "scripted",
-            model: "scripted-small",
-            thinkingLevel: "off",
-          },
-          coordinator: {
-            description: "coordination",
-            provider: "scripted",
-            model: "scripted-small",
-            thinkingLevel: "off",
-          },
+          worker: testProfile({ description: "general work" }),
+          coordinator: testProfile({ description: "coordination" }),
         },
       }),
       testModelLookup(),

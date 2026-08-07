@@ -1,9 +1,10 @@
-import { Deferred, Effect, Latch, Ref } from "effect";
+import { Clock, Data, Deferred, Effect, Latch, Option, Ref, Result } from "effect";
 import type { Deferred as DeferredType } from "effect/Deferred";
 import type { Latch as LatchType } from "effect/Latch";
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
   DelegateRejected,
+  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   RootStartError,
   UnknownAgent,
   WaitRejected,
@@ -31,17 +32,14 @@ export interface RegisteredAgent {
   readonly profile: PublicModelProfile;
 }
 
-export interface RegisterRootInput {
+export interface RegisterAgentInput {
   readonly name: AgentName;
   readonly goal: string;
   readonly profile: PublicModelProfile;
 }
 
-export interface RegisterChildInput {
-  readonly name: AgentName;
-  readonly goal: string;
-  readonly profile: PublicModelProfile;
-}
+export type RegisterRootInput = RegisterAgentInput;
+export type RegisterChildInput = RegisterAgentInput;
 
 export interface RegisterBatchInput {
   readonly parentId: AgentId;
@@ -52,7 +50,6 @@ export interface RegisterBatchInput {
 
 export interface BatchRegistration {
   readonly children: ReadonlyArray<RegisteredAgent>;
-  readonly waitPlanned: boolean;
 }
 
 export interface PlanWaitInput {
@@ -64,7 +61,6 @@ export interface PlanWaitInput {
 export type WaitPlanResult =
   | {
       readonly _tag: "Ready";
-      readonly targetIds: ReadonlyArray<AgentId>;
       readonly outcomes: ReadonlyArray<DependencyOutcome>;
     }
   | { readonly _tag: "Planned"; readonly targetIds: ReadonlyArray<AgentId> };
@@ -97,9 +93,15 @@ export interface ShutdownResult {
   readonly newlyRequested: ReadonlyArray<CommittedInterruptRequest>;
 }
 
-export class RegistryInvariantDefect extends Error {
-  readonly _tag = "RegistryInvariantDefect";
+export interface CommittedSettlement {
+  readonly agentId: AgentId;
+  readonly outcome: AgentOutcome;
 }
+
+export class RegistryInvariantDefect extends Error {}
+
+// Transition bodies run inside pure Ref.modify callbacks. Throwing here deliberately turns an
+// impossible registry state into a defect; domain rejection belongs in Transition.result instead.
 
 export interface AgentSnapshot extends RegisteredAgent {
   readonly status: AgentStatus;
@@ -121,11 +123,6 @@ export interface RegistrySnapshot {
   readonly pendingInstallationCount: number;
 }
 
-interface PlannedWait {
-  readonly invocationId: ToolInvocationId;
-  readonly targetIds: ReadonlyArray<AgentId>;
-}
-
 interface ActiveWait {
   readonly waitId: WaitId;
   readonly targetIds: ReadonlyArray<AgentId>;
@@ -140,7 +137,7 @@ interface AgentEntry extends RegisteredAgent {
   readonly outcome: AgentOutcome | undefined;
   readonly interruptRequested: InterruptReason | undefined;
   readonly seenInvocations: ReadonlySet<ToolInvocationId>;
-  readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWait>;
+  readonly plannedTargets: ReadonlyArray<AgentId>;
   readonly activeWait: ActiveWait | undefined;
   readonly childrenByName: ReadonlyMap<AgentName, AgentId>;
   readonly createdAt: number;
@@ -153,68 +150,29 @@ interface RegistryState {
   readonly rootId: AgentId | undefined;
   readonly accepting: boolean;
   readonly nonterminalCount: number;
-  readonly pendingInstallationCount: number;
 }
 
-type PostCommitAction =
-  | {
-      readonly _tag: "Complete";
-      readonly deferred: DeferredType<AgentOutcome>;
-      readonly outcome: AgentOutcome;
-    }
-  | { readonly _tag: "Open"; readonly latch: LatchType };
+type PostCommitAction = Data.TaggedEnum<{
+  Complete: {
+    readonly deferred: DeferredType<AgentOutcome>;
+    readonly outcome: AgentOutcome;
+  };
+  Open: { readonly latch: LatchType };
+}>;
 
-interface TransitionSuccess<A> {
-  readonly _tag: "Success";
-  readonly value: A;
-}
-
-interface TransitionFailure<E> {
-  readonly _tag: "Failure";
-  readonly error: E;
-}
-
-type TransitionResult<A, E> = TransitionSuccess<A> | TransitionFailure<E>;
+const PostCommitAction = Data.taggedEnum<PostCommitAction>();
 
 interface Transition<A, E> {
   readonly next: RegistryState;
   readonly actions: ReadonlyArray<PostCommitAction>;
-  readonly result: TransitionResult<A, E>;
+  readonly result: Result.Result<A, E>;
 }
 
-const success = <A>(value: A): TransitionSuccess<A> => ({ _tag: "Success", value });
-const failure = <E>(error: E): TransitionFailure<E> => ({ _tag: "Failure", error });
-
-const noChange = <A, E>(
-  state: RegistryState,
-  result: TransitionResult<A, E>,
-): Transition<A, E> => ({
+const noChange = <A, E>(state: RegistryState, result: Result.Result<A, E>): Transition<A, E> => ({
   next: state,
   actions: [],
   result,
 });
-
-const isTerminal = (status: AgentStatus): boolean =>
-  status === "Completed" || status === "Failed" || status === "Interrupted";
-
-const terminalStatus = (outcome: AgentOutcome): AgentStatus => {
-  switch (outcome._tag) {
-    case "Completed":
-      return "Completed";
-    case "Failed":
-      return "Failed";
-    case "Interrupted":
-      return "Interrupted";
-  }
-};
-
-const copyProfile = (profile: PublicModelProfile): PublicModelProfile =>
-  Object.freeze({
-    name: profile.name,
-    provider: profile.provider,
-    model: profile.model,
-    thinkingLevel: profile.thinkingLevel,
-  });
 
 const replaceAgent = (state: RegistryState, entry: AgentEntry): RegistryState => {
   const agents = new Map(state.agents);
@@ -224,37 +182,34 @@ const replaceAgent = (state: RegistryState, entry: AgentEntry): RegistryState =>
 
 const waitTargets = (entry: AgentEntry): ReadonlyArray<AgentId> => {
   if (entry.activeWait !== undefined) return [...entry.activeWait.targetIds];
-  const targetIds: Array<AgentId> = [];
-  const selected = new Set<AgentId>();
-  for (const plan of entry.plannedWaits.values()) {
-    for (const targetId of plan.targetIds) {
-      if (!selected.has(targetId)) {
-        selected.add(targetId);
-        targetIds.push(targetId);
-      }
-    }
+  return [...entry.plannedTargets];
+};
+
+const withTargets = (
+  current: ReadonlyArray<AgentId>,
+  additions: ReadonlyArray<AgentId>,
+): ReadonlyArray<AgentId> => {
+  const selected = new Set(current);
+  const targetIds = [...current];
+  for (const targetId of additions) {
+    if (selected.has(targetId)) continue;
+    selected.add(targetId);
+    targetIds.push(targetId);
   }
   return targetIds;
 };
 
-const dispatchAction = (action: PostCommitAction): Effect.Effect<void> => {
-  switch (action._tag) {
-    case "Complete":
-      return Deferred.succeed(action.deferred, action.outcome).pipe(Effect.asVoid);
-    case "Open":
-      return Latch.open(action.latch).pipe(Effect.asVoid);
-  }
-};
-
-const finishTransition = <A, E>(result: TransitionResult<A, E>): Effect.Effect<A, E> =>
-  result._tag === "Success" ? Effect.succeed(result.value) : Effect.fail(result.error);
+const dispatchAction = (action: PostCommitAction): Effect.Effect<void> =>
+  PostCommitAction.$match(action, {
+    Complete: ({ deferred, outcome }) => Deferred.succeed(deferred, outcome).pipe(Effect.asVoid),
+    Open: ({ latch }) => Latch.open(latch).pipe(Effect.asVoid),
+  });
 
 export interface RegistryOptions {
   readonly maxAgents: number;
   readonly maxFailureMessageChars?: number;
   readonly nextAgentId?: () => AgentId;
   readonly nextWaitId?: () => WaitId;
-  readonly now?: () => number;
 }
 
 export interface AgentRegistry {
@@ -264,18 +219,20 @@ export interface AgentRegistry {
   readonly registerBatch: (
     input: RegisterBatchInput,
   ) => Effect.Effect<BatchRegistration, DelegateRejected | UnknownAgent>;
-  readonly settle: (id: AgentId, outcome: AgentOutcome) => Effect.Effect<boolean, UnknownAgent>;
+  readonly settle: (
+    id: AgentId,
+    outcome: AgentOutcome,
+  ) => Effect.Effect<Option.Option<AgentOutcome>, UnknownAgent>;
   readonly planWait: (
     input: PlanWaitInput,
   ) => Effect.Effect<WaitPlanResult, WaitRejected | UnknownAgent>;
   readonly activateWaits: (id: AgentId) => Effect.Effect<WaitActivation, UnknownAgent>;
-  readonly markInstalled: (id: AgentId) => Effect.Effect<boolean, UnknownAgent>;
+  readonly markInstalled: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly markStarting: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly markRunning: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly takePendingCommand: (
     id: AgentId,
   ) => Effect.Effect<AgentCommand, UnknownAgent | CommandInterrupted>;
-  readonly signalMailbox: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
   readonly requestInterrupt: (
     id: AgentId,
@@ -284,7 +241,7 @@ export interface AgentRegistry {
   readonly beginShutdown: (reason: InterruptReason) => Effect.Effect<ShutdownResult>;
   readonly settlePendingInstallations: (
     reason: InterruptReason,
-  ) => Effect.Effect<ReadonlyArray<AgentId>>;
+  ) => Effect.Effect<ReadonlyArray<CommittedSettlement>>;
   readonly awaitQuiescence: Effect.Effect<void>;
   readonly snapshot: Effect.Effect<RegistrySnapshot>;
 }
@@ -297,7 +254,6 @@ const makeEntry = (
   completion: DeferredType<AgentOutcome>,
 ): AgentEntry => ({
   ...registration,
-  profile: copyProfile(registration.profile),
   status: "Queued",
   installation: "Pending",
   pendingCommand: { _tag: "InitialGoal", goal },
@@ -306,7 +262,7 @@ const makeEntry = (
   outcome: undefined,
   interruptRequested: undefined,
   seenInvocations: new Set(),
-  plannedWaits: new Map(),
+  plannedTargets: [],
   activeWait: undefined,
   childrenByName: new Map(),
   createdAt: now,
@@ -320,8 +276,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     return yield* Effect.die(new Error("Registry maxAgents must be a positive safe integer"));
   }
 
-  const now = options.now ?? Date.now;
-  const maxFailureMessageChars = options.maxFailureMessageChars ?? 2_000;
+  const maxFailureMessageChars =
+    options.maxFailureMessageChars ?? DEFAULT_MAX_FAILURE_MESSAGE_CHARS;
   const nextAgentId = options.nextAgentId ?? (() => makeAgentId(`agent_${crypto.randomUUID()}`));
   const nextWaitId = options.nextWaitId ?? (() => makeWaitId(`wait_${crypto.randomUUID()}`));
   const quiescence = yield* Latch.make(false);
@@ -330,24 +286,34 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     rootId: undefined,
     accepting: true,
     nonterminalCount: 0,
-    pendingInstallationCount: 0,
   });
 
   const transact = <A, E>(
     transition: (state: RegistryState) => Transition<A, E>,
   ): Effect.Effect<A, E> =>
-    Effect.uninterruptibleMask(() =>
+    Effect.uninterruptible(
       Ref.modify(stateRef, (state) => {
         const committed = transition(state);
         return [committed, committed.next];
       }).pipe(
         Effect.flatMap((committed) =>
           Effect.forEach(committed.actions, dispatchAction, { discard: true }).pipe(
-            Effect.andThen(finishTransition(committed.result)),
+            Effect.andThen(Effect.fromResult(committed.result)),
           ),
         ),
       ),
     );
+
+  const withAgent = <A, E>(
+    state: RegistryState,
+    id: AgentId,
+    body: (entry: AgentEntry) => Transition<A, E>,
+  ): Transition<A, E | UnknownAgent> => {
+    const entry = state.agents.get(id);
+    return entry === undefined
+      ? noChange(state, Result.fail(new UnknownAgent({ agentId: id })))
+      : body(entry);
+  };
 
   const outcomesFor = (
     state: RegistryState,
@@ -372,19 +338,20 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     const id = nextAgentId();
     const mailbox = yield* Latch.make(false);
     const completion = yield* Deferred.make<AgentOutcome>();
+    const registeredAt = yield* Clock.currentTimeMillis;
     const registered: RegisteredAgent = {
       id,
       name: input.name,
       parentId: undefined,
-      profile: copyProfile(input.profile),
+      profile: input.profile,
     };
-    const entry = makeEntry(registered, input.goal, now(), mailbox, completion);
+    const entry = makeEntry(registered, input.goal, registeredAt, mailbox, completion);
 
     return yield* transact((state): Transition<RegisteredAgent, RootStartError> => {
       if (!state.accepting || state.rootId !== undefined) {
         return noChange(
           state,
-          failure(
+          Result.fail(
             new RootStartError({
               message: "This registry has already admitted or closed its root",
             }),
@@ -399,10 +366,9 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           agents,
           rootId: id,
           nonterminalCount: 1,
-          pendingInstallationCount: 1,
         },
-        actions: [{ _tag: "Open", latch: mailbox }],
-        result: success(registered),
+        actions: [PostCommitAction.Open({ latch: mailbox })],
+        result: Result.succeed(registered),
       };
     });
   });
@@ -410,14 +376,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
   const registerBatch = Effect.fn("Brood.Registry.registerBatch")(function* (
     input: RegisterBatchInput,
   ) {
-    const registeredAt = now();
+    const registeredAt = yield* Clock.currentTimeMillis;
     const prepared = yield* Effect.forEach(input.children, (child) =>
       Effect.gen(function* () {
         const registered: RegisteredAgent = {
           id: nextAgentId(),
           name: child.name,
           parentId: input.parentId,
-          profile: copyProfile(child.profile),
+          profile: child.profile,
         };
         const mailbox = yield* Latch.make(false);
         const completion = yield* Deferred.make<AgentOutcome>();
@@ -430,314 +396,300 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
     return yield* transact(
       (state): Transition<BatchRegistration, DelegateRejected | UnknownAgent> => {
-        const parent = state.agents.get(input.parentId);
-        if (parent === undefined) {
-          return noChange(state, failure(new UnknownAgent({ agentId: input.parentId })));
-        }
-        if (!state.accepting) {
-          return noChange(
-            state,
-            failure(
-              new DelegateRejected({
-                reason: "NotAccepting",
-                message: "The registry is shutting down",
-              }),
-            ),
-          );
-        }
-        if (isTerminal(parent.status)) {
-          return noChange(
-            state,
-            failure(
-              new DelegateRejected({
-                reason: "InvalidInput",
-                message: "A terminal agent cannot delegate",
-              }),
-            ),
-          );
-        }
+        return withAgent<BatchRegistration, DelegateRejected>(state, input.parentId, (parent) => {
+          if (!state.accepting) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "NotAccepting",
+                  message: "The registry is shutting down",
+                }),
+              ),
+            );
+          }
+          if (parent.outcome !== undefined) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "InvalidInput",
+                  message: "A terminal agent cannot delegate",
+                }),
+              ),
+            );
+          }
+          if (parent.seenInvocations.has(input.invocationId)) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "DuplicateInvocationId",
+                  message: `Control invocation ${input.invocationId} was already committed`,
+                }),
+              ),
+            );
+          }
+          if (input.children.length === 0) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "InvalidInput",
+                  message: "Delegation requires at least one child",
+                }),
+              ),
+            );
+          }
+          if (state.agents.size + input.children.length > maxAgents) {
+            return noChange(
+              state,
+              Result.fail(
+                new DelegateRejected({
+                  reason: "AgentLimitExceeded",
+                  message: `Agent limit ${maxAgents} would be exceeded by ${input.children.length} requested children`,
+                }),
+              ),
+            );
+          }
+
+          if (prepared.length !== input.children.length) {
+            throw new RegistryInvariantDefect("Prepared child batch changed length");
+          }
+          const names = new Set<AgentName>();
+          const ids = new Set<AgentId>();
+          for (let index = 0; index < input.children.length; index += 1) {
+            const child = input.children[index];
+            const preparedChild = prepared[index];
+            if (child === undefined || preparedChild === undefined) {
+              throw new RegistryInvariantDefect("Prepared child batch lost an indexed entry");
+            }
+            if (names.has(child.name) || parent.childrenByName.has(child.name)) {
+              return noChange(
+                state,
+                Result.fail(
+                  new DelegateRejected({
+                    reason: "NameCollision",
+                    message: `Direct-child name ${child.name} has already been used`,
+                  }),
+                ),
+              );
+            }
+            names.add(child.name);
+            if (
+              ids.has(preparedChild.registered.id) ||
+              state.agents.has(preparedChild.registered.id)
+            ) {
+              throw new RegistryInvariantDefect(
+                `Agent ID generator reused ${preparedChild.registered.id}`,
+              );
+            }
+            ids.add(preparedChild.registered.id);
+          }
+
+          const agents = new Map(state.agents);
+          const childrenByName = new Map(parent.childrenByName);
+          for (const child of prepared) {
+            agents.set(child.registered.id, child.entry);
+            childrenByName.set(child.registered.name, child.registered.id);
+          }
+          const seenInvocations = new Set(parent.seenInvocations);
+          seenInvocations.add(input.invocationId);
+          const plannedTargets =
+            input.wait === "all"
+              ? withTargets(
+                  parent.plannedTargets,
+                  prepared.map(({ registered }) => registered.id),
+                )
+              : parent.plannedTargets;
+          agents.set(parent.id, {
+            ...parent,
+            childrenByName,
+            seenInvocations,
+            plannedTargets,
+            updatedAt: registeredAt,
+          });
+
+          return {
+            next: {
+              ...state,
+              agents,
+              nonterminalCount: state.nonterminalCount + prepared.length,
+            },
+            actions: prepared.map(({ entry }) => PostCommitAction.Open({ latch: entry.mailbox })),
+            result: Result.succeed({
+              children: prepared.map(({ registered }) => registered),
+            }),
+          };
+        });
+      },
+    );
+  });
+
+  const planWait = Effect.fn("Brood.Registry.planWait")(function* (input: PlanWaitInput) {
+    const plannedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<WaitPlanResult, WaitRejected | UnknownAgent> =>
+      withAgent<WaitPlanResult, WaitRejected>(state, input.parentId, (parent) => {
         if (parent.seenInvocations.has(input.invocationId)) {
           return noChange(
             state,
-            failure(
-              new DelegateRejected({
+            Result.fail(
+              new WaitRejected({
                 reason: "DuplicateInvocationId",
                 message: `Control invocation ${input.invocationId} was already committed`,
               }),
             ),
           );
         }
-        if (input.children.length === 0) {
+        if (input.childNames.length === 0) {
           return noChange(
             state,
-            failure(
-              new DelegateRejected({
-                reason: "InvalidInput",
-                message: "Delegation requires at least one child",
+            Result.fail(
+              new WaitRejected({
+                reason: "EmptySelection",
+                message: "A wait requires at least one child",
               }),
             ),
           );
         }
-        if (state.agents.size + input.children.length > maxAgents) {
+        if (parent.outcome !== undefined) {
           return noChange(
             state,
-            failure(
-              new DelegateRejected({
-                reason: "AgentLimitExceeded",
-                message: `Agent limit ${maxAgents} would be exceeded by ${input.children.length} requested children`,
-              }),
+            Result.fail(
+              new WaitRejected({ reason: "UnknownChild", message: "A terminal agent cannot wait" }),
             ),
           );
         }
 
-        const names = new Set<AgentName>();
-        const ids = new Set<AgentId>();
-        for (const child of input.children) {
-          if (names.has(child.name) || parent.childrenByName.has(child.name)) {
+        const targetIds: Array<AgentId> = [];
+        const selected = new Set<AgentId>();
+        for (const name of input.childNames) {
+          const childId = parent.childrenByName.get(name);
+          if (childId === undefined) {
             return noChange(
               state,
-              failure(
-                new DelegateRejected({
-                  reason: "NameCollision",
-                  message: `Direct-child name ${child.name} has already been used`,
+              Result.fail(
+                new WaitRejected({
+                  reason: "UnknownChild",
+                  message: `${name} is not a direct child of ${parent.name}`,
                 }),
               ),
             );
           }
-          names.add(child.name);
-        }
-        for (const child of prepared) {
-          if (ids.has(child.registered.id) || state.agents.has(child.registered.id)) {
-            throw new RegistryInvariantDefect(`Agent ID generator reused ${child.registered.id}`);
+          if (!selected.has(childId)) {
+            selected.add(childId);
+            targetIds.push(childId);
           }
-          ids.add(child.registered.id);
         }
 
-        const agents = new Map(state.agents);
-        const childrenByName = new Map(parent.childrenByName);
-        for (const child of prepared) {
-          agents.set(child.registered.id, child.entry);
-          childrenByName.set(child.registered.name, child.registered.id);
-        }
         const seenInvocations = new Set(parent.seenInvocations);
         seenInvocations.add(input.invocationId);
-        const plannedWaits = new Map(parent.plannedWaits);
-        if (input.wait === "all") {
-          const targetIds = Object.freeze(prepared.map(({ registered }) => registered.id));
-          plannedWaits.set(input.invocationId, {
-            invocationId: input.invocationId,
-            targetIds,
-          });
-        }
-        agents.set(parent.id, {
+        const canonicalTargetIds = [...targetIds];
+        const allTerminal = canonicalTargetIds.every((targetId) => {
+          const target = state.agents.get(targetId);
+          return target !== undefined && target.outcome !== undefined;
+        });
+        const next = replaceAgent(state, {
           ...parent,
-          childrenByName,
           seenInvocations,
-          plannedWaits,
-          updatedAt: registeredAt,
+          plannedTargets: allTerminal
+            ? parent.plannedTargets
+            : withTargets(parent.plannedTargets, canonicalTargetIds),
+          updatedAt: plannedAt,
         });
 
         return {
-          next: {
-            ...state,
-            agents,
-            nonterminalCount: state.nonterminalCount + prepared.length,
-            pendingInstallationCount: state.pendingInstallationCount + prepared.length,
-          },
-          actions: prepared.map(({ entry }) => ({ _tag: "Open", latch: entry.mailbox })),
-          result: success({
-            children: prepared.map(({ registered }) => registered),
-            waitPlanned: input.wait === "all",
-          }),
+          next,
+          actions: [],
+          result: Result.succeed(
+            allTerminal
+              ? {
+                  _tag: "Ready",
+                  outcomes: outcomesFor(state, canonicalTargetIds),
+                }
+              : { _tag: "Planned", targetIds: canonicalTargetIds },
+          ),
         };
-      },
+      }),
     );
   });
 
-  const planWait = Effect.fn("Brood.Registry.planWait")((input: PlanWaitInput) => {
-    const plannedAt = now();
-    return transact((state): Transition<WaitPlanResult, WaitRejected | UnknownAgent> => {
-      const parent = state.agents.get(input.parentId);
-      if (parent === undefined) {
-        return noChange(state, failure(new UnknownAgent({ agentId: input.parentId })));
-      }
-      if (parent.seenInvocations.has(input.invocationId)) {
-        return noChange(
-          state,
-          failure(
-            new WaitRejected({
-              reason: "DuplicateInvocationId",
-              message: `Control invocation ${input.invocationId} was already committed`,
-            }),
-          ),
-        );
-      }
-      if (input.childNames.length === 0) {
-        return noChange(
-          state,
-          failure(
-            new WaitRejected({
-              reason: "EmptySelection",
-              message: "A wait requires at least one child",
-            }),
-          ),
-        );
-      }
-      if (isTerminal(parent.status)) {
-        return noChange(
-          state,
-          failure(
-            new WaitRejected({ reason: "UnknownChild", message: "A terminal agent cannot wait" }),
-          ),
-        );
-      }
-
-      const targetIds: Array<AgentId> = [];
-      const selected = new Set<AgentId>();
-      for (const name of input.childNames) {
-        const childId = parent.childrenByName.get(name);
-        if (childId === undefined) {
-          return noChange(
-            state,
-            failure(
-              new WaitRejected({
-                reason: "UnknownChild",
-                message: `${name} is not a direct child of ${parent.name}`,
-              }),
-            ),
+  const activateWaits = Effect.fn("Brood.Registry.activateWaits")(function* (id: AgentId) {
+    const waitId = nextWaitId();
+    const activatedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<WaitActivation, UnknownAgent> =>
+      withAgent<WaitActivation, never>(state, id, (parent) => {
+        if (parent.status !== "Running") {
+          throw new RegistryInvariantDefect(
+            `Cannot activate waits for ${id} while ${parent.status}`,
           );
         }
-        if (!selected.has(childId)) {
-          selected.add(childId);
-          targetIds.push(childId);
+        if (parent.plannedTargets.length === 0) {
+          throw new RegistryInvariantDefect(`Suspended agent ${id} has no planned waits`);
         }
-      }
-
-      const seenInvocations = new Set(parent.seenInvocations);
-      seenInvocations.add(input.invocationId);
-      const canonicalTargetIds = Object.freeze([...targetIds]);
-      const allTerminal = canonicalTargetIds.every((targetId) => {
-        const target = state.agents.get(targetId);
-        return target !== undefined && target.outcome !== undefined;
-      });
-      const plannedWaits = new Map(parent.plannedWaits);
-      if (!allTerminal) {
-        plannedWaits.set(input.invocationId, {
-          invocationId: input.invocationId,
-          targetIds: canonicalTargetIds,
-        });
-      }
-      const next = replaceAgent(state, {
-        ...parent,
-        seenInvocations,
-        plannedWaits,
-        updatedAt: plannedAt,
-      });
-
-      return {
-        next,
-        actions: [],
-        result: success(
-          allTerminal
-            ? {
-                _tag: "Ready",
-                targetIds: canonicalTargetIds,
-                outcomes: outcomesFor(state, canonicalTargetIds),
-              }
-            : { _tag: "Planned", targetIds: canonicalTargetIds },
-        ),
-      };
-    });
-  });
-
-  const activateWaits = Effect.fn("Brood.Registry.activateWaits")((id: AgentId) => {
-    const waitId = nextWaitId();
-    const activatedAt = now();
-    return transact((state): Transition<WaitActivation, UnknownAgent> => {
-      const parent = state.agents.get(id);
-      if (parent === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-      if (parent.status !== "Running") {
-        throw new RegistryInvariantDefect(`Cannot activate waits for ${id} while ${parent.status}`);
-      }
-      if (parent.plannedWaits.size === 0) {
-        throw new RegistryInvariantDefect(`Suspended agent ${id} has no planned waits`);
-      }
-      if (parent.pendingCommand !== undefined || parent.activeWait !== undefined) {
-        throw new RegistryInvariantDefect(`Agent ${id} already has active mailbox or wait state`);
-      }
-
-      const targetIds: Array<AgentId> = [];
-      const selected = new Set<AgentId>();
-      for (const plan of parent.plannedWaits.values()) {
-        for (const targetId of plan.targetIds) {
-          if (!selected.has(targetId)) {
-            selected.add(targetId);
-            targetIds.push(targetId);
-          }
+        if (parent.pendingCommand !== undefined || parent.activeWait !== undefined) {
+          throw new RegistryInvariantDefect(`Agent ${id} already has active mailbox or wait state`);
         }
-      }
-      if (targetIds.length === 0) {
-        throw new RegistryInvariantDefect(`Suspended agent ${id} planned an empty wait`);
-      }
-      const canonicalTargetIds = Object.freeze([...targetIds]);
 
-      const allTerminal = canonicalTargetIds.every(
-        (targetId) => state.agents.get(targetId)?.outcome !== undefined,
-      );
-      if (allTerminal) {
-        const command: AgentCommand = {
-          _tag: "Resume",
-          waitId,
-          outcomes: outcomesFor(state, canonicalTargetIds),
-        };
+        const canonicalTargetIds = [...parent.plannedTargets];
+
+        const allTerminal = canonicalTargetIds.every(
+          (targetId) => state.agents.get(targetId)?.outcome !== undefined,
+        );
+        if (allTerminal) {
+          const command: AgentCommand = {
+            _tag: "Resume",
+            waitId,
+            outcomes: outcomesFor(state, canonicalTargetIds),
+          };
+          const next = replaceAgent(state, {
+            ...parent,
+            status: "Queued",
+            pendingCommand: command,
+            plannedTargets: [],
+            activeWait: undefined,
+            updatedAt: activatedAt,
+          });
+          return {
+            next,
+            actions: [PostCommitAction.Open({ latch: parent.mailbox })],
+            result: Result.succeed({ _tag: "Resumed", waitId, targetIds: canonicalTargetIds }),
+          };
+        }
+
+        const activeWait: ActiveWait = { waitId, targetIds: canonicalTargetIds };
         const next = replaceAgent(state, {
           ...parent,
-          status: "Queued",
-          pendingCommand: command,
-          plannedWaits: new Map(),
-          activeWait: undefined,
+          status: "Waiting",
+          plannedTargets: [],
+          activeWait,
           updatedAt: activatedAt,
         });
         return {
           next,
-          actions: [{ _tag: "Open", latch: parent.mailbox }],
-          result: success({ _tag: "Resumed", waitId, targetIds: canonicalTargetIds }),
+          actions: [],
+          result: Result.succeed({ _tag: "Waiting", waitId, targetIds: canonicalTargetIds }),
         };
-      }
-
-      const activeWait: ActiveWait = { waitId, targetIds: canonicalTargetIds };
-      const next = replaceAgent(state, {
-        ...parent,
-        status: "Waiting",
-        plannedWaits: new Map(),
-        activeWait,
-        updatedAt: activatedAt,
-      });
-      return {
-        next,
-        actions: [],
-        result: success({ _tag: "Waiting", waitId, targetIds: canonicalTargetIds }),
-      };
-    });
+      }),
+    );
   });
 
-  const markInstalled = Effect.fn("Brood.Registry.markInstalled")((id: AgentId) => {
-    const installedAt = now();
-    return transact((state): Transition<boolean, UnknownAgent> => {
-      const entry = state.agents.get(id);
-      if (entry === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-      if (entry.installation === "Installed") return noChange(state, success(false));
-      const next = replaceAgent(state, {
-        ...entry,
-        installation: "Installed",
-        updatedAt: installedAt,
-      });
-      return {
-        next: { ...next, pendingInstallationCount: state.pendingInstallationCount - 1 },
-        actions: [],
-        result: success(true),
-      };
-    });
+  const markInstalled = Effect.fn("Brood.Registry.markInstalled")(function* (id: AgentId) {
+    const installedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<void, UnknownAgent> =>
+      withAgent<void, never>(state, id, (entry) => {
+        if (entry.installation === "Installed") return noChange(state, Result.succeed(undefined));
+        return {
+          next: replaceAgent(state, {
+            ...entry,
+            installation: "Installed",
+            updatedAt: installedAt,
+          }),
+          actions: [],
+          result: Result.succeed(undefined),
+        };
+      }),
+    );
   });
 
   const transitionStatus = (
@@ -747,92 +699,88 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     updatedAt: number,
   ): Effect.Effect<void, UnknownAgent> =>
     transact((state): Transition<void, UnknownAgent> => {
-      const entry = state.agents.get(id);
-      if (entry === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-      if (!allowed.has(entry.status)) {
-        throw new RegistryInvariantDefect(
-          `Invalid status transition ${entry.status} -> ${status} for ${id}`,
-        );
-      }
-      return {
-        next: replaceAgent(state, { ...entry, status, updatedAt }),
-        actions: [],
-        result: success(undefined),
-      };
+      return withAgent<void, never>(state, id, (entry) => {
+        if (!allowed.has(entry.status)) {
+          throw new RegistryInvariantDefect(
+            `Invalid status transition ${entry.status} -> ${status} for ${id}`,
+          );
+        }
+        return {
+          next: replaceAgent(state, { ...entry, status, updatedAt }),
+          actions: [],
+          result: Result.succeed(undefined),
+        };
+      });
     });
 
-  const markStarting = Effect.fn("Brood.Registry.markStarting")((id: AgentId) =>
-    transitionStatus(id, new Set(["Queued"]), "Starting", now()),
-  );
-  const markRunning = Effect.fn("Brood.Registry.markRunning")((id: AgentId) =>
-    transitionStatus(id, new Set(["Queued", "Starting"]), "Running", now()),
-  );
-
-  const signalMailbox = Effect.fn("Brood.Registry.signalMailbox")(function* (id: AgentId) {
-    const state = yield* Ref.get(stateRef);
-    const entry = state.agents.get(id);
-    if (entry === undefined) return yield* Effect.fail(new UnknownAgent({ agentId: id }));
-    yield* Latch.open(entry.mailbox);
+  const QUEUED = new Set<AgentStatus>(["Queued"]);
+  const QUEUED_OR_STARTING = new Set<AgentStatus>(["Queued", "Starting"]);
+  const markStarting = Effect.fn("Brood.Registry.markStarting")(function* (id: AgentId) {
+    const updatedAt = yield* Clock.currentTimeMillis;
+    return yield* transitionStatus(id, QUEUED, "Starting", updatedAt);
+  });
+  const markRunning = Effect.fn("Brood.Registry.markRunning")(function* (id: AgentId) {
+    const updatedAt = yield* Clock.currentTimeMillis;
+    return yield* transitionStatus(id, QUEUED_OR_STARTING, "Running", updatedAt);
   });
 
-  type TakeDecision =
-    | { readonly _tag: "Command"; readonly command: AgentCommand }
-    | { readonly _tag: "Interrupted"; readonly reason: InterruptReason }
-    | { readonly _tag: "Empty"; readonly mailbox: LatchType };
+  type TakeDecision = Data.TaggedEnum<{
+    Command: { readonly command: AgentCommand };
+    Interrupted: { readonly reason: InterruptReason };
+    Empty: Record<never, never>;
+  }>;
+  const TakeDecision = Data.taggedEnum<TakeDecision>();
 
-  const takeLoop = (id: AgentId): Effect.Effect<AgentCommand, UnknownAgent | CommandInterrupted> =>
-    Effect.gen(function* () {
+  const takePendingCommand = Effect.fn("Brood.Registry.takePendingCommand")(function* (
+    id: AgentId,
+  ) {
+    while (true) {
       const before = yield* Ref.get(stateRef);
       const current = before.agents.get(id);
       if (current === undefined) return yield* Effect.fail(new UnknownAgent({ agentId: id }));
       yield* Latch.close(current.mailbox);
-      const takenAt = now();
+      const takenAt = yield* Clock.currentTimeMillis;
 
       const decision = yield* transact((state): Transition<TakeDecision, UnknownAgent> => {
-        const entry = state.agents.get(id);
-        if (entry === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-        if (entry.interruptRequested !== undefined) {
-          return noChange(
-            state,
-            success({ _tag: "Interrupted", reason: entry.interruptRequested }),
-          );
-        }
-        if (entry.pendingCommand !== undefined) {
-          const command = entry.pendingCommand;
-          return {
-            next: replaceAgent(state, {
-              ...entry,
-              pendingCommand: undefined,
-              updatedAt: takenAt,
-            }),
-            actions: [],
-            result: success({ _tag: "Command", command }),
-          };
-        }
-        if (isTerminal(entry.status)) {
-          throw new RegistryInvariantDefect(`Terminal agent ${id} cannot take another command`);
-        }
-        return noChange(state, success({ _tag: "Empty", mailbox: entry.mailbox }));
+        return withAgent<TakeDecision, never>(state, id, (entry) => {
+          if (entry.interruptRequested !== undefined) {
+            return noChange(
+              state,
+              Result.succeed(TakeDecision.Interrupted({ reason: entry.interruptRequested })),
+            );
+          }
+          if (entry.pendingCommand !== undefined) {
+            const command = entry.pendingCommand;
+            return {
+              next: replaceAgent(state, {
+                ...entry,
+                pendingCommand: undefined,
+                updatedAt: takenAt,
+              }),
+              actions: [],
+              result: Result.succeed(TakeDecision.Command({ command })),
+            };
+          }
+          if (entry.outcome !== undefined) {
+            throw new RegistryInvariantDefect(`Terminal agent ${id} cannot take another command`);
+          }
+          return noChange(state, Result.succeed(TakeDecision.Empty()));
+        });
       });
 
-      switch (decision._tag) {
-        case "Command":
-          return decision.command;
-        case "Interrupted": {
-          const interrupted: CommandInterrupted = {
+      const command = yield* TakeDecision.$match(decision, {
+        Command: ({ command: pending }) => Effect.succeed(Option.some(pending)),
+        Interrupted: ({ reason }) =>
+          Effect.fail({
             _tag: "CommandInterrupted",
             agentId: id,
-            reason: decision.reason,
-          };
-          return yield* Effect.fail(interrupted);
-        }
-        case "Empty":
-          yield* Latch.await(decision.mailbox);
-          return yield* Effect.suspend(() => takeLoop(id));
-      }
-    });
-
-  const takePendingCommand = Effect.fn("Brood.Registry.takePendingCommand")(takeLoop);
+            reason,
+          } satisfies CommandInterrupted),
+        Empty: () => Latch.await(current.mailbox).pipe(Effect.as(Option.none<AgentCommand>())),
+      });
+      if (Option.isSome(command)) return command.value;
+    }
+  });
 
   const settleTransition = (
     state: RegistryState,
@@ -840,82 +788,77 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     requestedOutcome: AgentOutcome,
     settledAt: number,
     onlyIfPendingInstallation: boolean,
-  ): Transition<boolean, UnknownAgent> => {
-    const entry = state.agents.get(id);
-    if (entry === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-    if (isTerminal(entry.status)) return noChange(state, success(false));
-    if (onlyIfPendingInstallation && entry.installation !== "Pending") {
-      return noChange(state, success(false));
-    }
-
-    const outcome: AgentOutcome =
-      entry.interruptRequested === undefined
-        ? requestedOutcome
-        : { _tag: "Interrupted", reason: entry.interruptRequested };
-    const settled: AgentEntry = {
-      ...entry,
-      status: terminalStatus(outcome),
-      installation: "Installed",
-      pendingCommand: undefined,
-      plannedWaits: new Map(),
-      activeWait: undefined,
-      outcome,
-      updatedAt: settledAt,
-      terminalAt: settledAt,
-    };
-    let next = replaceAgent(state, settled);
-    const actions: Array<PostCommitAction> = [
-      { _tag: "Complete", deferred: entry.completion, outcome },
-      { _tag: "Open", latch: entry.mailbox },
-    ];
-    const parent = entry.parentId === undefined ? undefined : next.agents.get(entry.parentId);
-    if (
-      parent?.activeWait !== undefined &&
-      parent.activeWait.targetIds.includes(id) &&
-      parent.activeWait.targetIds.every(
-        (targetId) => next.agents.get(targetId)?.outcome !== undefined,
-      )
-    ) {
-      if (parent.pendingCommand !== undefined) {
-        throw new RegistryInvariantDefect(`Satisfied wait for ${parent.id} found a full mailbox`);
+  ): Transition<Option.Option<AgentOutcome>, UnknownAgent> =>
+    withAgent<Option.Option<AgentOutcome>, never>(state, id, (entry) => {
+      if (entry.outcome !== undefined) return noChange(state, Result.succeed(Option.none()));
+      if (onlyIfPendingInstallation && entry.installation !== "Pending") {
+        return noChange(state, Result.succeed(Option.none()));
       }
-      if (parent.interruptRequested === undefined) {
-        const command: AgentCommand = {
-          _tag: "Resume",
-          waitId: parent.activeWait.waitId,
-          outcomes: outcomesFor(next, parent.activeWait.targetIds),
-        };
-        next = replaceAgent(next, {
-          ...parent,
-          status: "Queued",
-          pendingCommand: command,
-          activeWait: undefined,
-          updatedAt: settledAt,
-        });
-        actions.push({ _tag: "Open", latch: parent.mailbox });
-      }
-    }
-    const nonterminalCount = state.nonterminalCount - 1;
-    const reachedQuiescence = nonterminalCount === 0 && state.rootId !== undefined;
-    if (reachedQuiescence) actions.push({ _tag: "Open", latch: quiescence });
-    return {
-      next: {
-        ...next,
-        accepting: reachedQuiescence ? false : next.accepting,
-        nonterminalCount,
-        pendingInstallationCount:
-          entry.installation === "Pending"
-            ? state.pendingInstallationCount - 1
-            : state.pendingInstallationCount,
-      },
-      actions,
-      result: success(true),
-    };
-  };
 
-  const settle = Effect.fn("Brood.Registry.settle")((id: AgentId, outcome: AgentOutcome) => {
-    const settledAt = now();
-    return transact((state) => settleTransition(state, id, outcome, settledAt, false));
+      const outcome: AgentOutcome =
+        entry.interruptRequested === undefined
+          ? requestedOutcome
+          : { _tag: "Interrupted", reason: entry.interruptRequested };
+      const settled: AgentEntry = {
+        ...entry,
+        status: outcome._tag,
+        installation: "Installed",
+        pendingCommand: undefined,
+        plannedTargets: [],
+        activeWait: undefined,
+        outcome,
+        updatedAt: settledAt,
+        terminalAt: settledAt,
+      };
+      let next = replaceAgent(state, settled);
+      const actions: Array<PostCommitAction> = [
+        PostCommitAction.Complete({ deferred: entry.completion, outcome }),
+        PostCommitAction.Open({ latch: entry.mailbox }),
+      ];
+      const parent = entry.parentId === undefined ? undefined : next.agents.get(entry.parentId);
+      if (
+        parent?.activeWait !== undefined &&
+        parent.activeWait.targetIds.includes(id) &&
+        parent.activeWait.targetIds.every(
+          (targetId) => next.agents.get(targetId)?.outcome !== undefined,
+        )
+      ) {
+        if (parent.pendingCommand !== undefined) {
+          throw new RegistryInvariantDefect(`Satisfied wait for ${parent.id} found a full mailbox`);
+        }
+        if (parent.interruptRequested === undefined) {
+          const command: AgentCommand = {
+            _tag: "Resume",
+            waitId: parent.activeWait.waitId,
+            outcomes: outcomesFor(next, parent.activeWait.targetIds),
+          };
+          next = replaceAgent(next, {
+            ...parent,
+            status: "Queued",
+            pendingCommand: command,
+            activeWait: undefined,
+            updatedAt: settledAt,
+          });
+          actions.push(PostCommitAction.Open({ latch: parent.mailbox }));
+        }
+      }
+      const nonterminalCount = state.nonterminalCount - 1;
+      const reachedQuiescence = nonterminalCount === 0;
+      if (reachedQuiescence) actions.push(PostCommitAction.Open({ latch: quiescence }));
+      return {
+        next: {
+          ...next,
+          accepting: reachedQuiescence ? false : next.accepting,
+          nonterminalCount,
+        },
+        actions,
+        result: Result.succeed(Option.some(outcome)),
+      };
+    });
+
+  const settle = Effect.fn("Brood.Registry.settle")(function* (id: AgentId, outcome: AgentOutcome) {
+    const settledAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state) => settleTransition(state, id, outcome, settledAt, false));
   });
 
   const awaitOutcome = Effect.fn("Brood.Registry.awaitOutcome")(function* (id: AgentId) {
@@ -925,50 +868,54 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     return yield* Deferred.await(entry.completion);
   });
 
-  const requestInterrupt = Effect.fn("Brood.Registry.requestInterrupt")((
+  const requestInterrupt = Effect.fn("Brood.Registry.requestInterrupt")(function* (
     id: AgentId,
     reason: InterruptReason,
-  ) => {
-    const requestedAt = now();
-    return transact((state): Transition<boolean, UnknownAgent> => {
-      const entry = state.agents.get(id);
-      if (entry === undefined) return noChange(state, failure(new UnknownAgent({ agentId: id })));
-      if (isTerminal(entry.status) || entry.interruptRequested !== undefined) {
-        return noChange(state, success(false));
-      }
-      return {
-        next: replaceAgent(state, {
-          ...entry,
-          interruptRequested: reason,
-          updatedAt: requestedAt,
-        }),
-        actions: [{ _tag: "Open", latch: entry.mailbox }],
-        result: success(true),
-      };
-    });
+  ) {
+    const requestedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<boolean, UnknownAgent> =>
+      withAgent<boolean, never>(state, id, (entry) => {
+        if (entry.outcome !== undefined || entry.interruptRequested !== undefined) {
+          return noChange(state, Result.succeed(false));
+        }
+        return {
+          next: replaceAgent(state, {
+            ...entry,
+            interruptRequested: reason,
+            updatedAt: requestedAt,
+          }),
+          actions: [PostCommitAction.Open({ latch: entry.mailbox })],
+          result: Result.succeed(true),
+        };
+      }),
+    );
   });
 
-  const beginShutdown = Effect.fn("Brood.Registry.beginShutdown")((reason: InterruptReason) => {
-    const updatedAt = now();
-    return transact((state): Transition<ShutdownResult, never> => {
+  const beginShutdown = Effect.fn("Brood.Registry.beginShutdown")(function* (
+    reason: InterruptReason,
+  ) {
+    const updatedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<ShutdownResult, never> => {
       const agents = new Map(state.agents);
       const activeIds: Array<AgentId> = [];
       const newlyRequested: Array<CommittedInterruptRequest> = [];
       const actions: Array<PostCommitAction> = [];
       for (const entry of state.agents.values()) {
-        if (isTerminal(entry.status)) continue;
+        if (entry.outcome !== undefined) continue;
         activeIds.push(entry.id);
         if (entry.interruptRequested === undefined) {
           agents.set(entry.id, { ...entry, interruptRequested: reason, updatedAt });
           newlyRequested.push({ agentId: entry.id, reason });
-          actions.push({ _tag: "Open", latch: entry.mailbox });
+          actions.push(PostCommitAction.Open({ latch: entry.mailbox }));
         }
       }
-      if (state.nonterminalCount === 0) actions.push({ _tag: "Open", latch: quiescence });
+      if (state.nonterminalCount === 0) {
+        actions.push(PostCommitAction.Open({ latch: quiescence }));
+      }
       return {
         next: { ...state, agents, accepting: false },
         actions,
-        result: success({ activeIds, newlyRequested }),
+        result: Result.succeed({ activeIds, newlyRequested }),
       };
     });
   });
@@ -982,35 +929,37 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         );
       }
       const pending = Array.from(state.agents.values())
-        .filter((entry) => entry.installation === "Pending" && !isTerminal(entry.status))
+        .filter((entry) => entry.installation === "Pending" && entry.outcome === undefined)
         .map((entry) => entry.id);
-      const results = yield* Effect.forEach(pending, (id) => {
-        const settledAt = now();
-        return transact((current) =>
-          settleTransition(current, id, { _tag: "Interrupted", reason }, settledAt, true),
-        ).pipe(
-          Effect.orDie,
-          Effect.map((settled) => ({ id, settled })),
-        );
-      });
-      return results.filter(({ settled }) => settled).map(({ id }) => id);
+      const results = yield* Effect.forEach(pending, (id) =>
+        Effect.gen(function* () {
+          const settledAt = yield* Clock.currentTimeMillis;
+          return yield* transact((current) =>
+            settleTransition(current, id, { _tag: "Interrupted", reason }, settledAt, true),
+          ).pipe(
+            Effect.orDie,
+            Effect.map((outcome) => ({ id, outcome })),
+          );
+        }),
+      );
+      return results.flatMap(({ id, outcome }) =>
+        Option.isSome(outcome) ? [{ agentId: id, outcome: outcome.value }] : [],
+      );
     },
   );
 
-  const awaitQuiescenceLoop = (): Effect.Effect<void> =>
-    Effect.gen(function* () {
+  const awaitQuiescence = Effect.fn("Brood.Registry.awaitQuiescence")(function* () {
+    while (true) {
       yield* Latch.close(quiescence);
       const state = yield* Ref.get(stateRef);
       if (state.nonterminalCount === 0 && (state.rootId !== undefined || !state.accepting)) return;
       yield* Latch.await(quiescence);
-      return yield* Effect.suspend(awaitQuiescenceLoop);
-    });
-
-  const awaitQuiescence = Effect.fn("Brood.Registry.awaitQuiescence")(awaitQuiescenceLoop)();
+    }
+  })();
 
   const snapshot = Ref.get(stateRef).pipe(
-    Effect.map((state): RegistrySnapshot => ({
-      agents: Array.from(state.agents.values(), (entry): AgentSnapshot => ({
+    Effect.map((state): RegistrySnapshot => {
+      const agents = Array.from(state.agents.values(), (entry): AgentSnapshot => ({
         id: entry.id,
         name: entry.name,
         parentId: entry.parentId,
@@ -1024,12 +973,16 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
         terminalAt: entry.terminalAt,
-      })),
-      rootId: state.rootId,
-      accepting: state.accepting,
-      nonterminalCount: state.nonterminalCount,
-      pendingInstallationCount: state.pendingInstallationCount,
-    })),
+      }));
+      return {
+        agents,
+        rootId: state.rootId,
+        accepting: state.accepting,
+        nonterminalCount: state.nonterminalCount,
+        pendingInstallationCount: agents.filter(({ installation }) => installation === "Pending")
+          .length,
+      };
+    }),
   );
 
   return {
@@ -1042,7 +995,6 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     markStarting,
     markRunning,
     takePendingCommand,
-    signalMailbox,
     awaitOutcome,
     requestInterrupt,
     beginShutdown,

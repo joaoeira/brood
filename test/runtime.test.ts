@@ -1,11 +1,20 @@
+// Plain Vitest is intentional: these tests exercise real filesystem and ModelRuntime boundaries.
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, mkdir, realpath, rm, stat, symlink } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Duration, Effect } from "effect";
 import { buildBroodRuntime, decodeBroodConfig, type BroodConfigEncoded } from "../src/runtime.js";
 
-const base = "/tmp/brood-runtime-test";
+let base: string;
+
+beforeEach(async () => {
+  base = await mkdtemp(join(tmpdir(), "brood-runtime-test-"));
+});
+
+afterEach(async () => {
+  await rm(base, { recursive: true, force: true });
+});
 
 const validConfig = (): BroodConfigEncoded => ({
   workspacePath: join(base, "workspace"),
@@ -44,11 +53,19 @@ describe("Brood runtime configuration", () => {
           sessionDirectory: join(base, "workspace", ".brood", "sessions"),
         }),
       ),
-    ).rejects.toMatchObject({ _tag: "BroodConfigError", reason: "InvalidField" });
+    ).rejects.toMatchObject({
+      _tag: "BroodConfigError",
+      reason: "DecodeFailed",
+      path: "stateDirectory",
+    });
 
     await expect(
       Effect.runPromise(decodeBroodConfig({ ...validConfig(), maxAgents: 1, maxConcurrency: 2 })),
-    ).rejects.toMatchObject({ _tag: "BroodConfigError", reason: "InvalidField" });
+    ).rejects.toMatchObject({
+      _tag: "BroodConfigError",
+      reason: "DecodeFailed",
+      path: "maxConcurrency",
+    });
   });
 
   it("constructs one offline ModelRuntime and resolves the frozen catalogue", async () => {

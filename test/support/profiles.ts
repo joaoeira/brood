@@ -1,5 +1,6 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExactModelLookup, ModelProfile, ProfilesConfigInput } from "../../src/agent.js";
+import type { SupervisorOptions } from "../../src/supervisor.js";
 
 export const scriptedModel: Model<"openai-responses"> = {
   id: "scripted-small",
@@ -33,4 +34,26 @@ export const testProfilesConfig = (
 export const testModelLookup = (): ExactModelLookup => ({
   getModel: (provider, model) =>
     provider === scriptedModel.provider && model === scriptedModel.id ? scriptedModel : undefined,
+});
+
+type SupervisorTuning = Pick<
+  SupervisorOptions,
+  | "maxConcurrency"
+  | "maxAgents"
+  | "maxAgentResultChars"
+  | "maxFailureMessageChars"
+  | "maxResumePromptChars"
+  | "drainTimeoutMillis"
+>;
+
+export const testSupervisorConfig = (
+  overrides: Partial<SupervisorTuning> = {},
+): SupervisorTuning => ({
+  maxConcurrency: 1,
+  maxAgents: 8,
+  maxAgentResultChars: 12_000,
+  maxFailureMessageChars: 2_000,
+  maxResumePromptChars: 48_000,
+  drainTimeoutMillis: 60_000,
+  ...overrides,
 });

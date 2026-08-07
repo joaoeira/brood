@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
-import { Effect, HashSet, Option, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { Type } from "typebox";
 import {
   AgentId,
@@ -54,80 +54,80 @@ export interface ControlToolPort {
 const invalidDelegate = (message: string): DelegateRejected =>
   new DelegateRejected({ reason: "InvalidInput", message });
 
-const decodeInvocationId = <E>(
+const decodeInvocationId = Effect.fn("Brood.Tools.decodeInvocationId")(function* <E>(
   value: string,
   onError: (message: string) => E,
-): Effect.Effect<ToolInvocationId, E> =>
-  Schema.decodeUnknownEffect(ToolInvocationId)(value).pipe(
+) {
+  return yield* Schema.decodeUnknownEffect(ToolInvocationId)(value).pipe(
     Effect.mapError((error) => onError(`Invalid tool invocation ID: ${String(error)}`)),
   );
+});
 
 const DelegateInput = Schema.Struct({
-  tasks: Schema.Array(DelegatedTask),
+  tasks: Schema.Array(DelegatedTask).check(Schema.isMinLength(1)),
   wait: Schema.optionalKey(Schema.Literals(["all", "none"])),
 });
 
 const WaitForAgentsInput = Schema.Struct({
-  children: Schema.Array(AgentName),
+  children: Schema.Array(AgentName).check(Schema.isMinLength(1)),
 });
 
-const normalizeDelegateInput = (
+const normalizeDelegateInput = Effect.fn("Brood.Tools.normalizeDelegateInput")(function* (
   input: unknown,
   catalogue: ProfileCatalogue,
-): Effect.Effect<
-  { readonly tasks: ReadonlyArray<DelegatedTask>; readonly wait: "all" | "none" },
-  DelegateRejected
-> =>
-  Schema.decodeUnknownEffect(DelegateInput)(input).pipe(
+) {
+  return yield* Schema.decodeUnknownEffect(DelegateInput)(input).pipe(
     Effect.mapError((error) => invalidDelegate(`Invalid task batch: ${String(error)}`)),
-    Effect.flatMap((decodedInput) => {
-      const tasks = decodedInput.tasks;
-      if (tasks.length === 0) {
-        return Effect.fail(invalidDelegate("delegate requires at least one task"));
-      }
-      let seen = HashSet.empty<AgentName>();
-      for (const task of tasks) {
-        if (HashSet.has(seen, task.name)) {
-          return Effect.fail(
-            invalidDelegate(`Duplicate task name after normalization: ${task.name}`),
-          );
+    Effect.flatMap(
+      (
+        decodedInput,
+      ): Effect.Effect<
+        { readonly tasks: ReadonlyArray<DelegatedTask>; readonly wait: "all" | "none" },
+        DelegateRejected
+      > => {
+        const tasks = decodedInput.tasks;
+        const seen = new Set<AgentName>();
+        for (const task of tasks) {
+          if (seen.has(task.name)) {
+            return Effect.fail(
+              invalidDelegate(`Duplicate task name after normalization: ${task.name}`),
+            );
+          }
+          seen.add(task.name);
+          if (task.profile !== undefined && Option.isNone(catalogue.get(task.profile))) {
+            return Effect.fail(
+              new DelegateRejected({
+                reason: "UnknownProfile",
+                message: `Unknown profile: ${task.profile}. Choose one of: ${catalogue.names.join(", ")}`,
+              }),
+            );
+          }
         }
-        seen = HashSet.add(seen, task.name);
-        if (task.profile !== undefined && Option.isNone(catalogue.get(task.profile))) {
-          return Effect.fail(
-            new DelegateRejected({
-              reason: "UnknownProfile",
-              message: `Unknown profile: ${task.profile}. Choose one of: ${catalogue.names.join(", ")}`,
-            }),
-          );
-        }
-      }
-      return Effect.succeed({ tasks, wait: decodedInput.wait ?? "all" });
-    }),
+        return Effect.succeed({ tasks, wait: decodedInput.wait ?? "all" });
+      },
+    ),
   );
+});
 
-const normalizeNames = (input: unknown): Effect.Effect<ReadonlyArray<AgentName>, WaitRejected> =>
-  Schema.decodeUnknownEffect(WaitForAgentsInput)(input).pipe(
+const normalizeNames = Effect.fn("Brood.Tools.normalizeNames")(function* (input: unknown) {
+  return yield* Schema.decodeUnknownEffect(WaitForAgentsInput)(input).pipe(
     Effect.mapError(
       (error) =>
         new WaitRejected({
-          reason: "InvalidInput",
+          reason:
+            typeof input === "object" &&
+            input !== null &&
+            "children" in input &&
+            Array.isArray(input.children) &&
+            input.children.length === 0
+              ? "EmptySelection"
+              : "InvalidInput",
           message: `Invalid agent selection: ${String(error)}`,
         }),
     ),
-    Effect.flatMap(({ children }) => {
-      const names = children;
-      if (names.length === 0) {
-        return Effect.fail(
-          new WaitRejected({
-            reason: "EmptySelection",
-            message: "wait_for_agents requires at least one direct-child name",
-          }),
-        );
-      }
-      return Effect.succeed(names);
-    }),
+    Effect.map(({ children }) => children),
   );
+});
 
 const renderDelegate = (details: DelegateToolDetails): string => {
   const correlations = details.agents.map(

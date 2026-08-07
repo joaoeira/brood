@@ -105,6 +105,26 @@ it("truncates escaped peer text without splitting XML entities", () => {
   expect(rendered).toContain("[truncated by Brood]");
 });
 
+it("renders a short resume body even when its allowance cannot fit the truncation sentinel", () => {
+  const childId = makeAgentId("agent_short");
+  const command = {
+    _tag: "Resume" as const,
+    waitId: makeWaitId("wait_short"),
+    outcomes: [
+      {
+        _tag: "Completed" as const,
+        agentId: childId,
+        name: makeAgentName("short"),
+        result: normalizeAgentResult(childId, "session", "ok", 1_000),
+      },
+    ],
+  };
+  const full = renderAgentCommand(command, 2_000);
+  const exact = renderAgentCommand(command, Array.from(full).length);
+
+  expect(exact).toBe(full);
+});
+
 it("redacts controller defects before they cross into peer-visible data", () => {
   const outcome = dependencyOutcomeFromAgent(
     makeAgentId("agent_failed"),

@@ -1,3 +1,4 @@
+// Plain Vitest is intentional: these tests execute the pinned Pi SDK's real control loop.
 import { join } from "node:path";
 import type { AgentContext, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { agentLoop } from "@earendil-works/pi-agent-core";

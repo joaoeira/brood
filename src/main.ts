@@ -1,11 +1,13 @@
-import { Duration, Effect, References, type Stream } from "effect";
+import { Duration, Effect, References, type PubSub, type Scope } from "effect";
 import {
   AgentFailed,
+  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   RootInterrupted,
   summarizeAgentFailure,
   type AgentId,
   type AgentOutcome,
   type BroodResult,
+  type BroodConfigError,
   type DrainReport,
   type RootStartError,
   type UnknownAgent,
@@ -22,7 +24,7 @@ import { makeSupervisor, type AgentSnapshot, type SupervisorEvent } from "./supe
 export interface BroodController {
   readonly snapshot: Effect.Effect<ReadonlyArray<AgentSnapshot>>;
   readonly interrupt: (id: AgentId, source?: "cli" | "api") => Effect.Effect<void, UnknownAgent>;
-  readonly events: Stream.Stream<SupervisorEvent>;
+  readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
 }
 
 export interface BroodApplication {
@@ -32,26 +34,25 @@ export interface BroodApplication {
   ) => Effect.Effect<BroodResult, AgentFailed | RootInterrupted | RootStartError>;
 }
 
-const interpretRoot = (
+export const interpretRootOutcome = Effect.fn("Brood.interpretRootOutcome")((
   outcome: AgentOutcome,
   drain: DrainReport,
-  maxFailureMessageChars = 2_000,
-): Effect.Effect<BroodResult, AgentFailed | RootInterrupted> =>
-  Effect.gen(function* () {
-    switch (outcome._tag) {
-      case "Completed":
-        return { root: outcome.result, drain } satisfies BroodResult;
-      case "Failed":
-        return yield* new AgentFailed({
+  maxFailureMessageChars = DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
+): Effect.Effect<BroodResult, AgentFailed | RootInterrupted> => {
+  switch (outcome._tag) {
+    case "Completed":
+      return Effect.succeed({ root: outcome.result, drain } satisfies BroodResult);
+    case "Failed":
+      return Effect.fail(
+        new AgentFailed({
           failure: summarizeAgentFailure(outcome.failure, maxFailureMessageChars),
           drain,
-        });
-      case "Interrupted":
-        return yield* new RootInterrupted({ reason: outcome.reason, drain });
-    }
-  });
-
-export const interpretRootOutcome = Effect.fn("Brood.interpretRootOutcome")(interpretRoot);
+        }),
+      );
+    case "Interrupted":
+      return Effect.fail(new RootInterrupted({ reason: outcome.reason, drain }));
+  }
+});
 
 const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: BroodRuntime) {
   const adapter = makePiAdapter({
@@ -84,12 +85,12 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
       : Effect.provideService(operation, References.MinimumLogLevel, runtime.config.logLevel);
   });
 
-  const controller: BroodController = Object.freeze({
+  const controller: BroodController = {
     snapshot: supervisor.snapshot,
     interrupt: (id: AgentId, source: "cli" | "api" = "api") => supervisor.interrupt(id, source),
     events: supervisor.events,
-  });
-  return Object.freeze({ controller, run }) satisfies BroodApplication;
+  };
+  return { controller, run } satisfies BroodApplication;
 });
 
 export const makeBroodApplication = (input: BroodConfigEncoded) =>
@@ -102,13 +103,7 @@ export const makeBroodApplicationFromUnknown = (input: unknown) =>
 export const runBrood = (
   goal: string,
   input: BroodConfigEncoded,
-): Effect.Effect<
-  BroodResult,
-  | import("./agent.js").BroodConfigError
-  | import("./agent.js").RootStartError
-  | AgentFailed
-  | RootInterrupted
-> =>
+): Effect.Effect<BroodResult, BroodConfigError | RootStartError | AgentFailed | RootInterrupted> =>
   Effect.scoped(
     makeBroodApplication(input).pipe(Effect.flatMap((application) => application.run(goal))),
   );

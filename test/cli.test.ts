@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { exitCodeForSignal, parseCliArguments, parseOperatorCommand } from "../src/cli.js";
+import { Effect } from "effect";
+import { makeAgentId, UnknownAgent } from "../src/agent.js";
+import {
+  decodeOperatorCommand,
+  exitCodeForSignal,
+  parseCliArguments,
+  parseOperatorCommand,
+} from "../src/cli.js";
 
 describe("CLI boundaries", () => {
   it("parses a config path, positional goal, and event flag", () => {
@@ -17,8 +24,17 @@ describe("CLI boundaries", () => {
     expect(() => parseCliArguments(["--config", "--events", "goal"])).toThrow(
       "Missing value for --config",
     );
-    expect(() => parseOperatorCommand("interrupt not-an-agent")).toThrow("Invalid agent ID");
     expect(() => parseOperatorCommand("events maybe")).toThrow("events on|off");
+  });
+
+  it("decodes operator-entered agent IDs at the Effect boundary", async () => {
+    await expect(
+      Effect.runPromise(decodeOperatorCommand("interrupt not-an-agent")),
+    ).rejects.toThrow("Invalid agent ID");
+    await expect(Effect.runPromise(decodeOperatorCommand("interrupt agent_123"))).resolves.toEqual({
+      _tag: "Interrupt",
+      agentId: "agent_123",
+    });
   });
 
   it("parses the complete v1 operator command surface", () => {
@@ -33,5 +49,10 @@ describe("CLI boundaries", () => {
   it("uses conventional process exit codes for operator signals", () => {
     expect(exitCodeForSignal("SIGINT")).toBe(130);
     expect(exitCodeForSignal("SIGTERM")).toBe(143);
+  });
+
+  it("gives an operator a useful error for an unknown interrupt target", () => {
+    const error = new UnknownAgent({ agentId: makeAgentId("agent_typo") });
+    expect(error.message).toBe("Unknown agent: agent_typo");
   });
 });
