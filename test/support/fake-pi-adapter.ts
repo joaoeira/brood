@@ -99,6 +99,12 @@ const outcomeForStep = (
  * Deterministic Pi double: every observed run consumes exactly one scripted step. A test that
  * observes a run must eventually call complete, suspend, failRun, or failProtocol for that agent.
  */
+/**
+ * Scripting contract: every `agent.run(...)` a scenario triggers blocks on the
+ * step queue until the test scripts exactly one of `complete`, `suspend`,
+ * `failRun`, or `failProtocol` for it. A forgotten step hangs that test —
+ * deterministically, never flakily.
+ */
 export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(function* (
   options: FakePiAdapterOptions = {},
 ) {

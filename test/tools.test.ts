@@ -1,21 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { Effect, Schema } from "effect";
 import {
+  DelegateToolDetails,
+  WaitToolDetails,
   makeAgentId,
   makeAgentName,
   makeBatchId,
   makeProfileName,
   makeToolInvocationId,
-  normalizeAgentResult,
 } from "../src/agent.js";
-import {
-  DelegateToolDetails,
-  WaitToolDetails,
-  makeAgentTools,
-  type ControlToolPort,
-} from "../src/tools.js";
+import { makeAgentTools, type ControlToolPort } from "../src/tools.js";
+import { compileProfileCatalogue } from "../src/profiles.js";
+import { normalizeAgentResult } from "../src/render.js";
 import { testModelLookup, testProfile, testProfilesConfig } from "./support/profiles.js";
-import { compileProfileCatalogue } from "../src/agent.js";
 
 const catalogue = () =>
   Effect.runSync(

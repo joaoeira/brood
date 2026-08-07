@@ -1,3 +1,9 @@
+/**
+ * The supervisor: owns the global run semaphore, the FiberMap of controller
+ * fibers, the private registry, and the monitoring surface. The controller
+ * loop lives here — take a command, run one Pi turn under one permit, accept
+ * the outcome — plus delegation admission, draining, and interruption.
+ */
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
   Array as EffectArray,
@@ -22,11 +28,8 @@ import {
   RootStartError,
   UnknownAgent,
   decodeGoal,
-  dependencyOutcomeFromAgent,
   makeAgentName,
   makeBatchId,
-  normalizeAgentResult,
-  renderAgentCommand,
   type AgentId,
   type AgentCommand,
   type AgentName,
@@ -35,16 +38,17 @@ import {
   type AgentStatus,
   type BatchId,
   type DelegatedTask,
+  type DelegateToolDetails,
   type DrainReport,
   type DependencyOutcome,
   type InterruptReason,
   type PiRunOutcome,
-  type ProfileCatalogue,
-  type PublicModelProfile,
-  type ResolvedModelProfile,
   type WaitId,
   type ToolInvocationId,
+  type WaitToolDetails,
 } from "./agent.js";
+import type { ProfileCatalogue, PublicModelProfile, ResolvedModelProfile } from "./profiles.js";
+import { dependencyOutcomeFromAgent, normalizeAgentResult, renderAgentCommand } from "./render.js";
 import {
   DEFAULT_EVENT_BUFFER_CAPACITY,
   type PiAdapter,
@@ -61,12 +65,7 @@ import {
   type RegisteredAgent,
   type ShutdownResult,
 } from "./registry.js";
-import {
-  compileAgentToolFactory,
-  type ControlToolPort,
-  type DelegateToolDetails,
-  type WaitToolDetails,
-} from "./tools.js";
+import { compileAgentToolFactory, type ControlToolPort } from "./tools.js";
 
 export interface SupervisorOptions {
   readonly catalogue: ProfileCatalogue;
@@ -171,6 +170,8 @@ type ControllerError =
   | UnknownAgent
   | CommandInterrupted;
 
+// ── Pure helpers ────────────────────────────────────────────────────────────
+
 const controllerOutcome = (exit: ExitType<AgentOutcome, ControllerError>): AgentOutcome => {
   if (Exit.isSuccess(exit)) return exit.value;
   if (Cause.hasInterruptsOnly(exit.cause)) {
@@ -211,6 +212,8 @@ const systemPromptFor = (profile: ResolvedModelProfile): string =>
 const terminalStatus = (
   outcome: AgentOutcome,
 ): Extract<AgentStatus, "Completed" | "Failed" | "Interrupted"> => outcome._tag;
+
+// ── Supervisor construction ─────────────────────────────────────────────────
 
 export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   options: SupervisorOptions,
@@ -278,6 +281,8 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         publishLifecycle({ type: "AgentInterruptRequested", agentId, reason }),
       { discard: true },
     );
+
+  // ── The controller: one fiber per agent, one permit per turn ─────────────
 
   const acceptRunOutcome = Effect.fn("Brood.Supervisor.acceptRunOutcome")(function* (
     id: AgentId,
@@ -399,6 +404,8 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         : Effect.succeed({ task, profile });
     });
   });
+
+  // ── Public surface: tools port, root admission, interrupt, drain ─────────
 
   const toolPort: ControlToolPort = {
     delegate: Effect.fn("Brood.Supervisor.delegate")(

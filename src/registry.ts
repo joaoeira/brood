@@ -1,14 +1,19 @@
+/**
+ * Serialized agent registry: one Ref of immutable state, mutated only through
+ * pure transitions that return idempotent post-commit actions (complete a
+ * deferred, open a latch). Every agent lifecycle fact — admission, waits, the
+ * single-slot command mailbox, terminal settlement, shutdown — commits here
+ * or nowhere. No transition may wait on Pi, the semaphore, or I/O.
+ */
 import { Clock, Data, Deferred, Effect, Latch, Option, Ref, Result } from "effect";
 import type { Deferred as DeferredType } from "effect/Deferred";
 import type { Latch as LatchType } from "effect/Latch";
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
   DelegateRejected,
-  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   RootStartError,
   UnknownAgent,
   WaitRejected,
-  dependencyOutcomeFromAgent,
   makeAgentId,
   makeWaitId,
   type AgentCommand,
@@ -18,10 +23,11 @@ import {
   type AgentStatus,
   type DependencyOutcome,
   type InterruptReason,
-  type PublicModelProfile,
   type ToolInvocationId,
   type WaitId,
 } from "./agent.js";
+import type { PublicModelProfile } from "./profiles.js";
+import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, dependencyOutcomeFromAgent } from "./render.js";
 
 export type InstallationStatus = "Pending" | "Installed";
 
@@ -332,6 +338,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       );
     });
 
+  // ── Admission ─────────────────────────────────────────────────────────────
+
   const registerRoot = Effect.fn("Brood.Registry.registerRoot")(function* (
     input: RegisterRootInput,
   ) {
@@ -526,6 +534,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     );
   });
 
+  // ── Waits: plan during a turn, activate after suspension ─────────────────
+
   const planWait = Effect.fn("Brood.Registry.planWait")(function* (input: PlanWaitInput) {
     const plannedAt = yield* Clock.currentTimeMillis;
     return yield* transact((state): Transition<WaitPlanResult, WaitRejected | UnknownAgent> =>
@@ -674,6 +684,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     );
   });
 
+  // ── Installation, status marks, and the command mailbox ──────────────────
+
   const markInstalled = Effect.fn("Brood.Registry.markInstalled")(function* (id: AgentId) {
     const installedAt = yield* Clock.currentTimeMillis;
     return yield* transact((state): Transition<void, UnknownAgent> =>
@@ -782,6 +794,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     }
   });
 
+  // ── Terminal settlement ──────────────────────────────────────────────────
+
   const settleTransition = (
     state: RegistryState,
     id: AgentId,
@@ -867,6 +881,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     if (entry === undefined) return yield* Effect.fail(new UnknownAgent({ agentId: id }));
     return yield* Deferred.await(entry.completion);
   });
+
+  // ── Interruption, shutdown, and drain ────────────────────────────────────
 
   const requestInterrupt = Effect.fn("Brood.Registry.requestInterrupt")(function* (
     id: AgentId,
@@ -956,6 +972,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       yield* Latch.await(quiescence);
     }
   })();
+
+  // ── Snapshot ─────────────────────────────────────────────────────────────
 
   const snapshot = Ref.get(stateRef).pipe(
     Effect.map((state): RegistrySnapshot => {

@@ -1,5 +1,5 @@
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExactModelLookup, ModelProfile, ProfilesConfigInput } from "../../src/agent.js";
+import type { ExactModelLookup, ModelProfile, ProfilesConfigInput } from "../../src/profiles.js";
 import type { SupervisorOptions } from "../../src/supervisor.js";
 
 export const scriptedModel: Model<"openai-responses"> = {

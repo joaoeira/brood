@@ -1,9 +1,12 @@
+/**
+ * Programmatic entry point: composes runtime, supervisor, and Pi adapter into
+ * a scoped BroodApplication, and interprets the root's value-level outcome
+ * into BroodResult | AgentFailed | RootInterrupted after draining orphans.
+ */
 import { Duration, Effect, References, type PubSub, type Scope } from "effect";
 import {
   AgentFailed,
-  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   RootInterrupted,
-  summarizeAgentFailure,
   type AgentId,
   type AgentOutcome,
   type BroodResult,
@@ -12,6 +15,7 @@ import {
   type RootStartError,
   type UnknownAgent,
 } from "./agent.js";
+import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, summarizeAgentFailure } from "./render.js";
 import { makePiAdapter } from "./pi-adapter.js";
 import {
   buildBroodRuntime,

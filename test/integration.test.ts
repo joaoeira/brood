@@ -6,7 +6,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { expect, it } from "vitest";
-import { compileProfileCatalogue } from "../src/agent.js";
+import { compileProfileCatalogue } from "../src/profiles.js";
 import { makePiAdapter } from "../src/pi-adapter.js";
 import { makeSupervisor } from "../src/supervisor.js";
 

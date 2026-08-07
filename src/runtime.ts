@@ -1,17 +1,25 @@
+/**
+ * Configuration and wiring: Schema decode of the raw config, cross-field
+ * validation, directory preparation, one shared Pi ModelRuntime, and the
+ * one-time profile-catalogue compilation. Every configuration failure is a
+ * BroodConfigError; there is deliberately no second validation path.
+ */
 import { chmod, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Duration, Effect, Schema, SchemaIssue } from "effect";
+import { BroodConfigError } from "./agent.js";
 import {
-  BroodConfigError,
-  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
-  MIN_BOUNDED_TEXT_CHARS,
   ModelProfile,
   compileProfileCatalogue,
-  minimumResumePromptChars,
   type ProfileCatalogue,
   type ProfilesConfigInput,
-} from "./agent.js";
+} from "./profiles.js";
+import {
+  DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
+  MIN_BOUNDED_TEXT_CHARS,
+  minimumResumePromptChars,
+} from "./render.js";
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
 const BoundedTextChars = PositiveInt.check(Schema.isGreaterThanOrEqualTo(MIN_BOUNDED_TEXT_CHARS));

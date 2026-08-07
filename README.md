@@ -4,6 +4,25 @@ Brood is a small, Effect-first multi-agent harness around the Pi coding-agent SD
 
 This repository is an early v1 implementation. Its public entry point is programmatic; the CLI is a thin local operator surface, not a daemon or network API.
 
+## Code map
+
+The module graph is a DAG rooted in three vocabulary files; every other module imports only downward.
+
+| Module              | Role                                                                                                                    |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `src/agent.ts`      | Shared vocabulary: identifiers, agent outcomes, the control protocol, every error. Imports nothing from `src/`.         |
+| `src/profiles.ts`   | Model-profile config schemas and the one-time catalogue compilation to resolved Pi models.                              |
+| `src/render.ts`     | Everything a model reads: normalization, code-point truncation, the resume envelope.                                    |
+| `src/registry.ts`   | The serialized state machine: admission, waits, the command mailbox, terminal settlement, shutdown.                     |
+| `src/pi-adapter.ts` | The only module that talks to Pi: session lifecycle, the prompt bridge, settlement classification, the suspension hook. |
+| `src/tools.ts`      | The `delegate` / `wait_for_agents` tools: TypeBox schemas, input normalization, the injected supervisor port.           |
+| `src/supervisor.ts` | Scheduling: the global semaphore, controller fibers, drain/interrupt, monitoring. Owns the registry privately.          |
+| `src/runtime.ts`    | Config decode/validation and live Layer wiring. All config failures are `BroodConfigError`.                             |
+| `src/main.ts`       | Programmatic entry: composes the application, interprets the root outcome.                                              |
+| `src/cli.ts`        | Thin operator shell over `main.ts`.                                                                                     |
+
+Tests mirror `src/` one file to one file, plus `integration.test.ts`, `pi-sdk-compatibility.test.ts` (the Phase 0 pin-guard), and deterministic fakes under `test/support/`.
+
 ## Install and build
 
 Brood requires Node 22.19 or newer and pnpm 10. The state, Pi-agent, and session directories are forced to owner-only mode (`0700`) on startup because they contain credentials and transcripts.

@@ -1,11 +1,7 @@
 import { Cause, Effect, Exit } from "effect";
 import { describe, expect, it } from "vitest";
-import {
-  makeAgentId,
-  normalizeAgentResult,
-  type AgentOutcome,
-  type DrainReport,
-} from "../src/agent.js";
+import { makeAgentId, type AgentOutcome, type DrainReport } from "../src/agent.js";
+import { normalizeAgentResult } from "../src/render.js";
 import { interpretRootOutcome } from "../src/main.js";
 
 const drain: DrainReport = {

@@ -8,14 +8,13 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Cause, Effect, Exit, Fiber, Stream } from "effect";
 import { describe, expect, it } from "vitest";
 import {
-  compileProfileCatalogue,
   makeAgentId,
   makeAgentName,
   makeBatchId,
   makeProfileName,
   makeToolInvocationId,
-  type ProfileCatalogue,
 } from "../src/agent.js";
+import { compileProfileCatalogue, type ProfileCatalogue } from "../src/profiles.js";
 import { inspectControlToolResults, makePiAdapter, type PiAdapter } from "../src/pi-adapter.js";
 import { compileAgentToolFactory, type ControlToolPort } from "../src/tools.js";
 

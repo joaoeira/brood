@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+/**
+ * Thin operator shell over main.ts: argument parsing, the interactive
+ * status / interrupt / events commands, and newline-delimited JSON output for
+ * non-interactive callers. No supervisor internals are reachable from here.
+ */
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -283,33 +288,20 @@ const matchPublicFailure = Match.type<CliFailure>().pipe(
     code: error._tag,
     message: error.message,
   })),
-  Match.orElse(() => ({ code: "UnexpectedFailure", message: "Brood failed unexpectedly" })),
+  Match.exhaustive,
 );
 
-const CLI_FAILURE_TAGS = new Set([
-  "AgentFailed",
-  "RootInterrupted",
-  "BroodConfigError",
-  "RootStartError",
-  "CliInputError",
-]);
-
-const publicFailure = (error: unknown): Readonly<Record<string, unknown>> =>
-  typeof error === "object" &&
-  error !== null &&
-  "_tag" in error &&
-  typeof error._tag === "string" &&
-  CLI_FAILURE_TAGS.has(error._tag)
-    ? matchPublicFailure(error as CliFailure)
-    : { code: "UnexpectedFailure", message: "Brood failed unexpectedly" };
-
-const reportNonInteractiveExit = (exit: Exit.Exit<unknown, unknown>): Effect.Effect<void> => {
+// A defect-only cause has no typed error to render; everything in the typed
+// channel is already a CliFailure, so no runtime tag sniffing is needed.
+const reportNonInteractiveExit = (exit: Exit.Exit<unknown, CliFailure>): Effect.Effect<void> => {
   if (process.stdin.isTTY === true || Exit.isSuccess(exit)) return Effect.void;
   if (Cause.hasInterruptsOnly(exit.cause)) return writeJson({ type: "interrupted" });
-  const error = Cause.findErrorOption(exit.cause);
   return writeJson({
     type: "failed",
-    error: Option.isSome(error) ? publicFailure(error.value) : publicFailure(undefined),
+    error: Option.match(Cause.findErrorOption(exit.cause), {
+      onNone: () => ({ code: "UnexpectedFailure", message: "Brood failed unexpectedly" }),
+      onSome: matchPublicFailure,
+    }),
   });
 };
 

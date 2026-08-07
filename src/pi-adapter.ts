@@ -1,3 +1,9 @@
+/**
+ * The only module that talks to Pi. Opens one session per agent pinned to its
+ * controller scope, bridges session.prompt() into Effect with interruption
+ * cleanup, classifies run settlement from live session events, and turns
+ * control-tool markers into typed suspension via shouldStopAfterTurn.
+ */
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AssistantMessage, StopReason, ToolResultMessage } from "@earendil-works/pi-ai";
@@ -15,13 +21,14 @@ import {
 import { Data, Effect, Queue, Ref, Result, Schema, Scope, Stream } from "effect";
 import {
   AgentId,
+  DelegateToolDetails,
   PiOpenError,
   PiProtocolError,
   PiRunError,
+  WaitToolDetails,
   type PiRunOutcome,
-  type ResolvedModelProfile,
 } from "./agent.js";
-import { DelegateToolDetails, WaitToolDetails } from "./tools.js";
+import type { ResolvedModelProfile } from "./profiles.js";
 
 export interface PiSessionEvent {
   readonly agentId: AgentId;

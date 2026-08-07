@@ -1,3 +1,6 @@
+/**
+ * Public API surface. Everything in src/ not re-exported here is internal.
+ */
 export {
   AgentFailureSummary,
   AgentFailed,
@@ -6,14 +9,13 @@ export {
   BroodResult,
   DrainReport,
   InterruptReason,
-  ModelProfile,
-  ModelThinkingLevel,
   ProfileName,
   RootStartError,
   RootInterrupted,
   UnknownAgent,
   type AgentResult,
 } from "./agent.js";
+export { ModelProfile, ModelThinkingLevel } from "./profiles.js";
 export {
   makeBroodApplication,
   runBrood,

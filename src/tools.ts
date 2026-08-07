@@ -1,41 +1,27 @@
+/**
+ * The two Brood control tools (`delegate`, `wait_for_agents`): TypeBox
+ * parameter schemas for Pi, Effect-side input normalization, and the
+ * Promise bridge into the supervisor's injected `ControlToolPort`.
+ *
+ * Tools depend only on vocabulary — the supervisor hands its operations in
+ * through the port, which is what keeps the module graph acyclic.
+ */
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Effect, Option, Schema } from "effect";
 import { Type } from "typebox";
 import {
-  AgentId,
   AgentName,
-  BatchId,
-  BroodControl,
   DelegateRejected,
   DelegatedTask,
-  DependencyOutcome,
-  ProfileName,
   ToolInvocationId,
   WaitRejected,
-  type ProfileCatalogue,
+  type AgentId,
+  type DelegateToolDetails,
+  type DependencyOutcome,
+  type WaitToolDetails,
 } from "./agent.js";
-
-const DelegatedAgent = Schema.Struct({
-  name: AgentName,
-  id: AgentId,
-  profile: ProfileName,
-});
-
-export const DelegateToolDetails = Schema.Struct({
-  version: Schema.Literal(1),
-  batchId: BatchId,
-  agents: Schema.Array(DelegatedAgent),
-  broodControl: BroodControl,
-});
-export interface DelegateToolDetails extends Schema.Schema.Type<typeof DelegateToolDetails> {}
-
-export const WaitToolDetails = Schema.Struct({
-  version: Schema.Literal(1),
-  outcomes: Schema.Array(DependencyOutcome),
-  broodControl: BroodControl,
-});
-export interface WaitToolDetails extends Schema.Schema.Type<typeof WaitToolDetails> {}
+import type { ProfileCatalogue } from "./profiles.js";
 
 export interface ControlToolPort {
   readonly delegate: (

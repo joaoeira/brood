@@ -11,8 +11,8 @@ import {
   makeWaitId,
   type AgentId,
   type AgentOutcome,
-  type PublicModelProfile,
 } from "../src/agent.js";
+import type { PublicModelProfile } from "../src/profiles.js";
 import { makeRegistry } from "../src/registry.js";
 
 const profile: PublicModelProfile = {
