@@ -470,7 +470,7 @@ it.effect("shutdown stops admission and pending-installation settlement reaches 
     });
     const quiescence = yield* Effect.forkChild(registry.awaitQuiescence);
 
-    const interruptedIds = yield* registry.beginShutdown({ _tag: "SupervisorShutdown" });
+    const shutdown = yield* registry.beginShutdown({ _tag: "SupervisorShutdown" });
     const rejected = yield* Effect.flip(
       registry.registerBatch({
         parentId: root.id,
@@ -483,9 +483,15 @@ it.effect("shutdown stops admission and pending-installation settlement reaches 
     yield* Fiber.join(quiescence);
     const snapshot = yield* registry.snapshot;
 
-    expect(interruptedIds).toEqual([root.id, admitted.children[0]!.id]);
+    expect(shutdown).toEqual({
+      activeIds: [root.id, admitted.children[0]!.id],
+      newlyRequested: [
+        { agentId: root.id, reason: { _tag: "SupervisorShutdown" } },
+        { agentId: admitted.children[0]!.id, reason: { _tag: "SupervisorShutdown" } },
+      ],
+    });
     expect(rejected._tag).toBe("DelegateRejected");
-    expect(settledIds).toEqual(interruptedIds);
+    expect(settledIds).toEqual(shutdown.activeIds);
     expect(snapshot.accepting).toBe(false);
     expect(snapshot.nonterminalCount).toBe(0);
     expect(snapshot.pendingInstallationCount).toBe(0);

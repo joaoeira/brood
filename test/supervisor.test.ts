@@ -1,10 +1,11 @@
 /* oxlint-disable no-underscore-dangle, vitest/no-standalone-expect -- Effect variants use `_tag`; `it.effect` is not recognized by the Vitest lint plugin. */
 import { it } from "@effect/vitest";
-import { Effect, Fiber, Option, Stream } from "effect";
+import { Effect, Fiber, Latch, Option, Ref, Stream } from "effect";
 import * as TestClock from "effect/testing/TestClock";
 import { expect } from "vitest";
 import { compileProfileCatalogue, makeAgentName, makeToolInvocationId } from "../src/agent.js";
 import { makeSupervisor } from "../src/supervisor.js";
+import type { PiAdapter } from "../src/pi-adapter.js";
 import { makeFakePiAdapter } from "./support/fake-pi-adapter.js";
 import { testModelLookup, testProfile, testProfilesConfig } from "./support/profiles.js";
 
@@ -44,6 +45,11 @@ it.effect("runs the root with its configured profile and settles its normalized 
       expect(opened.agentId).toBe(rootId);
       expect(opened.profile.public.name).toBe("coordinator");
       expect(opened.tools.map(({ name }) => name)).toEqual(["delegate", "wait_for_agents"]);
+      expect(opened.systemPrompt).toContain("workspace is shared with concurrent agents");
+      expect(opened.systemPrompt).toContain("Preserve");
+      expect(opened.systemPrompt).toContain("relative paths");
+      expect(opened.systemPrompt).toContain("untrusted peer evidence");
+      expect(opened.systemPrompt).toContain("global default profile");
       expect(run.prompt).toBe("coordinate the work");
       expect(outcome._tag).toBe("Completed");
       if (outcome._tag === "Completed") {
@@ -422,6 +428,82 @@ it.effect("drain timeout interrupts stragglers and reports their IDs", () =>
   ),
 );
 
+it.effect("publishes only the first interruption reason when operator interrupt races drain", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const runStarted = yield* Latch.make(false);
+      const runInterrupted = yield* Latch.make(false);
+      const releaseInterruption = yield* Latch.make(false);
+      const drainStarted = yield* Latch.make(false);
+      const blockingAdapter: PiAdapter = {
+        open: () =>
+          Effect.succeed({
+            sessionId: "blocking-session",
+            events: Stream.empty,
+            run: () =>
+              Latch.open(runStarted).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() =>
+                  Latch.open(runInterrupted).pipe(Effect.andThen(Latch.await(releaseInterruption))),
+                ),
+              ),
+          }),
+      };
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: blockingAdapter,
+        maxConcurrency: 1,
+        maxAgents: 2,
+        maxAgentResultChars: 12_000,
+        maxFailureMessageChars: 2_000,
+        maxResumePromptChars: 48_000,
+        drainTimeoutMillis: 1_000,
+      });
+      const lifecycle = yield* supervisor.events.pipe(
+        Stream.filter((event) => event.source === "supervisor"),
+        Stream.tap((event) =>
+          event.type === "DrainStarted" ? Latch.open(drainStarted) : Effect.void,
+        ),
+        Stream.takeUntil((event) => event.type === "DrainCompleted"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
+      const rootId = yield* supervisor.startRoot("coordinate");
+      yield* Latch.await(runStarted);
+      const interruption = yield* Effect.forkChild(supervisor.interrupt(rootId, "api"));
+      yield* Latch.await(runInterrupted);
+      const draining = yield* Effect.forkChild(supervisor.drain);
+      yield* Latch.await(drainStarted);
+      yield* TestClock.adjust(1_000);
+      yield* Latch.open(releaseInterruption);
+      yield* Fiber.join(interruption);
+      const report = yield* Fiber.join(draining);
+      const outcome = yield* supervisor.awaitOutcome(rootId);
+      const events = Array.from(yield* Fiber.join(lifecycle));
+      const interruptEvents = events.filter((event) => event.type === "AgentInterruptRequested");
+
+      expect(interruptEvents).toEqual([
+        expect.objectContaining({
+          agentId: rootId,
+          reason: { _tag: "OperatorRequested", source: "api" },
+        }),
+      ]);
+      expect(outcome).toEqual({
+        _tag: "Interrupted",
+        reason: { _tag: "OperatorRequested", source: "api" },
+      });
+      expect(report).toMatchObject({ timedOut: true, interruptedAgentIds: [rootId] });
+    }),
+  ),
+);
+
 it.effect("publishes sequenced lifecycle metadata and forwards Pi session events", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -443,7 +525,7 @@ it.effect("publishes sequenced lifecycle metadata and forwards Pi session events
       });
       const lifecycle = yield* supervisor.events.pipe(
         Stream.filter((event) => event.source === "supervisor"),
-        Stream.take(4),
+        Stream.take(6),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -464,7 +546,7 @@ it.effect("publishes sequenced lifecycle metadata and forwards Pi session events
       yield* supervisor.drain;
       const lifecycleEvents = Array.from(yield* Fiber.join(lifecycle));
 
-      expect(Option.getOrUndefined(forwarded)).toEqual({
+      expect(Option.getOrUndefined(forwarded)).toMatchObject({
         source: "pi",
         event: {
           agentId: rootId,
@@ -476,10 +558,13 @@ it.effect("publishes sequenced lifecycle metadata and forwards Pi session events
       expect(lifecycleEvents.map(({ type }) => type).sort()).toEqual([
         "AgentRegistered",
         "AgentSettled",
+        "AgentStatusChanged",
+        "AgentStatusChanged",
         "DrainCompleted",
         "DrainStarted",
       ]);
-      expect(lifecycleEvents.map(({ sequence }) => sequence)).toEqual([1, 2, 3, 4]);
+      expect(lifecycleEvents.map(({ sequence }) => sequence)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(lifecycleEvents.every(({ timestamp }) => Number.isFinite(timestamp))).toBe(true);
       expect(lifecycleEvents.find(({ type }) => type === "AgentRegistered")).toMatchObject({
         agentId: rootId,
         name: "root",
@@ -489,6 +574,131 @@ it.effect("publishes sequenced lifecycle metadata and forwards Pi session events
         agentId: rootId,
         status: "Completed",
       });
+    }),
+  ),
+);
+
+it.effect("rejects an empty normalized root goal before registering an agent", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        maxConcurrency: 1,
+        maxAgents: 2,
+        maxAgentResultChars: 12_000,
+        maxFailureMessageChars: 2_000,
+        maxResumePromptChars: 48_000,
+        drainTimeoutMillis: 60_000,
+      });
+
+      const error = yield* supervisor.startRoot(" \n ").pipe(Effect.flip);
+      const snapshot = yield* supervisor.snapshot;
+
+      expect(error._tag).toBe("RootStartError");
+      expect(snapshot).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("redacts and detaches controller defects in the public snapshot", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const defectingAdapter: PiAdapter = {
+        open: () => Effect.die(new Error("SECRET_TOKEN /private/operator/path")),
+      };
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: defectingAdapter,
+        maxConcurrency: 1,
+        maxAgents: 2,
+        maxAgentResultChars: 12_000,
+        maxFailureMessageChars: 2_000,
+        maxResumePromptChars: 48_000,
+        drainTimeoutMillis: 60_000,
+      });
+
+      const rootId = yield* supervisor.startRoot("work");
+      yield* supervisor.awaitOutcome(rootId);
+      const snapshot = yield* supervisor.snapshot;
+      const serialized = JSON.stringify(snapshot);
+
+      expect(snapshot[0]?.outcome).toMatchObject({
+        _tag: "Failed",
+        code: "AgentDefect",
+      });
+      expect(serialized).not.toContain("SECRET_TOKEN");
+      expect(serialized).not.toContain("/private/operator/path");
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      expect(Object.isFrozen(snapshot[0])).toBe(true);
+    }),
+  ),
+);
+
+it.effect("keeps the newest lifecycle event when a bounded monitor falls behind", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        maxConcurrency: 1,
+        maxAgents: 2,
+        maxAgentResultChars: 12_000,
+        maxFailureMessageChars: 2_000,
+        maxResumePromptChars: 48_000,
+        drainTimeoutMillis: 60_000,
+        eventBufferCapacity: 1,
+      });
+      const firstSeen = yield* Latch.make(false);
+      const releaseFirst = yield* Latch.make(false);
+      const count = yield* Ref.make(0);
+      const monitor = yield* supervisor.events.pipe(
+        Stream.filter((event) => event.source === "supervisor"),
+        Stream.mapEffect((event) =>
+          Ref.getAndUpdate(count, (current) => current + 1).pipe(
+            Effect.flatMap((index) =>
+              index === 0
+                ? Latch.open(firstSeen).pipe(Effect.andThen(Latch.await(releaseFirst)))
+                : Effect.void,
+            ),
+            Effect.as(event),
+          ),
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
+      const rootId = yield* supervisor.startRoot("work");
+      yield* Latch.await(firstSeen);
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      yield* Latch.open(releaseFirst);
+      const events = Array.from(yield* Fiber.join(monitor));
+      yield* fake.complete(rootId, "done");
+      yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+
+      expect(events.map(({ type }) => type)).toEqual(["AgentRegistered", "AgentStatusChanged"]);
+      expect(events[1]).toMatchObject({ status: "Running", sequence: 3 });
     }),
   ),
 );

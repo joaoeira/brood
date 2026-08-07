@@ -87,6 +87,16 @@ export interface CommandInterrupted {
   readonly reason: InterruptReason;
 }
 
+export interface CommittedInterruptRequest {
+  readonly agentId: AgentId;
+  readonly reason: InterruptReason;
+}
+
+export interface ShutdownResult {
+  readonly activeIds: ReadonlyArray<AgentId>;
+  readonly newlyRequested: ReadonlyArray<CommittedInterruptRequest>;
+}
+
 export class RegistryInvariantDefect extends Error {
   readonly _tag = "RegistryInvariantDefect";
 }
@@ -271,7 +281,7 @@ export interface AgentRegistry {
     id: AgentId,
     reason: InterruptReason,
   ) => Effect.Effect<boolean, UnknownAgent>;
-  readonly beginShutdown: (reason: InterruptReason) => Effect.Effect<ReadonlyArray<AgentId>>;
+  readonly beginShutdown: (reason: InterruptReason) => Effect.Effect<ShutdownResult>;
   readonly settlePendingInstallations: (
     reason: InterruptReason,
   ) => Effect.Effect<ReadonlyArray<AgentId>>;
@@ -940,15 +950,17 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
   const beginShutdown = Effect.fn("Brood.Registry.beginShutdown")((reason: InterruptReason) => {
     const updatedAt = now();
-    return transact((state): Transition<ReadonlyArray<AgentId>, never> => {
+    return transact((state): Transition<ShutdownResult, never> => {
       const agents = new Map(state.agents);
       const activeIds: Array<AgentId> = [];
+      const newlyRequested: Array<CommittedInterruptRequest> = [];
       const actions: Array<PostCommitAction> = [];
       for (const entry of state.agents.values()) {
         if (isTerminal(entry.status)) continue;
         activeIds.push(entry.id);
         if (entry.interruptRequested === undefined) {
           agents.set(entry.id, { ...entry, interruptRequested: reason, updatedAt });
+          newlyRequested.push({ agentId: entry.id, reason });
           actions.push({ _tag: "Open", latch: entry.mailbox });
         }
       }
@@ -956,7 +968,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       return {
         next: { ...state, agents, accepting: false },
         actions,
-        result: success(activeIds),
+        result: success({ activeIds, newlyRequested }),
       };
     });
   });
