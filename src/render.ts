@@ -266,7 +266,7 @@ const renderRequest = (outcome: PeerRequestOutcome): RenderedRequest => {
     case "Unavailable":
       return {
         header: `  <request id="${escapeXmlAttribute(outcome.request)}" to="${escapeXmlAttribute(outcome.to)}" status="unavailable" reason="${escapeXmlAttribute(outcome.recipientState)}">`,
-        body: normalizeText(outcome.message),
+        body: "The recipient became terminal before replying. Continue without this clarification or ask another addressable agent.",
         footer: "  </request>",
       };
   }
@@ -312,7 +312,6 @@ export const MAX_REQUEST_OUTCOME_HEADER_CHARS = Math.max(
       request: maximumRequestId,
       to: maximumAgentPath,
       recipientState: "interrupted",
-      message: "",
     }),
   ),
 );

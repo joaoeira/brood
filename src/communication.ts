@@ -34,11 +34,38 @@ const canonicalAgentPath = Schema.isPattern(/^root(?:\/[A-Za-z0-9][A-Za-z0-9_-]{
 const opaqueRequestId = Schema.isPattern(/^request_[A-Za-z0-9_-]+$/);
 const ansiEscape = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g");
 
+const isDirectionalControl = (codePoint: number): boolean =>
+  codePoint === 0x061c ||
+  codePoint === 0x200e ||
+  codePoint === 0x200f ||
+  (codePoint >= 0x202a && codePoint <= 0x202e) ||
+  (codePoint >= 0x2066 && codePoint <= 0x2069);
+
 const replaceControlCharacters = (value: string): string =>
   Array.from(value, (character) => {
     const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159) ? " " : character;
+    return codePoint <= 31 ||
+      (codePoint >= 127 && codePoint <= 159) ||
+      isDirectionalControl(codePoint)
+      ? " "
+      : character;
   }).join("");
+
+const normalizePeerBody = (value: string): string =>
+  Array.from(value.replace(/\r\n?/gu, "\n"), (character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) return "�";
+    if (
+      (codePoint <= 31 && codePoint !== 9 && codePoint !== 10) ||
+      (codePoint >= 127 && codePoint <= 159) ||
+      isDirectionalControl(codePoint)
+    ) {
+      return "";
+    }
+    return character;
+  })
+    .join("")
+    .trim();
 
 const codePointLimit = (maximum: number, label: string) =>
   Schema.makeFilter(
@@ -50,7 +77,12 @@ const codePointLimit = (maximum: number, label: string) =>
   );
 
 const boundedBody = (maximum: number, label: string) =>
-  Schema.Trim.check(Schema.isMinLength(1), codePointLimit(maximum, label));
+  Schema.String.pipe(
+    Schema.decode({
+      decode: SchemaGetter.transform(normalizePeerBody),
+      encode: SchemaGetter.transform(normalizePeerBody),
+    }),
+  ).check(Schema.isMinLength(1), codePointLimit(maximum, label));
 
 export const normalizeActivity = (value: string): string =>
   replaceControlCharacters(value.replace(ansiEscape, "")).replace(/\s+/gu, " ").trim();
@@ -87,20 +119,20 @@ const QuestionBody = boundedBody(MAX_QUESTION_CHARS, "question");
 const ReplyBody = boundedBody(MAX_REPLY_CHARS, "reply");
 const BulletinBody = boundedBody(MAX_BULLETIN_CHARS, "bulletin");
 
-export const AgentWaitSummary = Schema.Struct({
-  agentCompletions: Schema.Array(AgentPath),
-  repliesFrom: Schema.Array(AgentPath),
+export const AgentWaitCounts = Schema.Struct({
+  agentCompletions: Schema.Natural,
+  replies: Schema.Natural,
 });
-export interface AgentWaitSummary extends Schema.Schema.Type<typeof AgentWaitSummary> {}
+export interface AgentWaitCounts extends Schema.Schema.Type<typeof AgentWaitCounts> {}
 
 export const AgentDirectoryEntry = Schema.Struct({
   path: AgentPath,
   name: AgentName,
-  parentPath: Schema.optionalKey(AgentPath),
   state: AddressableAgentState,
   profile: ProfileName,
   activity: Schema.optionalKey(AgentActivity),
-  waitingFor: AgentWaitSummary,
+  waitingFor: AgentWaitCounts,
+  waitingForCaller: Schema.Boolean,
 });
 export interface AgentDirectoryEntry extends Schema.Schema.Type<typeof AgentDirectoryEntry> {}
 
@@ -139,7 +171,6 @@ export const PeerRequestOutcome = Schema.TaggedUnion({
     request: RequestId,
     to: AgentPath,
     recipientState: Schema.Literals(["completed", "failed", "interrupted"]),
-    message: Schema.String,
   },
 });
 export type PeerRequestOutcome = typeof PeerRequestOutcome.Type;
@@ -171,7 +202,6 @@ export interface ListAgentsInput extends Schema.Schema.Type<typeof ListAgentsInp
 
 export const AgentSelf = Schema.Struct({
   path: AgentPath,
-  parentPath: Schema.optionalKey(AgentPath),
 });
 export interface AgentSelf extends Schema.Schema.Type<typeof AgentSelf> {}
 
@@ -416,8 +446,11 @@ export const decodeAskAgentInput = Effect.fn("Brood.Communication.decodeAskAgent
   );
 });
 
-const hasLimit = (input: unknown): boolean =>
-  typeof input === "object" && input !== null && "limit" in input;
+const hasOnlyLimit = (input: unknown): boolean =>
+  typeof input === "object" &&
+  input !== null &&
+  "limit" in input &&
+  Object.keys(input).every((key) => key === "limit");
 
 export const decodeReadMessagesInput = Effect.fn("Brood.Communication.decodeReadMessagesInput")(
   function* (input: unknown) {
@@ -428,8 +461,8 @@ export const decodeReadMessagesInput = Effect.fn("Brood.Communication.decodeRead
       Effect.mapError(
         () =>
           new ReadMessagesRejected({
-            reason: hasLimit(input) ? "InvalidLimit" : "InvalidInput",
-            message: hasLimit(input)
+            reason: hasOnlyLimit(input) ? "InvalidLimit" : "InvalidInput",
+            message: hasOnlyLimit(input)
               ? `Invalid read_messages limit. Supply an integer between 1 and ${MAX_INBOX_READ_ITEMS}.`
               : "Invalid read_messages input. Supply only the optional `limit` field.",
           }),
@@ -481,8 +514,8 @@ export const decodeReadBulletinsInput = Effect.fn("Brood.Communication.decodeRea
       Effect.mapError(
         () =>
           new ReadBulletinsRejected({
-            reason: hasLimit(input) ? "InvalidLimit" : "InvalidInput",
-            message: hasLimit(input)
+            reason: hasOnlyLimit(input) ? "InvalidLimit" : "InvalidInput",
+            message: hasOnlyLimit(input)
               ? `Invalid read_bulletins limit. Supply an integer between 1 and ${MAX_BULLETIN_READ_ITEMS}.`
               : "Invalid read_bulletins input. Supply only the optional `limit` field.",
           }),

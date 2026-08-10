@@ -25,17 +25,17 @@ const requestId = makeRequestId("request_1");
 const directoryEntry: AgentDirectoryEntry = {
   path: peerPath,
   name: makeAgentName("peer"),
-  parentPath: makeAgentPath("root"),
   state: "waiting",
   profile: makeProfileName("worker"),
   activity: "reviewing tests",
-  waitingFor: { agentCompletions: [], repliesFrom: [] },
+  waitingFor: { agentCompletions: 2, replies: 1 },
+  waitingForCaller: true,
 };
 
 const makePort = (): CommunicationToolPort => ({
   listAgents: vi.fn<CommunicationToolPort["listAgents"]>(() =>
     Effect.succeed({
-      self: { path: callerPath, parentPath: makeAgentPath("root") },
+      self: { path: callerPath },
       agents: [directoryEntry],
     }),
   ),

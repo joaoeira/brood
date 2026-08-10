@@ -176,12 +176,11 @@ const textResult = <A>(text: string, details: A) => ({
 });
 
 const renderListAgents = (result: ListAgentsResult): string => {
-  const parent = result.self.parentPath === undefined ? "none" : result.self.parentPath;
   const entries = result.agents.map((agent) => JSON.stringify(agent));
   const cursor =
     result.nextAfter === undefined ? "No further page." : `Next cursor: ${result.nextAfter}`;
   return [
-    `Self: ${result.self.path}; parent: ${parent}.`,
+    `Self: ${result.self.path}.`,
     entries.length === 0 ? "No other addressable agents." : "Addressable agents:",
     ...entries,
     cursor,

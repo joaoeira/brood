@@ -4,6 +4,7 @@ import { describe, expect } from "vitest";
 import {
   AgentPath,
   AgentActivity,
+  AgentDirectoryEntry,
   MAX_ACTIVITY_CHARS,
   MAX_BULLETIN_CHARS,
   MAX_INBOX_READ_ITEMS,
@@ -88,6 +89,12 @@ describe("communication vocabulary", () => {
         }),
       );
       expect(tooLong._tag).toBe("Failure");
+
+      const safe = yield* decodeSendMessageInput({
+        to: "root/peer",
+        message: "line one\u0000\nline two\ud800\u202Espoof",
+      });
+      expect(safe.message).toBe("line one\nline two�spoof");
     }),
   );
 
@@ -97,6 +104,9 @@ describe("communication vocabulary", () => {
         activity: "  checking\u001b[31m Pi\u001b[0m\n\t stop hook  ",
       });
       expect(set).toEqual({ activity: "checking Pi stop hook" });
+      expect(yield* decodeSetActivityInput({ activity: "safe\u202Etxt" })).toEqual({
+        activity: "safe txt",
+      });
       expect(yield* decodeSetActivityInput({ activity: null })).toEqual({ activity: null });
 
       const blank = yield* Effect.exit(decodeSetActivityInput({ activity: "\u001b[31m\n\t" }));
@@ -137,9 +147,25 @@ describe("communication vocabulary", () => {
         request: "request_2",
         to: "root/research",
         recipientState: "failed",
-        message: "The recipient failed before replying.",
       }).to,
     ).toBe(makeAgentPath("root/research"));
+  });
+
+  it("keeps directory rows fixed-size and path-addressable", () => {
+    expect(
+      Schema.decodeUnknownSync(AgentDirectoryEntry, { onExcessProperty: "error" })({
+        path: "root/research",
+        name: "research",
+        state: "waiting",
+        profile: "worker",
+        waitingFor: { agentCompletions: 12, replies: 2 },
+        waitingForCaller: true,
+      }),
+    ).toMatchObject({
+      path: makeAgentPath("root/research"),
+      waitingFor: { agentCompletions: 12, replies: 2 },
+      waitingForCaller: true,
+    });
   });
 
   it.effect("rejects invalid read limits with the operation-specific reason", () =>
@@ -151,6 +177,9 @@ describe("communication vocabulary", () => {
       expect(messages.reason).toBe("InvalidLimit");
       expect(bulletins.reason).toBe("InvalidLimit");
       expect(messages.message).toContain(`between 1 and ${MAX_INBOX_READ_ITEMS}`);
+
+      const excess = yield* Effect.flip(decodeReadMessagesInput({ limit: 1, unexpected: true }));
+      expect(excess.reason).toBe("InvalidInput");
     }),
   );
 

@@ -5,7 +5,7 @@
  */
 import { Schema } from "effect";
 import { DependencyOutcome, ToolInvocationId, WaitId } from "./agent.js";
-import { PeerRequestOutcome, RequestId } from "./communication.js";
+import { AgentWaitCounts, PeerRequestOutcome, RequestId } from "./communication.js";
 
 export const SuspensionMarker = Schema.TaggedUnion({
   AgentWait: {
@@ -42,12 +42,6 @@ export const CoordinationNotice = Schema.Struct({
 });
 export interface CoordinationNotice extends Schema.Schema.Type<typeof CoordinationNotice> {}
 
-export const ActiveWaitCounts = Schema.Struct({
-  agentCompletions: Schema.Natural,
-  replies: Schema.Natural,
-});
-export interface ActiveWaitCounts extends Schema.Schema.Type<typeof ActiveWaitCounts> {}
-
 export const AgentCommand = Schema.TaggedUnion({
   InitialGoal: {
     goal: Schema.String,
@@ -61,7 +55,7 @@ export const AgentCommand = Schema.TaggedUnion({
   },
   CoordinationWake: {
     notice: CoordinationNotice,
-    waitingFor: ActiveWaitCounts,
+    waitingFor: AgentWaitCounts,
   },
 });
 export type AgentCommand = typeof AgentCommand.Type;
