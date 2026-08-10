@@ -988,6 +988,8 @@ interface AgentCommunicationState {
   readonly bulletinCursor: BulletinSequence;
   readonly requestWakeGeneration: RequestWakeGeneration;
   readonly claimedRequestWakeGeneration: RequestWakeGeneration;
+  readonly pendingCompletedOutcome:
+    Extract<AgentOutcome, { readonly _tag: "Completed" }> | undefined;
   readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWaitTargets>;
   readonly activeWait: ActiveWaitPlan | undefined;
   readonly runningCommand:
@@ -1038,7 +1040,10 @@ type FinishTurnInput =
 type FinishTurnDecision = Data.TaggedEnum<{
   Settled: { readonly outcome: AgentOutcome };
   RunNext: Record<never, never>;
-  Park: Record<never, never>;
+  Park: {
+    readonly waitId: WaitId;
+    readonly targetIds: ReadonlyArray<AgentId>;
+  };
 }>;
 
 finishTurn(input: FinishTurnInput): Effect.Effect<FinishTurnDecision, PiProtocolError>
@@ -1060,7 +1065,7 @@ Decision precedence is:
 4. an unresolved active wait, which parks;
 5. otherwise the completed Pi result settles the agent.
 
-Passive unread messages and unseen bulletins do not prevent ordinary terminal settlement. Questions do: an accepted question arriving during a running prompt creates a newer request generation and therefore schedules a coordination command before normal completion.
+Passive unread messages and unseen bulletins do not prevent ordinary terminal settlement. Questions do: an accepted question arriving during a running prompt creates a newer request generation and therefore schedules a coordination command before normal completion. When there is no active wait, that deferred normal completion is retained as the atomic stale-claim fallback described below; it is never silently discarded.
 
 `RunNext` does not carry a prematurely built command. Command claiming and command materialization are intentionally split:
 
@@ -1068,15 +1073,23 @@ Passive unread messages and unseen bulletins do not prevent ordinary terminal se
 takePendingCommand(
   agentId: AgentId,
 ): Effect.Effect<CommandClaim, UnknownAgent | CommandInterrupted>;
+
+type BeginRunResult =
+  | { readonly _tag: "Ready"; readonly command: AgentCommand }
+  | { readonly _tag: "Settled"; readonly outcome: AgentOutcome }
+  | { readonly _tag: "Stale"; readonly status: "Waiting" };
+
 beginRun(
   agentId: AgentId,
   token: CommandToken,
-): Effect.Effect<AgentCommand, UnknownAgent | CommandInterrupted>;
+): Effect.Effect<BeginRunResult, UnknownAgent | CommandInterrupted>;
 ```
 
 `takePendingCommand` runs outside the run semaphore. It closes the existing mailbox latch, rechecks authoritative state, discards a stale request-wake trigger when no still-open incoming request carries a generation newer than the claimed watermark, and atomically reserves a fresh command token without freezing the prompt payload. A newer deleted ask therefore cannot re-wake merely because an older unanswered request remains.
 
-After the controller acquires a run permit and lazily opens the Pi session, `beginRun` verifies ownership of that token, derives precedence from current state, combines simultaneous wait satisfaction and a request wake, changes queued/starting state to running, and materializes the final command with the current notice and wait state. If a wait is satisfied, this transition projects every outcome, clears the active wait, and deletes delivered request records exactly once. It then claims the current request-wake generation. A question accepted while the controller is queued or starting is therefore visible in that run; a question accepted after `beginRun` receives a newer generation and is handled by `finishTurn`. No controller waits on an empty mailbox while holding a run permit.
+After the controller acquires a run permit and lazily opens the Pi session, `beginRun` verifies ownership of that token and re-derives precedence from authoritative current state—initial goal, then a satisfied active wait, then a newer open request, then stale claim. It does not trust the trigger frozen when the command was claimed. A ready transition combines simultaneous wait satisfaction and a request wake, changes queued/starting state to running, and materializes the final command with the current notice and wait state. If a wait is satisfied, this transition projects every outcome, clears the active wait, and deletes delivered request records exactly once. It then claims the current request-wake generation. A question accepted while the controller is queued or starting is therefore visible in that run; a question accepted after `beginRun` receives a newer generation and is handled by `finishTurn`. No controller waits on an empty mailbox while holding a run permit.
+
+When a completed ordinary run is deferred solely because a new incoming question must be surfaced, `finishTurn` retains that completed outcome as `pendingCompletedOutcome`. If the requester terminates before the queued coordination claim begins, `beginRun` observes that no work remains and atomically commits the retained completion, returning `Settled`. If current coordination work does remain, `beginRun` clears the fallback when it materializes the newer command because that run's result becomes authoritative. A stale claim with an unresolved active wait returns `Stale { status: "Waiting" }`. This closes the lost-result race without a supervisor-side check-then-settle gap: a racing ask commits either before terminal settlement and is included, or after it and fails as `RecipientTerminal`.
 
 If wait satisfaction and a question wake coexist, one `WaitSatisfied` command carries the notice; no second command competes for the single slot.
 
