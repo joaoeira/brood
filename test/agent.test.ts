@@ -3,6 +3,7 @@ import { Effect, Exit, Schema } from "effect";
 import { expect } from "vitest";
 import {
   AgentAdmissionCapacity,
+  DelegateRejected,
   decodeBroodControl,
   decodeAgentName,
   decodeProfileName,
@@ -16,6 +17,18 @@ it.effect("normalizes agent names while keeping profile names exact", () =>
 
     expect(agentName).toBe("api_worker-1");
     expect(Exit.isFailure(paddedProfile)).toBe(true);
+  }),
+);
+
+it.effect("keeps overlong canonical paths in the typed delegation error contract", () =>
+  Effect.gen(function* () {
+    const error = yield* Schema.decodeUnknownEffect(DelegateRejected)({
+      _tag: "DelegateRejected",
+      reason: "PathTooLong",
+      message: "The derived child path is too long; choose a shorter child name.",
+    });
+
+    expect(error.reason).toBe("PathTooLong");
   }),
 );
 

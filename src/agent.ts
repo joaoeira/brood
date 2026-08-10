@@ -295,6 +295,7 @@ export class DelegateRejected extends Schema.TaggedError<DelegateRejected>()("De
   reason: Schema.Literals([
     "InvalidInput",
     "NameCollision",
+    "PathTooLong",
     "NotAccepting",
     "UnknownProfile",
     "DuplicateInvocationId",
