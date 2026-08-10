@@ -809,6 +809,19 @@ Schema decoding, normalization, fixed-bound validation, and registry-domain reje
 
 All state-changing tools share one caller-wide `ToolInvocationId -> ToolOperationName` map. Reuse is rejected across tool kinds; the map is not partitioned by operation.
 
+```ts
+type ToolOperationName =
+  | "delegate"
+  | "wait_for_agents"
+  | "set_activity"
+  | "send_message"
+  | "ask_agent"
+  | "read_messages"
+  | "reply_to_request"
+  | "post_bulletin"
+  | "read_bulletins";
+```
+
 ## 9. Suspension and command protocol
 
 ### 9.1 Transcript-complete suspension markers
@@ -927,6 +940,10 @@ type InboxSequence = number;
 type RequestWakeGeneration = number;
 type BulletinSequence = number;
 type CommandToken = string & { readonly CommandToken: unique symbol };
+
+interface CommandClaim {
+  readonly token: CommandToken;
+}
 
 type InboxEntry =
   | {
@@ -1048,8 +1065,13 @@ Passive unread messages and unseen bulletins do not prevent ordinary terminal se
 `RunNext` does not carry a prematurely built command. Command claiming and command materialization are intentionally split:
 
 ```ts
-takePendingCommand(agentId: AgentId): Effect.Effect<CommandClaim, CommandInterrupted>;
-beginRun(agentId: AgentId, token: CommandToken): Effect.Effect<AgentCommand, CommandRejected>;
+takePendingCommand(
+  agentId: AgentId,
+): Effect.Effect<CommandClaim, UnknownAgent | CommandInterrupted>;
+beginRun(
+  agentId: AgentId,
+  token: CommandToken,
+): Effect.Effect<AgentCommand, UnknownAgent | CommandInterrupted>;
 ```
 
 `takePendingCommand` runs outside the run semaphore. It closes the existing mailbox latch, rechecks authoritative state, discards a stale request-wake trigger when no still-open incoming request carries a generation newer than the claimed watermark, and atomically reserves a fresh command token without freezing the prompt payload. A newer deleted ask therefore cannot re-wake merely because an older unanswered request remains.
