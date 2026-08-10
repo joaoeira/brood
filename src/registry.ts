@@ -5,13 +5,14 @@
  * single-slot command mailbox, terminal settlement, shutdown — commits here
  * or nowhere. No transition may wait on Pi, the semaphore, or I/O.
  */
-import { Clock, Data, Deferred, Effect, Latch, Option, Ref, Result } from "effect";
+import { Clock, Data, Deferred, Effect, Latch, Option, Ref, Result, Schema } from "effect";
 import type { Deferred as DeferredType } from "effect/Deferred";
 import type { Latch as LatchType } from "effect/Latch";
 /* oxlint-disable no-underscore-dangle -- Effect domain variants intentionally use `_tag`. */
 import {
   AgentAdmissionLimitExceeded,
   DelegateRejected,
+  PiProtocolError,
   RootStartError,
   type DelegateError,
   UnknownAgent,
@@ -19,24 +20,69 @@ import {
   makeAgentId,
   makeWaitId,
   type AgentAdmissionCapacity,
-  type AgentCommand,
   type AgentId,
   type AgentName,
   type AgentOutcome,
+  type AgentResult,
   type AgentStatus,
   type DependencyOutcome,
   type InterruptReason,
   type ToolInvocationId,
   type WaitId,
 } from "./agent.js";
+import { type AgentCommand, type PiRunOutcome } from "./control.js";
 import type { PublicModelProfile } from "./profiles.js";
 import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, dependencyOutcomeFromAgent } from "./render.js";
+import {
+  AskAgentRejected,
+  MAX_DIRECTORY_PAGE_ITEMS,
+  MAX_BULLETIN_READ_ITEMS,
+  MAX_BULLETINS_PER_AUTHOR,
+  MAX_INBOX_READ_ITEMS,
+  MAX_INCOMING_REQUESTS_PER_AGENT,
+  MAX_REQUEST_TARGETS_PER_WAIT,
+  MAX_TOOL_RESULT_CHARS,
+  MAX_UNREAD_MESSAGES_PER_AGENT,
+  PostBulletinRejected,
+  ReadBulletinsRejected,
+  ReadMessagesRejected,
+  ReplyRejected,
+  SendMessageRejected,
+  SetActivityRejected,
+  decodeAgentPath,
+  makeAgentPath,
+  makeRequestId,
+  type AgentActivity,
+  type AgentDirectoryEntry,
+  type AgentPath,
+  type AskAgentInput,
+  type AskAgentToolDetails,
+  type BulletinPost,
+  type ListAgentsInput,
+  type ListAgentsRejected,
+  type ListAgentsResult,
+  type PostBulletinInput,
+  type PostBulletinResult,
+  type ReadBulletinsInput,
+  type ReadBulletinsResult,
+  type ReadMessagesInput,
+  type ReadMessagesResult,
+  type PeerRequestOutcome,
+  type ReplyToRequestInput,
+  type ReplyToRequestResult,
+  type RequestId,
+  type SendMessageInput,
+  type SendMessageResult,
+  type SetActivityInput,
+  type SetActivityResult,
+} from "./communication.js";
 
 export type InstallationStatus = "Pending" | "Installed";
 
 export interface RegisteredAgent {
   readonly id: AgentId;
   readonly name: AgentName;
+  readonly path: AgentPath;
   readonly parentId: AgentId | undefined;
   readonly profile: PublicModelProfile;
 }
@@ -76,18 +122,6 @@ export type WaitPlanResult =
     }
   | { readonly _tag: "Planned"; readonly targetIds: ReadonlyArray<AgentId> };
 
-export type WaitActivation =
-  | {
-      readonly _tag: "Waiting";
-      readonly waitId: WaitId;
-      readonly targetIds: ReadonlyArray<AgentId>;
-    }
-  | {
-      readonly _tag: "Resumed";
-      readonly waitId: WaitId;
-      readonly targetIds: ReadonlyArray<AgentId>;
-    };
-
 export interface CommandInterrupted {
   readonly _tag: "CommandInterrupted";
   readonly agentId: AgentId;
@@ -124,6 +158,7 @@ export interface AgentSnapshot extends RegisteredAgent {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly terminalAt: number | undefined;
+  readonly activity: AgentActivity | undefined;
 }
 
 export interface RegistrySnapshot {
@@ -133,23 +168,94 @@ export interface RegistrySnapshot {
   readonly nonterminalCount: number;
   readonly pendingInstallationCount: number;
   readonly admissionCapacity: AgentAdmissionCapacity;
+  readonly retainedBulletinCount: number;
 }
 
-interface ActiveWait {
+interface WaitTargets {
+  readonly dependencies: ReadonlyArray<AgentId>;
+  readonly requests: ReadonlyArray<RequestId>;
+}
+
+interface PlannedWait extends WaitTargets {
+  readonly tool: "delegate" | "wait_for_agents" | "ask_agent";
+}
+
+interface ActiveWait extends WaitTargets {
   readonly waitId: WaitId;
-  readonly targetIds: ReadonlyArray<AgentId>;
+}
+
+const CommandToken = Schema.String.pipe(Schema.brand("CommandToken"));
+export type CommandToken = typeof CommandToken.Type;
+const makeCommandToken = Schema.decodeUnknownSync(CommandToken);
+
+type CommandTrigger = "initial" | "wait-satisfied" | "coordination";
+
+interface ClaimedCommand {
+  readonly token: CommandToken;
+  readonly trigger: CommandTrigger;
+}
+
+interface RunningCommand {
+  readonly token: CommandToken;
+}
+
+type InboxEntry =
+  | {
+      readonly _tag: "Message";
+      readonly sequence: number;
+      readonly fromId: AgentId;
+      readonly body: string;
+    }
+  | {
+      readonly _tag: "Request";
+      readonly sequence: number;
+      readonly requestId: RequestId;
+      readonly presented: boolean;
+    };
+
+type RequestState =
+  | { readonly _tag: "Open" }
+  | { readonly _tag: "Replied"; readonly reply: string }
+  | {
+      readonly _tag: "Unavailable";
+      readonly recipientState: "completed" | "failed" | "interrupted";
+    };
+
+interface RequestRecord {
+  readonly id: RequestId;
+  readonly requesterId: AgentId;
+  readonly recipientId: AgentId;
+  readonly wakeGeneration: number;
+  readonly question: string;
+  readonly state: RequestState;
+}
+
+interface BulletinRecord {
+  readonly sequence: number;
+  readonly authorId: AgentId;
+  readonly authorPath: AgentPath;
+  readonly body: string;
 }
 
 interface AgentEntry extends RegisteredAgent {
   readonly status: AgentStatus;
   readonly installation: InstallationStatus;
-  readonly pendingCommand: AgentCommand | undefined;
+  readonly initialGoal: string | undefined;
+  readonly claimedCommand: ClaimedCommand | undefined;
+  readonly runningCommand: RunningCommand | undefined;
+  readonly pendingCompletedResult: AgentResult | undefined;
   readonly mailbox: LatchType;
   readonly completion: DeferredType<AgentOutcome>;
   readonly outcome: AgentOutcome | undefined;
   readonly interruptRequested: InterruptReason | undefined;
-  readonly seenInvocations: ReadonlySet<ToolInvocationId>;
-  readonly plannedTargets: ReadonlyArray<AgentId>;
+  readonly turnInvocations: ReadonlyMap<ToolInvocationId, ToolOperationName>;
+  readonly activity: AgentActivity | undefined;
+  readonly inbox: ReadonlyArray<InboxEntry>;
+  readonly nextInboxSequence: number;
+  readonly bulletinCursor: number;
+  readonly requestWakeGeneration: number;
+  readonly claimedRequestWakeGeneration: number;
+  readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWait>;
   readonly activeWait: ActiveWait | undefined;
   readonly childrenByName: ReadonlyMap<AgentName, AgentId>;
   readonly createdAt: number;
@@ -159,6 +265,10 @@ interface AgentEntry extends RegisteredAgent {
 
 interface RegistryState {
   readonly agents: ReadonlyMap<AgentId, AgentEntry>;
+  readonly agentsByPath: ReadonlyMap<AgentPath, AgentId>;
+  readonly requests: ReadonlyMap<RequestId, RequestRecord>;
+  readonly bulletins: ReadonlyArray<BulletinRecord>;
+  readonly nextBulletinSequence: number;
   readonly rootId: AgentId | undefined;
   readonly accepting: boolean;
   readonly nonterminalCount: number;
@@ -192,17 +302,18 @@ const replaceAgent = (state: RegistryState, entry: AgentEntry): RegistryState =>
   return { ...state, agents };
 };
 
-const waitTargets = (entry: AgentEntry): ReadonlyArray<AgentId> => {
-  if (entry.activeWait !== undefined) return [...entry.activeWait.targetIds];
-  return [...entry.plannedTargets];
-};
+const plannedDependencies = (entry: AgentEntry): ReadonlyArray<AgentId> =>
+  Array.from(entry.plannedWaits.values()).flatMap(({ dependencies }) => dependencies);
 
-const withTargets = (
-  current: ReadonlyArray<AgentId>,
-  additions: ReadonlyArray<AgentId>,
-): ReadonlyArray<AgentId> => {
+const plannedRequests = (entry: AgentEntry): ReadonlyArray<RequestId> =>
+  Array.from(entry.plannedWaits.values()).flatMap(({ requests }) => requests);
+
+const withTargets = <A>(
+  current: ReadonlyArray<A>,
+  additions: ReadonlyArray<A>,
+): ReadonlyArray<A> => {
   const selected = new Set(current);
-  const targetIds = [...current];
+  const targetIds: Array<A> = [...current];
   for (const targetId of additions) {
     if (selected.has(targetId)) continue;
     selected.add(targetId);
@@ -222,7 +333,51 @@ export interface RegistryOptions {
   readonly maxFailureMessageChars?: number;
   readonly nextAgentId?: () => AgentId;
   readonly nextWaitId?: () => WaitId;
+  readonly nextRequestId?: () => RequestId;
+  readonly nextCommandToken?: () => string;
 }
+
+type ToolOperationName =
+  | "delegate"
+  | "wait_for_agents"
+  | "set_activity"
+  | "send_message"
+  | "ask_agent"
+  | "read_messages"
+  | "reply_to_request"
+  | "post_bulletin"
+  | "read_bulletins";
+
+export interface CommandClaim {
+  readonly token: CommandToken;
+  readonly trigger: CommandTrigger;
+}
+
+export type BeginRunResult =
+  | { readonly _tag: "Ready"; readonly command: AgentCommand }
+  | { readonly _tag: "Stale"; readonly status: "Waiting" }
+  | { readonly _tag: "Settled"; readonly outcome: AgentOutcome };
+
+export type FinishTurnInput =
+  | {
+      readonly agentId: AgentId;
+      readonly commandToken: CommandToken;
+      readonly piOutcome: Extract<PiRunOutcome, { readonly _tag: "Completed" }>;
+      readonly completedResult: AgentResult;
+    }
+  | {
+      readonly agentId: AgentId;
+      readonly commandToken: CommandToken;
+      readonly piOutcome: Extract<PiRunOutcome, { readonly _tag: "Suspended" }>;
+    };
+
+export type FinishTurnDecision = Data.TaggedEnum<{
+  Settled: { readonly outcome: AgentOutcome };
+  RunNext: Record<never, never>;
+  Park: { readonly waitId: WaitId; readonly targetIds: ReadonlyArray<AgentId> };
+}>;
+
+export const FinishTurnDecision = Data.taggedEnum<FinishTurnDecision>();
 
 export interface AgentRegistry {
   readonly registerRoot: (
@@ -234,6 +389,45 @@ export interface AgentRegistry {
   /** Authoritative snapshot, not a reservation: `used` is monotonic, so a
    * stale read can only overstate what remains. */
   readonly admissionCapacity: Effect.Effect<AgentAdmissionCapacity>;
+  readonly listAgents: (
+    callerId: AgentId,
+    input: ListAgentsInput,
+  ) => Effect.Effect<ListAgentsResult, ListAgentsRejected>;
+  readonly setActivity: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: SetActivityInput,
+  ) => Effect.Effect<SetActivityResult, SetActivityRejected>;
+  readonly sendMessage: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: SendMessageInput,
+  ) => Effect.Effect<SendMessageResult, SendMessageRejected>;
+  readonly askAgent: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: AskAgentInput,
+  ) => Effect.Effect<AskAgentToolDetails, AskAgentRejected>;
+  readonly readMessages: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReadMessagesInput,
+  ) => Effect.Effect<ReadMessagesResult, ReadMessagesRejected>;
+  readonly replyToRequest: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReplyToRequestInput,
+  ) => Effect.Effect<ReplyToRequestResult, ReplyRejected>;
+  readonly postBulletin: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: PostBulletinInput,
+  ) => Effect.Effect<PostBulletinResult, PostBulletinRejected>;
+  readonly readBulletins: (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReadBulletinsInput,
+  ) => Effect.Effect<ReadBulletinsResult, ReadBulletinsRejected>;
   readonly settle: (
     id: AgentId,
     outcome: AgentOutcome,
@@ -241,13 +435,18 @@ export interface AgentRegistry {
   readonly planWait: (
     input: PlanWaitInput,
   ) => Effect.Effect<WaitPlanResult, WaitRejected | UnknownAgent>;
-  readonly activateWaits: (id: AgentId) => Effect.Effect<WaitActivation, UnknownAgent>;
   readonly markInstalled: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly markStarting: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
-  readonly markRunning: (id: AgentId) => Effect.Effect<void, UnknownAgent>;
   readonly takePendingCommand: (
     id: AgentId,
-  ) => Effect.Effect<AgentCommand, UnknownAgent | CommandInterrupted>;
+  ) => Effect.Effect<CommandClaim, UnknownAgent | CommandInterrupted>;
+  readonly beginRun: (
+    id: AgentId,
+    token: CommandToken,
+  ) => Effect.Effect<BeginRunResult, UnknownAgent | CommandInterrupted>;
+  readonly finishTurn: (
+    input: FinishTurnInput,
+  ) => Effect.Effect<FinishTurnDecision, PiProtocolError>;
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
   readonly requestInterrupt: (
     id: AgentId,
@@ -271,13 +470,22 @@ const makeEntry = (
   ...registration,
   status: "Queued",
   installation: "Pending",
-  pendingCommand: { _tag: "InitialGoal", goal },
+  initialGoal: goal,
+  claimedCommand: undefined,
+  runningCommand: undefined,
+  pendingCompletedResult: undefined,
   mailbox,
   completion,
   outcome: undefined,
   interruptRequested: undefined,
-  seenInvocations: new Set(),
-  plannedTargets: [],
+  turnInvocations: new Map(),
+  activity: undefined,
+  inbox: [],
+  nextInboxSequence: 0,
+  bulletinCursor: 0,
+  requestWakeGeneration: 0,
+  claimedRequestWakeGeneration: 0,
+  plannedWaits: new Map(),
   activeWait: undefined,
   childrenByName: new Map(),
   createdAt: now,
@@ -297,9 +505,16 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     options.maxFailureMessageChars ?? DEFAULT_MAX_FAILURE_MESSAGE_CHARS;
   const nextAgentId = options.nextAgentId ?? (() => makeAgentId(`agent_${crypto.randomUUID()}`));
   const nextWaitId = options.nextWaitId ?? (() => makeWaitId(`wait_${crypto.randomUUID()}`));
+  const nextRequestId =
+    options.nextRequestId ?? (() => makeRequestId(`request_${crypto.randomUUID()}`));
+  const nextCommandToken = options.nextCommandToken ?? (() => crypto.randomUUID());
   const quiescence = yield* Latch.make(false);
   const stateRef = yield* Ref.make<RegistryState>({
     agents: new Map(),
+    agentsByPath: new Map(),
+    requests: new Map(),
+    bulletins: [],
+    nextBulletinSequence: 0,
     rootId: undefined,
     accepting: true,
     nonterminalCount: 0,
@@ -369,6 +584,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     const registered: RegisteredAgent = {
       id,
       name: input.name,
+      path: makeAgentPath("root"),
       parentId: undefined,
       profile: input.profile,
     };
@@ -388,10 +604,13 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       }
       const agents = new Map(state.agents);
       agents.set(id, entry);
+      const agentsByPath = new Map(state.agentsByPath);
+      agentsByPath.set(registered.path, registered.id);
       return {
         next: {
           ...state,
           agents,
+          agentsByPath,
           rootId: id,
           nonterminalCount: 1,
         },
@@ -404,12 +623,35 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
   const registerBatch = Effect.fn("Brood.Registry.registerBatch")(function* (
     input: RegisterBatchInput,
   ) {
+    const beforePreparation = yield* Ref.get(stateRef);
+    const knownParent = beforePreparation.agents.get(input.parentId);
+    if (knownParent === undefined) {
+      return yield* Effect.fail(new UnknownAgent({ agentId: input.parentId }));
+    }
+    const paths = yield* Effect.forEach(input.children, (child) =>
+      decodeAgentPath(`${knownParent.path}/${child.name}`).pipe(
+        Effect.mapError(
+          () =>
+            new DelegateRejected({
+              reason: "PathTooLong",
+              message: `Delegating ${child.name} would exceed the canonical path limit; use a shorter child name before retrying the batch.`,
+            }),
+        ),
+      ),
+    );
     const registeredAt = yield* Clock.currentTimeMillis;
-    const prepared = yield* Effect.forEach(input.children, (child) =>
+    const prepared = yield* Effect.forEach(input.children, (child, index) =>
       Effect.gen(function* () {
+        const path = paths[index];
+        if (path === undefined) {
+          return yield* Effect.die(
+            new RegistryInvariantDefect("Validated child paths changed length"),
+          );
+        }
         const registered: RegisteredAgent = {
           id: nextAgentId(),
           name: child.name,
+          path,
           parentId: input.parentId,
           profile: child.profile,
         };
@@ -446,17 +688,13 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             ),
           );
         }
-        if (parent.seenInvocations.has(input.invocationId)) {
-          return noChange(
-            state,
-            Result.fail(
-              new DelegateRejected({
-                reason: "DuplicateInvocationId",
-                message: `Control invocation ${input.invocationId} was already committed`,
-              }),
-            ),
-          );
-        }
+        const claimed = withInvocation(
+          parent,
+          input.invocationId,
+          "delegate",
+          (message) => new DelegateRejected({ reason: "DuplicateInvocationId", message }),
+        );
+        if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
         if (input.children.length === 0) {
           return noChange(
             state,
@@ -515,42 +753,731 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         }
 
         const agents = new Map(state.agents);
+        const agentsByPath = new Map(state.agentsByPath);
         const childrenByName = new Map(parent.childrenByName);
         for (const child of prepared) {
-          agents.set(child.registered.id, child.entry);
-          childrenByName.set(child.registered.name, child.registered.id);
+          if (!child.registered.path.startsWith(`${parent.path}/`)) {
+            throw new RegistryInvariantDefect("Parent path changed during batch preparation");
+          }
+          const registered = child.registered;
+          agents.set(registered.id, { ...child.entry, ...registered });
+          agentsByPath.set(registered.path, registered.id);
+          childrenByName.set(registered.name, registered.id);
         }
-        const seenInvocations = new Set(parent.seenInvocations);
-        seenInvocations.add(input.invocationId);
-        const plannedTargets =
-          input.wait === "all"
-            ? withTargets(
-                parent.plannedTargets,
-                prepared.map(({ registered }) => registered.id),
-              )
-            : parent.plannedTargets;
+        const plannedWaits = new Map(claimed.success.plannedWaits);
+        if (input.wait === "all") {
+          plannedWaits.set(input.invocationId, {
+            tool: "delegate",
+            dependencies: prepared.map(({ registered }) => registered.id),
+            requests: [],
+          });
+        }
         agents.set(parent.id, {
-          ...parent,
+          ...claimed.success,
           childrenByName,
-          seenInvocations,
-          plannedTargets,
+          plannedWaits,
           updatedAt: registeredAt,
         });
 
         const next: RegistryState = {
           ...state,
           agents,
+          agentsByPath,
           nonterminalCount: state.nonterminalCount + prepared.length,
         };
         return {
           next,
           actions: prepared.map(({ entry }) => PostCommitAction.Open({ latch: entry.mailbox })),
           result: Result.succeed({
-            children: prepared.map(({ registered }) => registered),
+            children: prepared.map(({ registered }) => {
+              const stored = agents.get(registered.id);
+              if (stored === undefined) {
+                throw new RegistryInvariantDefect(`Registered child ${registered.id} is missing`);
+              }
+              return stored;
+            }),
             capacityAfterCommit: capacityOf(next),
           }),
         };
       });
+    });
+  });
+
+  // ── Peer discovery ──────────────────────────────────────────────────────
+
+  const addressableState = (status: AgentStatus): AgentDirectoryEntry["state"] => {
+    switch (status) {
+      case "Queued":
+        return "queued";
+      case "Starting":
+        return "starting";
+      case "Running":
+        return "running";
+      case "Waiting":
+        return "waiting";
+      case "Completed":
+      case "Failed":
+      case "Interrupted":
+        throw new RegistryInvariantDefect(`Terminal status ${status} is not addressable`);
+    }
+  };
+
+  const listAgents = Effect.fn("Brood.Registry.listAgents")(function* (
+    callerId: AgentId,
+    input: ListAgentsInput,
+  ) {
+    const state = yield* Ref.get(stateRef);
+    const caller = state.agents.get(callerId);
+    if (caller === undefined) {
+      return yield* Effect.die(new RegistryInvariantDefect(`Missing caller ${callerId}`));
+    }
+    const eligible = Array.from(state.agents.values())
+      .filter(
+        (entry) =>
+          entry.id !== callerId &&
+          entry.outcome === undefined &&
+          (input.after === undefined || entry.path > input.after),
+      )
+      .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+    const self = { path: caller.path };
+    const agents: Array<AgentDirectoryEntry> = [];
+    for (const [index, entry] of eligible.entries()) {
+      if (agents.length >= MAX_DIRECTORY_PAGE_ITEMS) break;
+      const unresolvedDependencies = withTargets(
+        entry.activeWait?.dependencies ?? [],
+        plannedDependencies(entry),
+      ).filter((dependencyId) => {
+        const dependency = state.agents.get(dependencyId);
+        if (dependency === undefined) {
+          throw new RegistryInvariantDefect(`Missing dependency ${dependencyId}`);
+        }
+        return dependency.outcome === undefined;
+      });
+      const unresolvedRequestRecipients = withTargets(
+        entry.activeWait?.requests ?? [],
+        plannedRequests(entry),
+      ).flatMap((requestId) => {
+        const request = state.requests.get(requestId);
+        if (request === undefined) {
+          throw new RegistryInvariantDefect(`Missing request ${requestId}`);
+        }
+        if (request.state._tag !== "Open") return [];
+        if (!state.agents.has(request.recipientId)) {
+          throw new RegistryInvariantDefect(`Missing recipient ${request.recipientId}`);
+        }
+        return [request.recipientId];
+      });
+      const projected: AgentDirectoryEntry = {
+        path: entry.path,
+        name: entry.name,
+        state: addressableState(entry.status),
+        profile: entry.profile.name,
+        ...(entry.activity === undefined ? {} : { activity: entry.activity }),
+        waitingFor: {
+          agentCompletions: unresolvedDependencies.length,
+          replies: unresolvedRequestRecipients.length,
+        },
+        waitingForCaller:
+          unresolvedDependencies.includes(callerId) ||
+          unresolvedRequestRecipients.includes(callerId),
+      };
+      const candidateAgents = [...agents, projected];
+      const candidateNextAfter = index < eligible.length - 1 ? projected.path : undefined;
+      const candidateResult: ListAgentsResult = {
+        self,
+        agents: candidateAgents,
+        ...(candidateNextAfter === undefined ? {} : { nextAfter: candidateNextAfter }),
+      };
+      if (Array.from(JSON.stringify(candidateResult)).length > MAX_TOOL_RESULT_CHARS) {
+        break;
+      }
+      agents.push(projected);
+    }
+    if (eligible.length > 0 && agents.length === 0) {
+      throw new RegistryInvariantDefect(
+        "MAX_TOOL_RESULT_CHARS cannot hold one complete directory entry",
+      );
+    }
+    const nextAfter = eligible.length > agents.length ? agents.at(-1)?.path : undefined;
+    return {
+      self,
+      agents,
+      ...(nextAfter === undefined ? {} : { nextAfter }),
+    };
+  });
+
+  const nextSafeCounter = (current: number, label: string): number => {
+    if (!Number.isSafeInteger(current) || current >= Number.MAX_SAFE_INTEGER) {
+      throw new RegistryInvariantDefect(`${label} exhausted its safe integer range`);
+    }
+    return current + 1;
+  };
+
+  const withInvocation = <E>(
+    entry: AgentEntry,
+    invocationId: ToolInvocationId,
+    operation: ToolOperationName,
+    makeError: (message: string) => E,
+  ): Result.Result<AgentEntry, E> => {
+    const existing = entry.turnInvocations.get(invocationId);
+    if (existing !== undefined) {
+      return Result.fail(
+        makeError(
+          `Tool invocation ${invocationId} was already committed by ${existing} during this agent turn; do not reuse tool-call IDs.`,
+        ),
+      );
+    }
+    const turnInvocations = new Map(entry.turnInvocations);
+    turnInvocations.set(invocationId, operation);
+    return Result.succeed({ ...entry, turnInvocations });
+  };
+
+  const callerOrDie = (state: RegistryState, callerId: AgentId): AgentEntry => {
+    const caller = state.agents.get(callerId);
+    if (caller === undefined) {
+      throw new RegistryInvariantDefect(`Missing caller ${callerId}`);
+    }
+    if (caller.outcome !== undefined) {
+      throw new RegistryInvariantDefect(`Terminal caller ${callerId} used a communication tool`);
+    }
+    return caller;
+  };
+
+  const setActivity = Effect.fn("Brood.Registry.setActivity")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: SetActivityInput,
+  ) {
+    const updatedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<SetActivityResult, SetActivityRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "set_activity",
+        (message) => new SetActivityRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const activity = input.activity === null ? undefined : input.activity;
+      return {
+        next: replaceAgent(state, { ...claimed.success, activity, updatedAt }),
+        actions: [],
+        result: Result.succeed(activity === undefined ? {} : { activity }),
+      };
+    });
+  });
+
+  const sendMessage = Effect.fn("Brood.Registry.sendMessage")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: SendMessageInput,
+  ) {
+    const deliveredAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<SendMessageResult, SendMessageRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "send_message",
+        (message) => new SendMessageRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const recipientId = state.agentsByPath.get(input.to);
+      if (recipientId === undefined) {
+        return noChange(
+          state,
+          Result.fail(
+            new SendMessageRejected({
+              reason: "UnknownRecipient",
+              recipient: input.to,
+              message: `No addressable agent exists at ${input.to}; call list_agents and retry with a listed canonical path.`,
+            }),
+          ),
+        );
+      }
+      if (recipientId === callerId) {
+        return noChange(
+          state,
+          Result.fail(
+            new SendMessageRejected({
+              reason: "SelfRecipient",
+              recipient: input.to,
+              message:
+                "An agent cannot send a message to itself; retain the information locally instead.",
+            }),
+          ),
+        );
+      }
+      const recipient = state.agents.get(recipientId);
+      if (recipient === undefined) {
+        throw new RegistryInvariantDefect(`Path index points to missing agent ${recipientId}`);
+      }
+      if (recipient.outcome !== undefined) {
+        return noChange(
+          state,
+          Result.fail(
+            new SendMessageRejected({
+              reason: "RecipientTerminal",
+              recipient: input.to,
+              message: `${input.to} is terminal and cannot read new messages; choose an addressable agent or write durable context under .brood/shared/.`,
+            }),
+          ),
+        );
+      }
+      const unreadMessages = recipient.inbox.filter((item) => item._tag === "Message").length;
+      if (unreadMessages >= MAX_UNREAD_MESSAGES_PER_AGENT) {
+        return noChange(
+          state,
+          Result.fail(
+            new SendMessageRejected({
+              reason: "RecipientMessageCapacityExceeded",
+              recipient: input.to,
+              message: `${input.to} has ${MAX_UNREAD_MESSAGES_PER_AGENT} unread passive messages; retry later, choose another agent, or write the information under .brood/shared/.`,
+            }),
+          ),
+        );
+      }
+      const sequence = nextSafeCounter(recipient.nextInboxSequence, "Inbox sequence");
+      const agents = new Map(state.agents);
+      agents.set(callerId, { ...claimed.success, updatedAt: deliveredAt });
+      agents.set(recipientId, {
+        ...recipient,
+        inbox: [
+          ...recipient.inbox,
+          { _tag: "Message", sequence, fromId: callerId, body: input.message },
+        ],
+        nextInboxSequence: sequence,
+        updatedAt: deliveredAt,
+      });
+      return {
+        next: { ...state, agents },
+        actions: [],
+        result: Result.succeed({
+          to: recipient.path,
+          recipientState: addressableState(recipient.status),
+        }),
+      };
+    });
+  });
+
+  const askAgent = Effect.fn("Brood.Registry.askAgent")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: AskAgentInput,
+  ) {
+    const requestedAt = yield* Clock.currentTimeMillis;
+    const requestId = nextRequestId();
+    return yield* transact((state): Transition<AskAgentToolDetails, AskAgentRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "ask_agent",
+        (message) => new AskAgentRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const recipientId = state.agentsByPath.get(input.to);
+      if (recipientId === undefined) {
+        return noChange(
+          state,
+          Result.fail(
+            new AskAgentRejected({
+              reason: "UnknownRecipient",
+              recipient: input.to,
+              message: `No addressable agent exists at ${input.to}; call list_agents and retry with a listed canonical path.`,
+            }),
+          ),
+        );
+      }
+      if (recipientId === callerId) {
+        return noChange(
+          state,
+          Result.fail(
+            new AskAgentRejected({
+              reason: "SelfRecipient",
+              recipient: input.to,
+              message:
+                "An agent cannot ask itself a correlated question; continue reasoning locally instead.",
+            }),
+          ),
+        );
+      }
+      const recipient = state.agents.get(recipientId);
+      if (recipient === undefined) {
+        throw new RegistryInvariantDefect(`Path index points to missing agent ${recipientId}`);
+      }
+      if (recipient.outcome !== undefined) {
+        return noChange(
+          state,
+          Result.fail(
+            new AskAgentRejected({
+              reason: "RecipientTerminal",
+              recipient: input.to,
+              message: `${input.to} is terminal and cannot answer; choose an addressable agent or continue without the clarification.`,
+            }),
+          ),
+        );
+      }
+      const incomingRequests = recipient.inbox.filter(
+        (item) =>
+          item._tag === "Request" && state.requests.get(item.requestId)?.state._tag === "Open",
+      ).length;
+      if (incomingRequests >= MAX_INCOMING_REQUESTS_PER_AGENT) {
+        return noChange(
+          state,
+          Result.fail(
+            new AskAgentRejected({
+              reason: "RecipientRequestCapacityExceeded",
+              recipient: input.to,
+              message: `${input.to} already has ${MAX_INCOMING_REQUESTS_PER_AGENT} open questions; retry later or ask another addressable agent.`,
+            }),
+          ),
+        );
+      }
+      const retainedTargets = Array.from(state.requests.values()).filter(
+        ({ requesterId }) => requesterId === callerId,
+      ).length;
+      if (retainedTargets >= MAX_REQUEST_TARGETS_PER_WAIT) {
+        return noChange(
+          state,
+          Result.fail(
+            new AskAgentRejected({
+              reason: "RequestWaitLimitExceeded",
+              recipient: input.to,
+              message: `This agent already has ${MAX_REQUEST_TARGETS_PER_WAIT} undelivered request outcomes; wait for them before asking another correlated question.`,
+            }),
+          ),
+        );
+      }
+      if (state.requests.has(requestId)) {
+        throw new RegistryInvariantDefect(`Request ID generator reused ${requestId}`);
+      }
+      const sequence = nextSafeCounter(recipient.nextInboxSequence, "Inbox sequence");
+      const wakeGeneration = nextSafeCounter(
+        recipient.requestWakeGeneration,
+        "Request wake generation",
+      );
+      const plannedWaits = new Map(claimed.success.plannedWaits);
+      plannedWaits.set(invocationId, {
+        tool: "ask_agent",
+        dependencies: [],
+        requests: [requestId],
+      });
+      const requests = new Map(state.requests);
+      requests.set(requestId, {
+        id: requestId,
+        requesterId: callerId,
+        recipientId,
+        wakeGeneration,
+        question: input.question,
+        state: { _tag: "Open" },
+      });
+      const agents = new Map(state.agents);
+      agents.set(callerId, { ...claimed.success, plannedWaits, updatedAt: requestedAt });
+      agents.set(recipientId, {
+        ...recipient,
+        inbox: [...recipient.inbox, { _tag: "Request", sequence, requestId, presented: false }],
+        nextInboxSequence: sequence,
+        requestWakeGeneration: wakeGeneration,
+        updatedAt: requestedAt,
+      });
+      return {
+        next: { ...state, agents, requests },
+        actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
+        result: Result.succeed({
+          version: 1,
+          request: requestId,
+          to: recipient.path,
+          recipientState: addressableState(recipient.status),
+          broodControl: { version: 1, kind: "suspend", invocationId },
+        }),
+      };
+    });
+  });
+
+  const inboxProjectionSize = (value: unknown): number => Array.from(JSON.stringify(value)).length;
+
+  const readMessages = Effect.fn("Brood.Registry.readMessages")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReadMessagesInput,
+  ) {
+    const readAt = yield* Clock.currentTimeMillis;
+    const limit = input.limit ?? MAX_INBOX_READ_ITEMS;
+    return yield* transact((state): Transition<ReadMessagesResult, ReadMessagesRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "read_messages",
+        (message) => new ReadMessagesRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+
+      const openRequestEntries = caller.inbox.filter(
+        (item): item is Extract<InboxEntry, { _tag: "Request" }> => {
+          if (item._tag !== "Request") return false;
+          return state.requests.get(item.requestId)?.state._tag === "Open";
+        },
+      );
+      const unpresented = openRequestEntries.filter(({ presented }) => !presented);
+      const presented = openRequestEntries.filter(({ presented: wasPresented }) => wasPresented);
+      const messages = caller.inbox.filter(
+        (item): item is Extract<InboxEntry, { _tag: "Message" }> => item._tag === "Message",
+      );
+      const ordered: ReadonlyArray<InboxEntry> = [...unpresented, ...messages, ...presented];
+      const selected: Array<{
+        readonly source: InboxEntry;
+        readonly item: ReadMessagesResult["items"][number];
+      }> = [];
+      for (const source of ordered) {
+        if (selected.length >= limit) break;
+        const request =
+          source._tag === "Request" ? state.requests.get(source.requestId) : undefined;
+        if (source._tag === "Request" && request === undefined)
+          throw new RegistryInvariantDefect(`Inbox references missing ${source.requestId}`);
+        const senderId = source._tag === "Message" ? source.fromId : request?.requesterId;
+        const sender = senderId === undefined ? undefined : state.agents.get(senderId);
+        if (sender === undefined) {
+          throw new RegistryInvariantDefect("Inbox item has no retained sender attribution");
+        }
+        let item: ReadMessagesResult["items"][number];
+        if (source._tag === "Message") {
+          item = { kind: "message", from: sender.path, message: source.body };
+        } else {
+          if (request === undefined)
+            throw new RegistryInvariantDefect(`Inbox references missing ${source.requestId}`);
+          item = {
+            kind: "request",
+            request: source.requestId,
+            from: sender.path,
+            question: request.question,
+          };
+        }
+        const projectedChars = inboxProjectionSize({
+          items: [...selected.map(({ item: selectedItem }) => selectedItem), item],
+          inbox: {
+            unreadMessages: caller.inbox.length,
+            openRequests: caller.inbox.length,
+            omittedFromPage: ordered.length,
+          },
+        });
+        if (projectedChars + 512 > MAX_TOOL_RESULT_CHARS) break;
+        selected.push({ source, item });
+      }
+      const selectedMessages = new Set(
+        selected.flatMap(({ source }) => (source._tag === "Message" ? [source.sequence] : [])),
+      );
+      const selectedRequests = new Set(
+        selected.flatMap(({ source }) => (source._tag === "Request" ? [source.requestId] : [])),
+      );
+      const inbox = caller.inbox.flatMap((item): ReadonlyArray<InboxEntry> => {
+        if (item._tag === "Message") return selectedMessages.has(item.sequence) ? [] : [item];
+        return [selectedRequests.has(item.requestId) ? { ...item, presented: true } : item];
+      });
+      const unreadMessages = inbox.filter((item) => item._tag === "Message").length;
+      const openRequests = inbox.filter(
+        (item) =>
+          item._tag === "Request" && state.requests.get(item.requestId)?.state._tag === "Open",
+      ).length;
+      const result: ReadMessagesResult = {
+        items: selected.map(({ item }) => item),
+        inbox: {
+          unreadMessages,
+          openRequests,
+          omittedFromPage: ordered.length - selected.length,
+        },
+      };
+      return {
+        next: replaceAgent(state, { ...claimed.success, inbox, updatedAt: readAt }),
+        actions: [],
+        result: Result.succeed(result),
+      };
+    });
+  });
+
+  const replyToRequest = Effect.fn("Brood.Registry.replyToRequest")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReplyToRequestInput,
+  ) {
+    const repliedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<ReplyToRequestResult, ReplyRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "reply_to_request",
+        (message) => new ReplyRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const request = state.requests.get(input.request);
+      if (request === undefined) {
+        return noChange(
+          state,
+          Result.fail(
+            new ReplyRejected({
+              reason: "UnknownOrClosedRequest",
+              request: input.request,
+              message: `Request ${input.request} is unknown or already closed; call read_messages and reply to an open request ID.`,
+            }),
+          ),
+        );
+      }
+      if (request.recipientId !== callerId) {
+        return noChange(
+          state,
+          Result.fail(
+            new ReplyRejected({
+              reason: "NotRecipient",
+              request: input.request,
+              message: `This agent is not the recipient of ${input.request}; only the addressed agent may reply.`,
+            }),
+          ),
+        );
+      }
+      if (request.state._tag === "Replied") {
+        return noChange(
+          state,
+          Result.fail(
+            new ReplyRejected({
+              reason: "AlreadyReplied",
+              request: input.request,
+              message: `Request ${input.request} already has a reply; continue with other work instead of replacing it.`,
+            }),
+          ),
+        );
+      }
+      if (request.state._tag === "Unavailable") {
+        return noChange(
+          state,
+          Result.fail(
+            new ReplyRejected({
+              reason: "UnknownOrClosedRequest",
+              request: input.request,
+              message: `Request ${input.request} is closed because an endpoint became unavailable; call read_messages for other open requests.`,
+            }),
+          ),
+        );
+      }
+      const requester = state.agents.get(request.requesterId);
+      if (requester === undefined || requester.outcome !== undefined) {
+        throw new RegistryInvariantDefect(`Open request ${request.id} has no live requester`);
+      }
+      const requests = new Map(state.requests);
+      requests.set(request.id, { ...request, state: { _tag: "Replied", reply: input.message } });
+      const agents = new Map(state.agents);
+      agents.set(callerId, {
+        ...claimed.success,
+        inbox: caller.inbox.filter(
+          (item) => item._tag !== "Request" || item.requestId !== request.id,
+        ),
+        updatedAt: repliedAt,
+      });
+      let next: RegistryState = { ...state, agents, requests };
+      const actions: Array<PostCommitAction> = [];
+      const currentRequester = next.agents.get(requester.id);
+      if (
+        currentRequester !== undefined &&
+        currentRequester.status === "Waiting" &&
+        activeWaitSatisfied(next, currentRequester)
+      ) {
+        const queued: AgentEntry = { ...currentRequester, status: "Queued", updatedAt: repliedAt };
+        const queuedAgents = new Map(next.agents);
+        queuedAgents.set(queued.id, queued);
+        next = { ...next, agents: queuedAgents };
+        actions.push(PostCommitAction.Open({ latch: queued.mailbox }));
+      }
+      return {
+        next,
+        actions,
+        result: Result.succeed({ request: request.id, to: requester.path }),
+      };
+    });
+  });
+
+  const postBulletin = Effect.fn("Brood.Registry.postBulletin")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: PostBulletinInput,
+  ) {
+    const postedAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<PostBulletinResult, PostBulletinRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "post_bulletin",
+        (message) => new PostBulletinRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const sequence = nextSafeCounter(state.nextBulletinSequence, "Bulletin sequence");
+      const authored = state.bulletins.filter(({ authorId }) => authorId === callerId);
+      const evictedSequence =
+        authored.length >= MAX_BULLETINS_PER_AUTHOR ? authored[0]?.sequence : undefined;
+      const retained =
+        evictedSequence === undefined
+          ? state.bulletins
+          : state.bulletins.filter(({ sequence: candidate }) => candidate !== evictedSequence);
+      return {
+        next: {
+          ...replaceAgent(state, { ...claimed.success, updatedAt: postedAt }),
+          bulletins: [
+            ...retained,
+            {
+              sequence,
+              authorId: callerId,
+              authorPath: caller.path,
+              body: input.message,
+            },
+          ],
+          nextBulletinSequence: sequence,
+        },
+        actions: [],
+        result: Result.succeed({ author: caller.path }),
+      };
+    });
+  });
+
+  const readBulletins = Effect.fn("Brood.Registry.readBulletins")(function* (
+    callerId: AgentId,
+    invocationId: ToolInvocationId,
+    input: ReadBulletinsInput,
+  ) {
+    const readAt = yield* Clock.currentTimeMillis;
+    const limit = input.limit ?? MAX_BULLETIN_READ_ITEMS;
+    return yield* transact((state): Transition<ReadBulletinsResult, ReadBulletinsRejected> => {
+      const caller = callerOrDie(state, callerId);
+      const claimed = withInvocation(
+        caller,
+        invocationId,
+        "read_bulletins",
+        (message) => new ReadBulletinsRejected({ reason: "DuplicateInvocationId", message }),
+      );
+      if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
+      const unseen = state.bulletins.filter(({ sequence }) => sequence > caller.bulletinCursor);
+      const selected: Array<{ readonly record: BulletinRecord; readonly post: BulletinPost }> = [];
+      for (const record of unseen) {
+        if (selected.length >= limit) break;
+        const post: BulletinPost = { author: record.authorPath, message: record.body };
+        const projectedChars = inboxProjectionSize({
+          posts: [...selected.map(({ post: selectedPost }) => selectedPost), post],
+          bulletin: { remaining: unseen.length },
+        });
+        if (projectedChars + 512 > MAX_TOOL_RESULT_CHARS) break;
+        selected.push({ record, post });
+      }
+      const bulletinCursor = selected.at(-1)?.record.sequence ?? caller.bulletinCursor;
+      return {
+        next: replaceAgent(state, { ...claimed.success, bulletinCursor, updatedAt: readAt }),
+        actions: [],
+        result: Result.succeed({
+          posts: selected.map(({ post }) => post),
+          bulletin: {
+            remaining: state.bulletins.filter(({ sequence }) => sequence > bulletinCursor).length,
+          },
+        }),
+      };
     });
   });
 
@@ -560,17 +1487,13 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     const plannedAt = yield* Clock.currentTimeMillis;
     return yield* transact((state): Transition<WaitPlanResult, WaitRejected | UnknownAgent> =>
       withAgent<WaitPlanResult, WaitRejected>(state, input.parentId, (parent) => {
-        if (parent.seenInvocations.has(input.invocationId)) {
-          return noChange(
-            state,
-            Result.fail(
-              new WaitRejected({
-                reason: "DuplicateInvocationId",
-                message: `Control invocation ${input.invocationId} was already committed`,
-              }),
-            ),
-          );
-        }
+        const claimed = withInvocation(
+          parent,
+          input.invocationId,
+          "wait_for_agents",
+          (message) => new WaitRejected({ reason: "DuplicateInvocationId", message }),
+        );
+        if (Result.isFailure(claimed)) return noChange(state, Result.fail(claimed.failure));
         if (input.childNames.length === 0) {
           return noChange(
             state,
@@ -612,19 +1535,22 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           }
         }
 
-        const seenInvocations = new Set(parent.seenInvocations);
-        seenInvocations.add(input.invocationId);
         const canonicalTargetIds = [...targetIds];
         const allTerminal = canonicalTargetIds.every((targetId) => {
           const target = state.agents.get(targetId);
           return target !== undefined && target.outcome !== undefined;
         });
+        const plannedWaits = new Map(claimed.success.plannedWaits);
+        if (!allTerminal) {
+          plannedWaits.set(input.invocationId, {
+            tool: "wait_for_agents",
+            dependencies: canonicalTargetIds,
+            requests: [],
+          });
+        }
         const next = replaceAgent(state, {
-          ...parent,
-          seenInvocations,
-          plannedTargets: allTerminal
-            ? parent.plannedTargets
-            : withTargets(parent.plannedTargets, canonicalTargetIds),
+          ...claimed.success,
+          plannedWaits,
           updatedAt: plannedAt,
         });
 
@@ -639,66 +1565,6 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
                 }
               : { _tag: "Planned", targetIds: canonicalTargetIds },
           ),
-        };
-      }),
-    );
-  });
-
-  const activateWaits = Effect.fn("Brood.Registry.activateWaits")(function* (id: AgentId) {
-    const waitId = nextWaitId();
-    const activatedAt = yield* Clock.currentTimeMillis;
-    return yield* transact((state): Transition<WaitActivation, UnknownAgent> =>
-      withAgent<WaitActivation, never>(state, id, (parent) => {
-        if (parent.status !== "Running") {
-          throw new RegistryInvariantDefect(
-            `Cannot activate waits for ${id} while ${parent.status}`,
-          );
-        }
-        if (parent.plannedTargets.length === 0) {
-          throw new RegistryInvariantDefect(`Suspended agent ${id} has no planned waits`);
-        }
-        if (parent.pendingCommand !== undefined || parent.activeWait !== undefined) {
-          throw new RegistryInvariantDefect(`Agent ${id} already has active mailbox or wait state`);
-        }
-
-        const canonicalTargetIds = [...parent.plannedTargets];
-
-        const allTerminal = canonicalTargetIds.every(
-          (targetId) => state.agents.get(targetId)?.outcome !== undefined,
-        );
-        if (allTerminal) {
-          const command: AgentCommand = {
-            _tag: "Resume",
-            waitId,
-            outcomes: outcomesFor(state, canonicalTargetIds),
-          };
-          const next = replaceAgent(state, {
-            ...parent,
-            status: "Queued",
-            pendingCommand: command,
-            plannedTargets: [],
-            activeWait: undefined,
-            updatedAt: activatedAt,
-          });
-          return {
-            next,
-            actions: [PostCommitAction.Open({ latch: parent.mailbox })],
-            result: Result.succeed({ _tag: "Resumed", waitId, targetIds: canonicalTargetIds }),
-          };
-        }
-
-        const activeWait: ActiveWait = { waitId, targetIds: canonicalTargetIds };
-        const next = replaceAgent(state, {
-          ...parent,
-          status: "Waiting",
-          plannedTargets: [],
-          activeWait,
-          updatedAt: activatedAt,
-        });
-        return {
-          next,
-          actions: [],
-          result: Result.succeed({ _tag: "Waiting", waitId, targetIds: canonicalTargetIds }),
         };
       }),
     );
@@ -746,18 +1612,77 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     });
 
   const QUEUED = new Set<AgentStatus>(["Queued"]);
-  const QUEUED_OR_STARTING = new Set<AgentStatus>(["Queued", "Starting"]);
   const markStarting = Effect.fn("Brood.Registry.markStarting")(function* (id: AgentId) {
     const updatedAt = yield* Clock.currentTimeMillis;
     return yield* transitionStatus(id, QUEUED, "Starting", updatedAt);
   });
-  const markRunning = Effect.fn("Brood.Registry.markRunning")(function* (id: AgentId) {
-    const updatedAt = yield* Clock.currentTimeMillis;
-    return yield* transitionStatus(id, QUEUED_OR_STARTING, "Running", updatedAt);
-  });
+
+  const openIncomingRequests = (
+    state: RegistryState,
+    entry: AgentEntry,
+  ): ReadonlyArray<RequestRecord> =>
+    entry.inbox.flatMap((item) => {
+      if (item._tag !== "Request") return [];
+      const request = state.requests.get(item.requestId);
+      return request?.state._tag === "Open" ? [request] : [];
+    });
+
+  const hasNewOpenRequest = (state: RegistryState, entry: AgentEntry): boolean =>
+    openIncomingRequests(state, entry).some(
+      ({ wakeGeneration }) => wakeGeneration > entry.claimedRequestWakeGeneration,
+    );
+
+  const activeWaitSatisfied = (state: RegistryState, entry: AgentEntry): boolean => {
+    const active = entry.activeWait;
+    if (active === undefined) return false;
+    return (
+      active.dependencies.every((id) => state.agents.get(id)?.outcome !== undefined) &&
+      active.requests.every((id) => {
+        const request = state.requests.get(id);
+        return request !== undefined && request.state._tag !== "Open";
+      })
+    );
+  };
+
+  const coordinationNotice = (state: RegistryState, entry: AgentEntry): AgentCommand["notice"] => {
+    const notice = {
+      unreadMessages: entry.inbox.filter(({ _tag }) => _tag === "Message").length,
+      openRequests: openIncomingRequests(state, entry).length,
+      unseenBulletins: state.bulletins.filter(({ sequence }) => sequence > entry.bulletinCursor)
+        .length,
+    };
+    return notice.unreadMessages === 0 && notice.openRequests === 0 && notice.unseenBulletins === 0
+      ? undefined
+      : notice;
+  };
+
+  const requestOutcomeFor = (state: RegistryState, requestId: RequestId): PeerRequestOutcome => {
+    const request = state.requests.get(requestId);
+    if (request === undefined || request.state._tag === "Open") {
+      throw new RegistryInvariantDefect(`Request ${requestId} is not settled`);
+    }
+    const recipient = state.agents.get(request.recipientId);
+    if (recipient === undefined) {
+      throw new RegistryInvariantDefect(`Request ${requestId} has no recipient`);
+    }
+    if (request.state._tag === "Replied") {
+      return {
+        _tag: "Replied",
+        request: request.id,
+        to: recipient.path,
+        reply: request.state.reply,
+      };
+    }
+    return {
+      _tag: "Unavailable",
+      request: request.id,
+      to: recipient.path,
+      recipientState: request.state.recipientState,
+    };
+  };
 
   type TakeDecision = Data.TaggedEnum<{
-    Command: { readonly command: AgentCommand };
+    Command: { readonly claim: CommandClaim };
     Interrupted: { readonly reason: InterruptReason };
     Empty: Record<never, never>;
   }>;
@@ -772,6 +1697,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       if (current === undefined) return yield* Effect.fail(new UnknownAgent({ agentId: id }));
       yield* Latch.close(current.mailbox);
       const takenAt = yield* Clock.currentTimeMillis;
+      const token = makeCommandToken(nextCommandToken());
 
       const decision = yield* transact((state): Transition<TakeDecision, UnknownAgent> => {
         return withAgent<TakeDecision, never>(state, id, (entry) => {
@@ -781,16 +1707,28 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
               Result.succeed(TakeDecision.Interrupted({ reason: entry.interruptRequested })),
             );
           }
-          if (entry.pendingCommand !== undefined) {
-            const command = entry.pendingCommand;
+          if (entry.claimedCommand !== undefined || entry.runningCommand !== undefined) {
+            throw new RegistryInvariantDefect(`Agent ${id} already owns a command`);
+          }
+          const trigger: CommandTrigger | undefined =
+            entry.initialGoal !== undefined
+              ? "initial"
+              : activeWaitSatisfied(state, entry)
+                ? "wait-satisfied"
+                : hasNewOpenRequest(state, entry)
+                  ? "coordination"
+                  : undefined;
+          if (trigger !== undefined) {
+            const claim: CommandClaim = { token, trigger };
             return {
               next: replaceAgent(state, {
                 ...entry,
-                pendingCommand: undefined,
+                status: "Queued",
+                claimedCommand: claim,
                 updatedAt: takenAt,
               }),
               actions: [],
-              result: Result.succeed(TakeDecision.Command({ command })),
+              result: Result.succeed(TakeDecision.Command({ claim })),
             };
           }
           if (entry.outcome !== undefined) {
@@ -801,29 +1739,162 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       });
 
       const command = yield* TakeDecision.$match(decision, {
-        Command: ({ command: pending }) => Effect.succeed(Option.some(pending)),
+        Command: ({ claim }) => Effect.succeed(Option.some(claim)),
         Interrupted: ({ reason }) =>
           Effect.fail({
             _tag: "CommandInterrupted",
             agentId: id,
             reason,
           } satisfies CommandInterrupted),
-        Empty: () => Latch.await(current.mailbox).pipe(Effect.as(Option.none<AgentCommand>())),
+        Empty: () => Latch.await(current.mailbox).pipe(Effect.as(Option.none<CommandClaim>())),
       });
       if (Option.isSome(command)) return command.value;
     }
   });
 
+  const beginRun = Effect.fn("Brood.Registry.beginRun")(function* (
+    id: AgentId,
+    token: CommandToken,
+  ) {
+    const beganAt = yield* Clock.currentTimeMillis;
+    return yield* transact((state): Transition<BeginRunResult, UnknownAgent | CommandInterrupted> =>
+      withAgent<BeginRunResult, CommandInterrupted>(state, id, (entry) => {
+        const claim = entry.claimedCommand;
+        if (claim === undefined || claim.token !== token || entry.runningCommand !== undefined) {
+          throw new RegistryInvariantDefect(`Command token does not own the next run for ${id}`);
+        }
+        if (entry.interruptRequested !== undefined) {
+          return noChange(
+            state,
+            Result.fail({
+              _tag: "CommandInterrupted",
+              agentId: id,
+              reason: entry.interruptRequested,
+            }),
+          );
+        }
+        const notice = coordinationNotice(state, entry);
+        let command: AgentCommand;
+        let nextState = state;
+        let nextEntry = entry;
+        if (entry.initialGoal !== undefined) {
+          command = {
+            _tag: "InitialGoal",
+            goal: entry.initialGoal,
+            ...(notice === undefined ? {} : { notice }),
+          };
+          nextEntry = { ...entry, initialGoal: undefined };
+        } else if (activeWaitSatisfied(state, entry)) {
+          const active = entry.activeWait;
+          if (active === undefined) {
+            throw new RegistryInvariantDefect(`Satisfied wait claim for ${id} is no longer ready`);
+          }
+          const requests = active.requests.map((requestId) => requestOutcomeFor(state, requestId));
+          command = {
+            _tag: "WaitSatisfied",
+            waitId: active.waitId,
+            dependencies: outcomesFor(state, active.dependencies),
+            requests,
+            ...(notice === undefined ? {} : { notice }),
+          };
+          const retainedRequests = new Map(state.requests);
+          for (const requestId of active.requests) retainedRequests.delete(requestId);
+          nextState = { ...state, requests: retainedRequests };
+          nextEntry = { ...entry, activeWait: undefined };
+        } else if (hasNewOpenRequest(state, entry)) {
+          const requiredNotice = notice ?? {
+            unreadMessages: 0,
+            openRequests: openIncomingRequests(state, entry).length,
+            unseenBulletins: 0,
+          };
+          const active = entry.activeWait;
+          command = {
+            _tag: "CoordinationWake",
+            notice: requiredNotice,
+            waitingFor: {
+              agentCompletions:
+                active?.dependencies.filter(
+                  (dependency) => state.agents.get(dependency)?.outcome === undefined,
+                ).length ?? 0,
+              replies:
+                active?.requests.filter(
+                  (requestId) => state.requests.get(requestId)?.state._tag === "Open",
+                ).length ?? 0,
+            },
+          };
+        } else {
+          if (entry.activeWait === undefined) {
+            if (entry.pendingCompletedResult === undefined) {
+              throw new RegistryInvariantDefect(
+                `Stale command for ${id} has neither an active wait nor a deferred completion`,
+              );
+            }
+            const fallback: AgentOutcome = {
+              _tag: "Completed",
+              result: entry.pendingCompletedResult,
+            };
+            const cleared = replaceAgent(state, {
+              ...entry,
+              claimedCommand: undefined,
+              updatedAt: beganAt,
+            });
+            const settled = settleTransition(cleared, id, fallback, beganAt, false);
+            if (Result.isFailure(settled.result)) {
+              throw new RegistryInvariantDefect(`Stale agent ${id} disappeared during settlement`);
+            }
+            const committed = Option.getOrUndefined(settled.result.success);
+            if (committed === undefined) {
+              throw new RegistryInvariantDefect(`Stale agent ${id} was already settled`);
+            }
+            return {
+              ...settled,
+              result: Result.succeed({ _tag: "Settled", outcome: committed }),
+            };
+          }
+          return {
+            next: replaceAgent(state, {
+              ...entry,
+              status: "Waiting",
+              claimedCommand: undefined,
+              updatedAt: beganAt,
+            }),
+            actions: [],
+            result: Result.succeed({ _tag: "Stale", status: "Waiting" }),
+          };
+        }
+        const runningCommand: RunningCommand = {
+          token,
+        };
+        nextEntry = {
+          ...nextEntry,
+          status: "Running",
+          claimedCommand: undefined,
+          runningCommand,
+          pendingCompletedResult: undefined,
+          claimedRequestWakeGeneration: entry.requestWakeGeneration,
+          turnInvocations: new Map(),
+          plannedWaits: new Map(),
+          updatedAt: beganAt,
+        };
+        return {
+          next: replaceAgent(nextState, nextEntry),
+          actions: [],
+          result: Result.succeed({ _tag: "Ready", command }),
+        };
+      }),
+    );
+  });
+
   // ── Terminal settlement ──────────────────────────────────────────────────
 
-  const settleTransition = (
+  function settleTransition(
     state: RegistryState,
     id: AgentId,
     requestedOutcome: AgentOutcome,
     settledAt: number,
     onlyIfPendingInstallation: boolean,
-  ): Transition<Option.Option<AgentOutcome>, UnknownAgent> =>
-    withAgent<Option.Option<AgentOutcome>, never>(state, id, (entry) => {
+  ): Transition<Option.Option<AgentOutcome>, UnknownAgent> {
+    return withAgent<Option.Option<AgentOutcome>, never>(state, id, (entry) => {
       if (entry.outcome !== undefined) return noChange(state, Result.succeed(Option.none()));
       if (onlyIfPendingInstallation && entry.installation !== "Pending") {
         return noChange(state, Result.succeed(Option.none()));
@@ -837,43 +1908,72 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         ...entry,
         status: outcome._tag,
         installation: "Installed",
-        pendingCommand: undefined,
-        plannedTargets: [],
+        initialGoal: undefined,
+        claimedCommand: undefined,
+        runningCommand: undefined,
+        pendingCompletedResult: undefined,
+        turnInvocations: new Map(),
+        plannedWaits: new Map(),
         activeWait: undefined,
+        activity: undefined,
+        inbox: [],
         outcome,
         updatedAt: settledAt,
         terminalAt: settledAt,
       };
-      let next = replaceAgent(state, settled);
+      let agents = new Map(state.agents);
+      agents.set(id, settled);
+      const requests = new Map(state.requests);
       const actions: Array<PostCommitAction> = [
         PostCommitAction.Complete({ deferred: entry.completion, outcome }),
         PostCommitAction.Open({ latch: entry.mailbox }),
       ];
-      const parent = entry.parentId === undefined ? undefined : next.agents.get(entry.parentId);
-      if (
-        parent?.activeWait !== undefined &&
-        parent.activeWait.targetIds.includes(id) &&
-        parent.activeWait.targetIds.every(
-          (targetId) => next.agents.get(targetId)?.outcome !== undefined,
-        )
-      ) {
-        if (parent.pendingCommand !== undefined) {
-          throw new RegistryInvariantDefect(`Satisfied wait for ${parent.id} found a full mailbox`);
+      let recipientTerminalState: "completed" | "failed" | "interrupted";
+      switch (outcome._tag) {
+        case "Completed":
+          recipientTerminalState = "completed";
+          break;
+        case "Failed":
+          recipientTerminalState = "failed";
+          break;
+        case "Interrupted":
+          recipientTerminalState = "interrupted";
+          break;
+      }
+      for (const request of state.requests.values()) {
+        if (request.requesterId === id) {
+          requests.delete(request.id);
+          const recipient = agents.get(request.recipientId);
+          if (recipient !== undefined && recipient.outcome === undefined) {
+            agents.set(recipient.id, {
+              ...recipient,
+              inbox: recipient.inbox.filter(
+                (item) => item._tag !== "Request" || item.requestId !== request.id,
+              ),
+              updatedAt: settledAt,
+            });
+          }
+          continue;
         }
-        if (parent.interruptRequested === undefined) {
-          const command: AgentCommand = {
-            _tag: "Resume",
-            waitId: parent.activeWait.waitId,
-            outcomes: outcomesFor(next, parent.activeWait.targetIds),
-          };
-          next = replaceAgent(next, {
-            ...parent,
-            status: "Queued",
-            pendingCommand: command,
-            activeWait: undefined,
-            updatedAt: settledAt,
+        if (request.recipientId === id && request.state._tag === "Open") {
+          requests.set(request.id, {
+            ...request,
+            state: { _tag: "Unavailable", recipientState: recipientTerminalState },
           });
-          actions.push(PostCommitAction.Open({ latch: parent.mailbox }));
+        }
+      }
+      let next: RegistryState = { ...state, agents, requests };
+      for (const candidate of agents.values()) {
+        if (
+          candidate.status === "Waiting" &&
+          candidate.interruptRequested === undefined &&
+          activeWaitSatisfied(next, candidate)
+        ) {
+          const queued: AgentEntry = { ...candidate, status: "Queued", updatedAt: settledAt };
+          agents = new Map(agents);
+          agents.set(candidate.id, queued);
+          next = { ...next, agents };
+          actions.push(PostCommitAction.Open({ latch: candidate.mailbox }));
         }
       }
       const nonterminalCount = state.nonterminalCount - 1;
@@ -889,10 +1989,186 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         result: Result.succeed(Option.some(outcome)),
       };
     });
+  }
 
   const settle = Effect.fn("Brood.Registry.settle")(function* (id: AgentId, outcome: AgentOutcome) {
     const settledAt = yield* Clock.currentTimeMillis;
     return yield* transact((state) => settleTransition(state, id, outcome, settledAt, false));
+  });
+
+  const finishTurn = Effect.fn("Brood.Registry.finishTurn")(function* (input: FinishTurnInput) {
+    const finishedAt = yield* Clock.currentTimeMillis;
+    const freshWaitId = nextWaitId();
+    return yield* transact((state): Transition<FinishTurnDecision, PiProtocolError> => {
+      const entry = state.agents.get(input.agentId);
+      if (entry === undefined) {
+        throw new RegistryInvariantDefect(`Missing running agent ${input.agentId}`);
+      }
+      if (entry.outcome !== undefined) {
+        return noChange(
+          state,
+          Result.succeed(FinishTurnDecision.Settled({ outcome: entry.outcome })),
+        );
+      }
+      const running = entry.runningCommand;
+      if (running === undefined || running.token !== input.commandToken) {
+        throw new RegistryInvariantDefect(`Command token does not own the running turn`);
+      }
+
+      const protocolError = (message: string) =>
+        noChange(state, Result.fail(new PiProtocolError({ agentId: input.agentId, message })));
+      let activeWait = entry.activeWait;
+      if (input.piOutcome._tag === "Completed") {
+        if (entry.plannedWaits.size > 0) {
+          return protocolError(
+            "The Pi run completed without reporting every successful suspending Brood operation.",
+          );
+        }
+      } else {
+        const seenMarkers = new Set<ToolInvocationId>();
+        for (const marker of input.piOutcome.markers) {
+          if (seenMarkers.has(marker.invocationId)) {
+            return protocolError(
+              `Suspension marker ${marker.invocationId} appeared more than once in one turn.`,
+            );
+          }
+          seenMarkers.add(marker.invocationId);
+          const planned = entry.plannedWaits.get(marker.invocationId);
+          if (planned === undefined) {
+            return protocolError(
+              `Suspension marker ${marker.invocationId} has no matching registry plan in this turn.`,
+            );
+          }
+          if (marker._tag === "AgentWait") {
+            if (planned.tool !== marker.tool || planned.requests.length > 0) {
+              return protocolError(
+                `Suspension marker ${marker.invocationId} does not match its planned ${planned.tool} operation.`,
+              );
+            }
+          } else if (
+            planned.tool !== "ask_agent" ||
+            planned.requests.length !== 1 ||
+            planned.requests[0] !== marker.request
+          ) {
+            return protocolError(
+              `Request marker ${marker.invocationId} does not match its planned request.`,
+            );
+          }
+          const base =
+            activeWait ??
+            ({ waitId: freshWaitId, dependencies: [], requests: [] } satisfies ActiveWait);
+          activeWait = {
+            ...base,
+            dependencies: withTargets(base.dependencies, planned.dependencies),
+            requests: withTargets(base.requests, planned.requests),
+          };
+        }
+        if (seenMarkers.size !== entry.plannedWaits.size) {
+          const missing = Array.from(entry.plannedWaits.keys()).filter(
+            (invocationId) => !seenMarkers.has(invocationId),
+          );
+          return protocolError(
+            `The suspended Pi run omitted planned Brood marker${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}.`,
+          );
+        }
+        if (activeWait === undefined) {
+          return protocolError("The Pi run suspended without any activated wait target.");
+        }
+      }
+
+      const reconciled: AgentEntry = {
+        ...entry,
+        runningCommand: undefined,
+        turnInvocations: new Map(),
+        plannedWaits: new Map(),
+        activeWait,
+        updatedAt: finishedAt,
+      };
+      const reconciledState = replaceAgent(state, reconciled);
+      if (entry.interruptRequested !== undefined) {
+        const settled = settleTransition(
+          reconciledState,
+          entry.id,
+          { _tag: "Interrupted", reason: entry.interruptRequested },
+          finishedAt,
+          false,
+        );
+        if (Result.isFailure(settled.result)) {
+          throw new RegistryInvariantDefect(`Running agent ${entry.id} disappeared during finish`);
+        }
+        const committed = Option.getOrUndefined(settled.result.success);
+        if (committed === undefined) {
+          throw new RegistryInvariantDefect(`Running agent ${entry.id} was already settled`);
+        }
+        return {
+          ...settled,
+          result: Result.succeed(FinishTurnDecision.Settled({ outcome: committed })),
+        };
+      }
+      if (activeWaitSatisfied(reconciledState, reconciled)) {
+        return {
+          next: replaceAgent(reconciledState, { ...reconciled, status: "Queued" }),
+          actions: [PostCommitAction.Open({ latch: reconciled.mailbox })],
+          result: Result.succeed(FinishTurnDecision.RunNext()),
+        };
+      }
+      if (hasNewOpenRequest(reconciledState, reconciled)) {
+        const pendingCompletedResult =
+          input.piOutcome._tag === "Completed" && "completedResult" in input
+            ? input.completedResult
+            : undefined;
+        return {
+          next: replaceAgent(reconciledState, {
+            ...reconciled,
+            status: "Queued",
+            pendingCompletedResult,
+          }),
+          actions: [PostCommitAction.Open({ latch: reconciled.mailbox })],
+          result: Result.succeed(FinishTurnDecision.RunNext()),
+        };
+      }
+      if (reconciled.activeWait !== undefined) {
+        const unresolvedDependencies = reconciled.activeWait.dependencies.filter(
+          (dependency) => reconciledState.agents.get(dependency)?.outcome === undefined,
+        );
+        const unresolvedRequestRecipients = reconciled.activeWait.requests.flatMap((requestId) => {
+          const request = reconciledState.requests.get(requestId);
+          if (request === undefined) {
+            throw new RegistryInvariantDefect(`Active wait references missing ${requestId}`);
+          }
+          return request.state._tag === "Open" ? [request.recipientId] : [];
+        });
+        return {
+          next: replaceAgent(reconciledState, { ...reconciled, status: "Waiting" }),
+          actions: [],
+          result: Result.succeed(
+            FinishTurnDecision.Park({
+              waitId: reconciled.activeWait.waitId,
+              targetIds: withTargets(unresolvedDependencies, unresolvedRequestRecipients),
+            }),
+          ),
+        };
+      }
+      if (input.piOutcome._tag !== "Completed") {
+        return protocolError("The Pi run suspended without leaving an active wait.");
+      }
+      if (!("completedResult" in input)) {
+        throw new RegistryInvariantDefect("Completed turn has no normalized agent result");
+      }
+      const completed: AgentOutcome = { _tag: "Completed", result: input.completedResult };
+      const settled = settleTransition(reconciledState, entry.id, completed, finishedAt, false);
+      if (Result.isFailure(settled.result)) {
+        throw new RegistryInvariantDefect(`Running agent ${entry.id} disappeared during finish`);
+      }
+      const committed = Option.getOrUndefined(settled.result.success);
+      if (committed === undefined) {
+        throw new RegistryInvariantDefect(`Running agent ${entry.id} was already settled`);
+      }
+      return {
+        ...settled,
+        result: Result.succeed(FinishTurnDecision.Settled({ outcome: committed })),
+      };
+    });
   });
 
   const awaitOutcome = Effect.fn("Brood.Registry.awaitOutcome")(function* (id: AgentId) {
@@ -997,21 +2273,41 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
   const snapshot = Ref.get(stateRef).pipe(
     Effect.map((state): RegistrySnapshot => {
-      const agents = Array.from(state.agents.values(), (entry): AgentSnapshot => ({
-        id: entry.id,
-        name: entry.name,
-        parentId: entry.parentId,
-        profile: entry.profile,
-        status: entry.status,
-        installation: entry.installation,
-        waitTargets: waitTargets(entry),
-        hasPendingCommand: entry.pendingCommand !== undefined,
-        interruptRequested: entry.interruptRequested,
-        outcome: entry.outcome,
-        createdAt: entry.createdAt,
-        updatedAt: entry.updatedAt,
-        terminalAt: entry.terminalAt,
-      }));
+      const agents = Array.from(state.agents.values(), (entry): AgentSnapshot => {
+        const dependencyIds = withTargets(
+          entry.activeWait?.dependencies ?? [],
+          plannedDependencies(entry),
+        );
+        const requestIds = withTargets(entry.activeWait?.requests ?? [], plannedRequests(entry));
+        const requestRecipientIds = requestIds.map((requestId) => {
+          const request = state.requests.get(requestId);
+          if (request === undefined) {
+            throw new RegistryInvariantDefect(`Wait references missing request ${requestId}`);
+          }
+          return request.recipientId;
+        });
+        return {
+          id: entry.id,
+          name: entry.name,
+          path: entry.path,
+          parentId: entry.parentId,
+          profile: entry.profile,
+          status: entry.status,
+          installation: entry.installation,
+          waitTargets: withTargets(dependencyIds, requestRecipientIds),
+          hasPendingCommand:
+            entry.initialGoal !== undefined ||
+            entry.claimedCommand !== undefined ||
+            activeWaitSatisfied(state, entry) ||
+            hasNewOpenRequest(state, entry),
+          interruptRequested: entry.interruptRequested,
+          outcome: entry.outcome,
+          createdAt: entry.createdAt,
+          updatedAt: entry.updatedAt,
+          terminalAt: entry.terminalAt,
+          activity: entry.activity,
+        };
+      });
       return {
         agents,
         rootId: state.rootId,
@@ -1020,6 +2316,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         pendingInstallationCount: agents.filter(({ installation }) => installation === "Pending")
           .length,
         admissionCapacity: capacityOf(state),
+        retainedBulletinCount: state.bulletins.length,
       };
     }),
   );
@@ -1028,13 +2325,21 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     registerRoot,
     registerBatch,
     admissionCapacity,
+    listAgents,
+    setActivity,
+    sendMessage,
+    askAgent,
+    readMessages,
+    replyToRequest,
+    postBulletin,
+    readBulletins,
     settle,
     planWait,
-    activateWaits,
     markInstalled,
     markStarting,
-    markRunning,
     takePendingCommand,
+    beginRun,
+    finishTurn,
     awaitOutcome,
     requestInterrupt,
     beginShutdown,
