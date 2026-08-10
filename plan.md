@@ -220,10 +220,10 @@ The existing `maxResumePromptChars` remains configurable because it governs broa
 
 ```ts
 existingDependencyMinimum(maxAgentAdmissions) +
-  MAX_REQUEST_TARGETS_PER_WAIT * (MAX_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS);
+  MAX_REQUEST_TARGETS_PER_WAIT * (MAX_ENCODED_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS);
 ```
 
-`MAX_REQUEST_OUTCOME_HEADER_CHARS` is derived by rendering the longest fixed header with maximum-length trusted identifiers, not guessed independently. The default configuration must continue to pass this bound; adjust the fixed constants rather than adding another configuration knob if it does not.
+`MAX_ENCODED_REPLY_CHARS` is derived by passing the worst-case accepted reply through the real XML encoder (`&` expands to `&amp;`), not by assuming encoded length equals input code-point length. `MAX_REQUEST_OUTCOME_HEADER_CHARS` is likewise derived by rendering the longest fixed header with maximum-length trusted identifiers. The default configuration is `minimumResumePromptChars(128)` so its default admission limit remains coherent; adjust fixed constants rather than adding another configuration knob if that changes.
 
 ## 6. Boundary vocabulary
 
