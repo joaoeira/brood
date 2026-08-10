@@ -10,6 +10,7 @@ import type { AssistantMessage, StopReason, ToolResultMessage } from "@earendil-
 import { contentText } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+  createCodingTools,
   createAgentSession,
   DefaultResourceLoader,
   type AgentSessionEvent,
@@ -26,8 +27,9 @@ import {
   PiProtocolError,
   PiRunError,
   WaitToolDetails,
-  type PiRunOutcome,
 } from "./agent.js";
+import { AskAgentToolDetails } from "./communication.js";
+import type { PiRunOutcome, SuspensionMarker } from "./control.js";
 import type { ResolvedModelProfile } from "./profiles.js";
 
 export interface PiSessionEvent {
@@ -88,7 +90,9 @@ export class ConcurrentPiRunDefect extends Error {
 
 export type ControlInspection = Data.TaggedEnum<{
   Continue: Record<never, never>;
-  Suspend: Record<never, never>;
+  Suspend: {
+    readonly markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>];
+  };
   Malformed: { readonly error: PiProtocolError };
 }>;
 
@@ -98,48 +102,108 @@ export const inspectControlToolResults = (
   agentId: AgentId,
   toolResults: ReadonlyArray<ToolResultMessage>,
 ): ControlInspection => {
-  let suspend = false;
+  const markers: Array<SuspensionMarker> = [];
+  const malformed = (message: string): ControlInspection =>
+    ControlInspection.Malformed({
+      error: new PiProtocolError({
+        agentId,
+        message,
+      }),
+    });
   for (const result of toolResults) {
-    if (result.toolName !== "delegate" && result.toolName !== "wait_for_agents") continue;
-    if (result.isError) continue;
-    const malformed = (message: string): ControlInspection =>
-      ControlInspection.Malformed({
-        error: new PiProtocolError({
-          agentId,
-          message,
-        }),
-      });
-    let control;
-    if (result.toolName === "delegate") {
-      const decoded = Schema.decodeUnknownResult(DelegateToolDetails)(result.details);
-      if (Result.isFailure(decoded)) {
-        return malformed(
-          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
-        );
-      }
-      control = decoded.success.broodControl;
-    } else {
-      const decoded = Schema.decodeUnknownResult(WaitToolDetails)(result.details);
-      if (Result.isFailure(decoded)) {
-        return malformed(
-          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
-        );
-      }
-      control = decoded.success.broodControl;
+    if (
+      result.toolName !== "delegate" &&
+      result.toolName !== "wait_for_agents" &&
+      result.toolName !== "ask_agent"
+    ) {
+      continue;
     }
+    if (result.isError) continue;
+
+    if (result.toolName === "delegate") {
+      const decoded = Schema.decodeUnknownResult(DelegateToolDetails, {
+        onExcessProperty: "error",
+      })(result.details);
+      if (Result.isFailure(decoded)) {
+        return malformed(
+          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
+        );
+      }
+      const control = decoded.success.broodControl;
+      if (control.invocationId !== result.toolCallId) {
+        return malformed(
+          `${result.toolName} invocation ${control.invocationId} does not match tool call ${result.toolCallId}`,
+        );
+      }
+      if (control.kind === "suspend") {
+        markers.push({
+          _tag: "AgentWait",
+          tool: "delegate",
+          invocationId: control.invocationId,
+        });
+      }
+      continue;
+    }
+
+    if (result.toolName === "wait_for_agents") {
+      const decoded = Schema.decodeUnknownResult(WaitToolDetails, {
+        onExcessProperty: "error",
+      })(result.details);
+      if (Result.isFailure(decoded)) {
+        return malformed(
+          `Malformed ${result.toolName} control details: ${String(decoded.failure)}`,
+        );
+      }
+      const control = decoded.success.broodControl;
+      if (control.invocationId !== result.toolCallId) {
+        return malformed(
+          `${result.toolName} invocation ${control.invocationId} does not match tool call ${result.toolCallId}`,
+        );
+      }
+      if (control.kind === "suspend") {
+        markers.push({
+          _tag: "AgentWait",
+          tool: "wait_for_agents",
+          invocationId: control.invocationId,
+        });
+      }
+      continue;
+    }
+
+    const decoded = Schema.decodeUnknownResult(AskAgentToolDetails, {
+      onExcessProperty: "error",
+    })(result.details);
+    if (Result.isFailure(decoded)) {
+      return malformed(`Malformed ${result.toolName} control details: ${String(decoded.failure)}`);
+    }
+    const { broodControl: control, request } = decoded.success;
     if (control.invocationId !== result.toolCallId) {
       return malformed(
         `${result.toolName} invocation ${control.invocationId} does not match tool call ${result.toolCallId}`,
       );
     }
-    suspend = suspend || control.kind === "suspend";
+    if (control.kind !== "suspend") {
+      return malformed("Successful ask_agent control details must suspend the caller");
+    }
+    markers.push({
+      _tag: "RequestWait",
+      tool: "ask_agent",
+      invocationId: control.invocationId,
+      request,
+    });
   }
-  return suspend ? ControlInspection.Suspend() : ControlInspection.Continue();
+  const [first, ...rest] = markers;
+  return first === undefined
+    ? ControlInspection.Continue()
+    : ControlInspection.Suspend({ markers: [first, ...rest] });
 };
 
 type Suspension = Data.TaggedEnum<{
   None: Record<never, never>;
-  Marked: { readonly turn: AssistantMessage };
+  Marked: {
+    readonly turn: AssistantMessage;
+    readonly markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>];
+  };
   Continued: Record<never, never>;
 }>;
 
@@ -214,12 +278,20 @@ const classifySettledRun = (
     );
   }
   if (state.suspension._tag === "Marked") {
+    if (turn !== state.suspension.turn) {
+      return Effect.fail(
+        new PiProtocolError({
+          agentId,
+          message: "Pi settled on a different assistant turn after a suspension marker",
+        }),
+      );
+    }
     if (state.suspension.turn.stopReason !== "toolUse") {
       return Effect.fail(
         new PiProtocolError({ agentId, message: "Suspension marker was not on a toolUse turn" }),
       );
     }
-    return Effect.succeed({ _tag: "Suspended" });
+    return Effect.succeed({ _tag: "Suspended", markers: state.suspension.markers });
   }
 
   const stopReason: StopReason = turn.stopReason;
@@ -308,6 +380,21 @@ const secureDirectory = (path: string, agentId: AgentId): Effect.Effect<void, Pi
 
 export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
   open: Effect.fn("Brood.PiAdapter.open")(function* (request) {
+    const builtInToolNames = createCodingTools(options.workspacePath).map(({ name }) => name);
+    const expectedTools = [...builtInToolNames, ...request.tools.map(({ name }) => name)];
+    const seenToolNames = new Set<string>();
+    for (const name of expectedTools) {
+      if (seenToolNames.has(name)) {
+        return yield* Effect.fail(
+          new PiOpenError({
+            agentId: request.agentId,
+            message: `Duplicate Pi tool name: ${name}. Every built-in and custom tool name must be unique.`,
+          }),
+        );
+      }
+      seenToolNames.add(name);
+    }
+
     const agentSessionDirectory = join(options.sessionDirectory, request.agentId);
     yield* Effect.forEach(
       [options.piAgentDirectory, agentSessionDirectory],
@@ -389,8 +476,8 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
         session.agent.shouldStopAfterTurn = ({ message, toolResults }) =>
           ControlInspection.$match(inspectControlToolResults(request.agentId, toolResults), {
             Continue: () => false,
-            Suspend: () => {
-              classifier.suspension = Suspension.Marked({ turn: message });
+            Suspend: ({ markers }) => {
+              classifier.suspension = Suspension.Marked({ turn: message, markers });
               return true;
             },
             Malformed: ({ error }) => {
@@ -470,7 +557,6 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
         session.thinkingLevel === request.profile.public.thinkingLevel,
       `Pi session profile mismatch for ${request.agentId}`,
     );
-    const expectedTools = ["read", "bash", "edit", "write", "delegate", "wait_for_agents"];
     const activeTools = session.getActiveToolNames();
     const sortedActiveTools = [...activeTools].sort();
     const sortedExpectedTools = [...expectedTools].sort();

@@ -1,4 +1,6 @@
 // Plain Vitest is intentional: these tests execute the pinned Pi SDK's real control loop.
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { agentLoop } from "@earendil-works/pi-agent-core";
@@ -8,9 +10,17 @@ import type {
   Message,
   Model,
   ModelThinkingLevel,
+  ToolResultMessage,
   UserMessage,
 } from "@earendil-works/pi-ai";
-import { clampThinkingLevel, EventStream, StringEnum } from "@earendil-works/pi-ai";
+import {
+  clampThinkingLevel,
+  EventStream,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+  StringEnum,
+} from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -19,6 +29,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Schema } from "effect";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 
@@ -103,6 +114,11 @@ const identityConverter = (messages: AgentMessage[]): Message[] =>
       message.role === "user" || message.role === "assistant" || message.role === "toolResult",
   ) as Message[];
 
+class CompatibilityToolRejected extends Schema.TaggedError<CompatibilityToolRejected>()(
+  "CompatibilityToolRejected",
+  { message: Schema.String },
+) {}
+
 describe("pinned Pi SDK compatibility", () => {
   it("constructs a provider-safe runtime profile enum", () => {
     const profileNames: ReadonlyArray<string> = ["worker", "researcher"];
@@ -175,6 +191,178 @@ describe("pinned Pi SDK compatibility", () => {
     expect(executions).toEqual(["first", "second"]);
   });
 
+  it("returns ordinary parallel-tool results in assistant source order", async () => {
+    const parameters = Type.Object({});
+    let releaseFirst = (): void => undefined;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const first: AgentTool<typeof parameters, { value: string }> = {
+      name: "first",
+      label: "First",
+      description: "Completes after second",
+      parameters,
+      execute: async () => {
+        await firstMayFinish;
+        return {
+          content: [{ type: "text", text: "first result" }],
+          details: { value: "first" },
+        };
+      },
+    };
+    const second: AgentTool<typeof parameters, { value: string }> = {
+      name: "second",
+      label: "Second",
+      description: "Completes first",
+      parameters,
+      execute: async () => {
+        releaseFirst();
+        return {
+          content: [{ type: "text", text: "second result" }],
+          details: { value: "second" },
+        };
+      },
+    };
+    const context: AgentContext = { systemPrompt: "", messages: [], tools: [first, second] };
+    let observedResults: ReadonlyArray<ToolResultMessage> = [];
+    const stream = agentLoop(
+      [createUserMessage("run both")],
+      context,
+      {
+        model: createModel(),
+        convertToLlm: identityConverter,
+        shouldStopAfterTurn: ({ toolResults }) => {
+          observedResults = toolResults;
+          return true;
+        },
+      },
+      undefined,
+      () => {
+        const response = new MockAssistantStream();
+        queueMicrotask(() => {
+          const message = createAssistantMessage(
+            [
+              { type: "toolCall", id: "first-call", name: "first", arguments: {} },
+              { type: "toolCall", id: "second-call", name: "second", arguments: {} },
+            ],
+            "toolUse",
+          );
+          response.push({ type: "done", reason: "toolUse", message });
+        });
+        return response;
+      },
+    );
+
+    await stream.result();
+
+    expect(observedResults.map(({ toolCallId }) => toolCallId)).toEqual([
+      "first-call",
+      "second-call",
+    ]);
+    expect(observedResults.map(({ details }) => details)).toEqual([
+      { value: "first" },
+      { value: "second" },
+    ]);
+  });
+
+  it("turns a thrown typed tool error into its complete message and empty details", async () => {
+    const parameters = Type.Object({});
+    const tool: AgentTool<typeof parameters, Record<never, never>> = {
+      name: "reject",
+      label: "Reject",
+      description: "Throws a typed error",
+      parameters,
+      execute: async () => {
+        throw new CompatibilityToolRejected({
+          message: "The requested peer is terminal; choose an addressable peer and retry.",
+        });
+      },
+    };
+    const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+    let observedResult: ToolResultMessage | undefined;
+    const stream = agentLoop(
+      [createUserMessage("reject")],
+      context,
+      {
+        model: createModel(),
+        convertToLlm: identityConverter,
+        shouldStopAfterTurn: ({ toolResults }) => {
+          observedResult = toolResults[0];
+          return true;
+        },
+      },
+      undefined,
+      () => {
+        const response = new MockAssistantStream();
+        queueMicrotask(() => {
+          const message = createAssistantMessage(
+            [{ type: "toolCall", id: "reject-call", name: "reject", arguments: {} }],
+            "toolUse",
+          );
+          response.push({ type: "done", reason: "toolUse", message });
+        });
+        return response;
+      },
+    );
+
+    await stream.result();
+
+    expect(observedResult).toMatchObject({
+      toolCallId: "reject-call",
+      toolName: "reject",
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: "The requested peer is terminal; choose an addressable peer and retry.",
+        },
+      ],
+      details: {},
+    });
+  });
+
+  it("does not poll steering again after shouldStopAfterTurn accepts a tool turn", async () => {
+    const parameters = Type.Object({});
+    const tool: AgentTool<typeof parameters, Record<never, never>> = {
+      name: "stop",
+      label: "Stop",
+      description: "Produces a stopping tool result",
+      parameters,
+      execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+    };
+    const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+    let steeringPolls = 0;
+    const stream = agentLoop(
+      [createUserMessage("stop")],
+      context,
+      {
+        model: createModel(),
+        convertToLlm: identityConverter,
+        getSteeringMessages: async () => {
+          steeringPolls += 1;
+          return [];
+        },
+        shouldStopAfterTurn: () => true,
+      },
+      undefined,
+      () => {
+        const response = new MockAssistantStream();
+        queueMicrotask(() => {
+          const message = createAssistantMessage(
+            [{ type: "toolCall", id: "stop-call", name: "stop", arguments: {} }],
+            "toolUse",
+          );
+          response.push({ type: "done", reason: "toolUse", message });
+        });
+        return response;
+      },
+    );
+
+    await stream.result();
+
+    expect(steeringPolls).toBe(1);
+  });
+
   it("accepts the model, thinking, tools, hook, and cleanup surfaces Brood needs", async () => {
     const modelRuntime = await ModelRuntime.create({
       modelsPath: null,
@@ -229,5 +417,103 @@ describe("pinned Pi SDK compatibility", () => {
 
     await session.abort();
     session.dispose();
+  });
+
+  it("persists successful tool details before shouldStopAfterTurn runs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "brood-pi-compat-persistence-"));
+    try {
+      const faux = fauxProvider({
+        provider: "compat-persistence",
+        models: [{ id: "scripted-small" }],
+      });
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("persist", {}, { id: "persist-call" }), {
+          stopReason: "toolUse",
+        }),
+      ]);
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+      modelRuntime.registerNativeProvider(faux.provider);
+      await modelRuntime.setRuntimeApiKey("compat-persistence", "offline-test-key");
+      await modelRuntime.refresh({ allowNetwork: false, providers: ["compat-persistence"] });
+      const model = modelRuntime.getModel("compat-persistence", "scripted-small");
+      expect(model).toBeDefined();
+      if (model === undefined) return;
+
+      const settingsManager = SettingsManager.inMemory();
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: directory,
+        agentDir: join(directory, "agent"),
+        settingsManager,
+        noExtensions: true,
+        noPromptTemplates: true,
+        noSkills: true,
+        noThemes: true,
+        noContextFiles: true,
+        systemPromptOverride: () => "Compatibility persistence test",
+      });
+      await resourceLoader.reload();
+      const tool = defineTool({
+        name: "persist",
+        label: "Persist",
+        description: "Return machine-readable details",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        execute: async () => ({
+          content: [{ type: "text" as const, text: "persisted" }],
+          details: { kind: "marker", request: "request_compat" },
+        }),
+      });
+      const { session } = await createAgentSession({
+        cwd: directory,
+        agentDir: join(directory, "agent"),
+        modelRuntime,
+        model,
+        thinkingLevel: "off",
+        customTools: [tool],
+        resourceLoader,
+        sessionManager: SessionManager.create(directory, join(directory, "sessions")),
+        settingsManager,
+      });
+      try {
+        let stateContainedResult = false;
+        let persistedContainedResult = false;
+        session.agent.shouldStopAfterTurn = async ({ context, toolResults }) => {
+          stateContainedResult =
+            toolResults.some(
+              (result) =>
+                result.toolCallId === "persist-call" &&
+                typeof result.details === "object" &&
+                result.details !== null &&
+                Reflect.get(result.details, "request") === "request_compat",
+            ) &&
+            context.messages.some(
+              (message) => message.role === "toolResult" && message.toolCallId === "persist-call",
+            ) &&
+            session.messages.some(
+              (message) => message.role === "toolResult" && message.toolCallId === "persist-call",
+            );
+          const sessionFile = session.sessionFile;
+          if (sessionFile !== undefined) {
+            const persisted = await readFile(sessionFile, "utf8");
+            persistedContainedResult =
+              persisted.includes('"toolCallId":"persist-call"') &&
+              persisted.includes('"request":"request_compat"');
+          }
+          return true;
+        };
+
+        await session.prompt("persist details", {
+          expandPromptTemplates: false,
+          source: "extension",
+        });
+
+        expect(stateContainedResult).toBe(true);
+        expect(persistedContainedResult).toBe(true);
+      } finally {
+        await session.abort();
+        session.dispose();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

@@ -80,8 +80,81 @@ assistant turns and observes two calls to the custom tool's `execute`. This is a
 reachable provider-boundary event even though well-behaved providers normally
 generate unique IDs.
 
-Brood therefore needs only a per-agent duplicate-control-invocation guard. The
-first successful `delegate` or `wait_for_agents` invocation records its ID in
-the same registry transition as its mutation. Reuse of that ID returns a typed,
-model-visible tool error and performs no mutation. Brood does not need a result
-cache, argument fingerprint, or generic Pi-tool replay framework in v1.
+Brood therefore needs only a guard for duplicate Brood invocation IDs within
+the currently claimed command. Each successful state-changing tool records its
+ID in the same registry transition as its mutation; `finishTurn` clears that
+command-local map. Cross-tool reuse in the same assistant run returns a typed,
+model-visible error and performs no mutation. Reuse in a later run is allowed
+because Pi itself gives the same ID no session-wide identity. Brood does not
+need a result cache, argument fingerprint, or generic Pi-tool replay framework
+in v1.
+
+## Turn-finalization and suspension findings
+
+The pinned `agent-loop` executes all tool calls in one assistant message before
+consulting `shouldStopAfterTurn`. It appends each finalized `ToolResultMessage`
+to both the current context and the run's `newMessages`, then emits `turn_end`,
+and only then awaits the stop hook. `AgentSession` handles each `message_end`
+event by synchronously appending the message to its `SessionManager` before the
+loop reaches the hook. A characterization test observes the same successful
+tool details in the hook's `toolResults`, the loop context, `session.messages`,
+and the JSONL session file. Brood can therefore stop after a control result
+without leaving a dangling tool call or losing its machine-readable marker.
+
+Ordinary non-sequential tools execute concurrently. Their completion events may
+be out of order, but Pi awaits the callback promises with `Promise.all` over the
+assistant's original tool-call array and emits the finalized result messages in
+that array order. The compatibility test deliberately completes the second tool
+before the first and still observes `first-call`, then `second-call`. Brood's v1
+control tools are sequential, but the adapter preserves this upstream source
+order when it constructs its complete suspension-marker tuple.
+
+The hook receives one successful marker for each accepted control operation.
+Brood decodes successful `delegate`, `wait_for_agents`, and `ask_agent` details
+strictly, checks that the embedded invocation ID equals Pi's tool-call ID, and
+derives the closed marker variant from the tool name. `ask_agent` additionally
+supplies the decoded request ID. Missing fields, excess fields, invalid request
+IDs, invocation mismatches, an impossible successful `ask_agent` continuation,
+and incomplete or reordered call/result batches become `PiProtocolError`.
+Failed known tools and unrelated tools contribute no marker. A suspended run is
+valid only when the marked assistant message is also the final `toolUse` turn.
+
+## Failed tool callbacks
+
+Pi catches values thrown by a tool callback. If the value is an `Error`, Pi
+uses its `message`; otherwise it uses `String(value)`. It constructs an error
+tool result with exactly one text item, empty details, and `isError: true`.
+The compatibility test throws an Effect `Schema.TaggedError` and verifies that
+the complete actionable sentence survives while typed fields do not. Brood
+must consequently put every model-actionable explanation in the error's
+`message`; rejected callbacks cannot carry a suspension marker in `details`.
+
+## Steering, preparation, and prompt settlement
+
+The core loop polls steering once at loop startup. After a tool turn it invokes
+`prepareNextTurn`, then `shouldStopAfterTurn`, and polls steering again only if
+the stop hook returns false. A characterization test proves that a stopping tool
+turn performs exactly the initial poll and no post-hook poll. Pi exposes queues
+and preparation hooks, but Brood v1 does not use them for coordination: the
+adapter removes the session-installed `prepareNextTurn` hooks and installs only
+`shouldStopAfterTurn`. It does not add a steering producer, preparation loop, or
+detached promise. Later communication is delivered as a new controller-owned
+prompt after the prior high-level prompt has settled.
+
+`AgentSession.prompt()` wraps the core loop with retry, compaction, queue, and
+`agent_settled` handling. In particular, threshold compaction can run after the
+core loop's `agent_end` and before the high-level prompt promise resolves. The
+global Brood run permit must therefore cover the complete `session.prompt()`
+promise, not merely the core stop hook. The adapter classifies the run only
+after that promise settles and captures a fresh classifier for each invocation.
+
+## Exact active-tool invariant
+
+Pi's default writable coding surface is produced by `createCodingTools(cwd)`;
+the pinned version returns `read`, `bash`, `edit`, and `write`. Brood derives its
+expected active names from that factory plus every name in `PiOpenRequest.tools`
+instead of hard-coding the current Brood tool catalogue. Duplicate custom names,
+or a custom name colliding with a built-in, fail session opening before Pi or the
+filesystem is touched. After creation, the adapter still compares the complete
+active set against that derived expectation and treats divergence as an
+invariant defect.
