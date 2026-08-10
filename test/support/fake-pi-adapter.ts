@@ -33,6 +33,10 @@ export interface FakePiSnapshot {
 
 export interface FakePiAdapterOptions {
   readonly openFailureMessage?: string;
+  readonly openFailureMessageFor?: (
+    request: PiOpenRequest,
+    openNumber: number,
+  ) => string | undefined;
   readonly blockCleanup?: boolean;
 }
 
@@ -143,9 +147,11 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
       { ...state, openCount: state.openCount + 1 },
     ]);
     yield* Queue.offer(opened, request);
-    if (options.openFailureMessage !== undefined) {
+    const openFailureMessage =
+      options.openFailureMessageFor?.(request, openNumber) ?? options.openFailureMessage;
+    if (openFailureMessage !== undefined) {
       return yield* Effect.fail(
-        new PiOpenError({ agentId: request.agentId, message: options.openFailureMessage }),
+        new PiOpenError({ agentId: request.agentId, message: openFailureMessage }),
       );
     }
 

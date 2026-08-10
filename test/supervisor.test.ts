@@ -1,9 +1,10 @@
 /* oxlint-disable no-underscore-dangle, vitest/no-standalone-expect -- Effect variants use `_tag`; `it.effect` is not recognized by the Vitest lint plugin. */
 import { it } from "@effect/vitest";
-import { Effect, Fiber, Latch, Option, Ref, Stream } from "effect";
+import { Effect, Fiber, Latch, Option, Ref, Schema, Stream } from "effect";
 import * as TestClock from "effect/testing/TestClock";
 import { expect } from "vitest";
 import { makeAgentName, makeToolInvocationId } from "../src/agent.js";
+import { AgentActivity, makeAgentPath } from "../src/communication.js";
 import { compileProfileCatalogue } from "../src/profiles.js";
 import { makeSupervisor } from "../src/supervisor.js";
 import type { PiAdapter } from "../src/pi-adapter.js";
@@ -45,7 +46,18 @@ it.effect("runs the root with its configured profile and settles its normalized 
 
       expect(opened.agentId).toBe(rootId);
       expect(opened.profile.public.name).toBe("coordinator");
-      expect(opened.tools.map(({ name }) => name)).toEqual(["delegate", "wait_for_agents"]);
+      expect(opened.tools.map(({ name }) => name)).toEqual([
+        "delegate",
+        "wait_for_agents",
+        "list_agents",
+        "set_activity",
+        "send_message",
+        "ask_agent",
+        "read_messages",
+        "reply_to_request",
+        "post_bulletin",
+        "read_bulletins",
+      ]);
       expect(opened.systemPrompt).toContain("workspace is shared with concurrent agents");
       expect(opened.systemPrompt).toContain("Preserve");
       expect(opened.systemPrompt).toContain("relative paths");
@@ -145,6 +157,338 @@ it.effect(
         expect(drain.terminalAgentCount).toBe(2);
       }),
     ),
+);
+
+it.effect(
+  "with one permit a child can question its parked parent and both resume their original waits",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const catalogue = yield* compileProfileCatalogue(
+          testProfilesConfig(),
+          testModelLookup(),
+          4_000,
+        );
+        const fake = yield* makeFakePiAdapter();
+        const supervisor = yield* makeSupervisor({
+          catalogue,
+          piAdapter: fake,
+          ...testSupervisorConfig({ maxConcurrency: 1, maxAgentAdmissions: 2 }),
+        });
+        const eventSubscription = yield* supervisor.events;
+        const lifecycle = yield* Stream.fromSubscription(eventSubscription).pipe(
+          Stream.filter((event) => event.source === "supervisor"),
+          Stream.takeUntil((event) => event.type === "DrainCompleted"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+        yield* fake.nextOpen;
+        const rootInitial = yield* fake.nextRun;
+        const delegated = yield* supervisor.toolPort.delegate(
+          rootId,
+          makeToolInvocationId("delegate-api"),
+          [{ name: makeAgentName("api"), goal: "implement the API" }],
+          "all",
+        );
+        const child = delegated.agents[0];
+        if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+        yield* fake.suspend(rootId, [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-api"),
+          },
+        ]);
+
+        yield* fake.nextOpen;
+        const childInitial = yield* fake.nextRun;
+        const asked = yield* supervisor.toolPort.askAgent(
+          child.id,
+          makeToolInvocationId("ask-root"),
+          {
+            to: makeAgentPath("root"),
+            question: "Should this endpoint accept PUT?",
+          },
+        );
+        yield* fake.suspend(child.id, [
+          {
+            _tag: "RequestWait",
+            tool: "ask_agent",
+            invocationId: makeToolInvocationId("ask-root"),
+            request: asked.request,
+          },
+        ]);
+
+        const rootCoordination = yield* fake.nextRun;
+        expect(rootCoordination.sessionId).toBe(rootInitial.sessionId);
+        expect(rootCoordination.prompt).toContain("<brood_coordination_wake");
+        expect(rootCoordination.prompt).toContain('open_requests="1"');
+        const inbox = yield* supervisor.toolPort.readMessages(
+          rootId,
+          makeToolInvocationId("read-root-question"),
+          {},
+        );
+        expect(inbox.items[0]).toMatchObject({
+          kind: "request",
+          request: asked.request,
+          from: "root/api",
+        });
+        yield* supervisor.toolPort.replyToRequest(rootId, makeToolInvocationId("answer-api"), {
+          request: asked.request,
+          message: "No. Implement POST and GET only.",
+        });
+        yield* fake.complete(rootId, "answered clarification");
+
+        const childResumed = yield* fake.nextRun;
+        expect(childResumed.sessionId).toBe(childInitial.sessionId);
+        expect(childResumed.prompt).toContain("<brood_request_outcomes");
+        expect(childResumed.prompt).toContain("No. Implement POST and GET only.");
+        yield* fake.complete(child.id, "api complete");
+
+        const rootResumed = yield* fake.nextRun;
+        expect(rootResumed.sessionId).toBe(rootInitial.sessionId);
+        expect(rootResumed.prompt).toContain("<brood_dependency_outcomes");
+        expect(rootResumed.prompt).toContain("api complete");
+        yield* fake.complete(rootId, "root complete");
+
+        const outcome = yield* supervisor.awaitOutcome(rootId);
+        const drain = yield* supervisor.drain;
+        const events = Array.from(yield* Fiber.join(lifecycle));
+        const resumedIds = events.flatMap((event) =>
+          event.type === "AgentResumed" ? [event.agentId] : [],
+        );
+        const stats = yield* fake.snapshot;
+
+        expect(outcome._tag).toBe("Completed");
+        expect(resumedIds).toEqual([child.id, rootId]);
+        expect(stats.maxActiveRuns).toBe(1);
+        expect(stats.runCounts.get(rootId)).toBe(3);
+        expect(stats.runCounts.get(child.id)).toBe(2);
+        expect(drain.terminalAgentCount).toBe(2);
+      }),
+    ),
+);
+
+it.effect("turns a recipient session-open failure into an unavailable reply", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter({
+        openFailureMessageFor: (_request, openNumber) =>
+          openNumber === 2 ? "recipient authentication failed" : undefined,
+      });
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 1, maxAgentAdmissions: 2 }),
+      });
+
+      const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      const delegated = yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-failing-recipient"),
+        [{ name: makeAgentName("api"), goal: "implement the API" }],
+        "none",
+      );
+      const child = delegated.agents[0];
+      if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+      const asked = yield* supervisor.toolPort.askAgent(
+        rootId,
+        makeToolInvocationId("ask-failing-recipient"),
+        { to: makeAgentPath("root/api"), question: "Can you support PUT?" },
+      );
+      yield* fake.suspend(rootId, [
+        {
+          _tag: "RequestWait",
+          tool: "ask_agent",
+          invocationId: makeToolInvocationId("ask-failing-recipient"),
+          request: asked.request,
+        },
+      ]);
+
+      const childOpen = yield* fake.nextOpen;
+      const childOutcome = yield* supervisor.awaitOutcome(child.id);
+      const resumed = yield* fake.nextRun;
+      yield* fake.complete(rootId, "continued without recipient");
+      const rootOutcome = yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+
+      expect(childOpen.agentId).toBe(child.id);
+      expect(childOutcome).toMatchObject({
+        _tag: "Failed",
+        failure: { _tag: "AgentStartFailed" },
+      });
+      expect(resumed.prompt).toContain('status="unavailable"');
+      expect(resumed.prompt).toContain('to="root/api"');
+      expect(resumed.prompt).toContain('reason="failed"');
+      expect(rootOutcome._tag).toBe("Completed");
+    }),
+  ),
+);
+
+it.effect(
+  "projects activity but keeps passive communication bodies out of operational surfaces",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const catalogue = yield* compileProfileCatalogue(
+          testProfilesConfig(),
+          testModelLookup(),
+          4_000,
+        );
+        const fake = yield* makeFakePiAdapter();
+        const supervisor = yield* makeSupervisor({
+          catalogue,
+          piAdapter: fake,
+          ...testSupervisorConfig({ maxConcurrency: 2, maxAgentAdmissions: 2 }),
+        });
+        const eventSubscription = yield* supervisor.events;
+        const lifecycle = yield* Stream.fromSubscription(eventSubscription).pipe(
+          Stream.filter((event) => event.source === "supervisor"),
+          Stream.takeUntil((event) => event.type === "DrainCompleted"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+        yield* fake.nextOpen;
+        yield* fake.nextRun;
+        const delegated = yield* supervisor.toolPort.delegate(
+          rootId,
+          makeToolInvocationId("delegate-peer"),
+          [{ name: makeAgentName("peer"), goal: "peer work" }],
+          "none",
+        );
+        const peer = delegated.agents[0];
+        if (peer === undefined) return yield* Effect.die(new Error("peer was not registered"));
+        yield* fake.nextOpen;
+        yield* fake.nextRun;
+
+        yield* supervisor.toolPort.setActivity(rootId, makeToolInvocationId("set-root-activity"), {
+          activity: Schema.decodeUnknownSync(AgentActivity)("auditing\nAPI"),
+        });
+        const directory = yield* supervisor.toolPort.listAgents(peer.id, {});
+        expect(directory.agents).toContainEqual(
+          expect.objectContaining({ path: "root", activity: "auditing API" }),
+        );
+
+        const privateMessage = "PRIVATE_MESSAGE_BODY_8d404";
+        const privateBulletin = "PRIVATE_BULLETIN_BODY_9f122";
+        yield* supervisor.toolPort.sendMessage(
+          peer.id,
+          makeToolInvocationId("send-private-message"),
+          { to: makeAgentPath("root"), message: privateMessage },
+        );
+        yield* supervisor.toolPort.postBulletin(
+          peer.id,
+          makeToolInvocationId("post-private-bulletin"),
+          { message: privateBulletin },
+        );
+
+        const liveStatus = yield* supervisor.status;
+        const liveDetail = yield* supervisor.show("root");
+        expect(liveStatus.agents[0]).toMatchObject({ path: "root", activity: "auditing API" });
+        expect(liveDetail.activity).toBe("auditing API");
+        expect(JSON.stringify([liveStatus, liveDetail])).not.toContain(privateMessage);
+        expect(JSON.stringify([liveStatus, liveDetail])).not.toContain(privateBulletin);
+
+        yield* fake.complete(rootId, "root done");
+        const rootOutcome = yield* supervisor.awaitOutcome(rootId);
+        const terminalStatus = yield* supervisor.status;
+        const terminalDetail = yield* supervisor.show("root");
+        expect(rootOutcome._tag).toBe("Completed");
+        expect(terminalStatus.agents[0]).not.toHaveProperty("activity");
+        expect(terminalDetail).not.toHaveProperty("activity");
+
+        yield* fake.complete(peer.id, "peer done");
+        yield* supervisor.drain;
+        const events = Array.from(yield* Fiber.join(lifecycle));
+        expect(JSON.stringify(events)).not.toContain(privateMessage);
+        expect(JSON.stringify(events)).not.toContain(privateBulletin);
+      }),
+    ),
+);
+
+it.effect("does not settle a run when a question arrives before its turn finishes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 2, maxAgentAdmissions: 2 }),
+      });
+
+      const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+      yield* fake.nextOpen;
+      const rootInitial = yield* fake.nextRun;
+      const delegated = yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-running-asker"),
+        [{ name: makeAgentName("asker"), goal: "ask the root" }],
+        "none",
+      );
+      const child = delegated.agents[0];
+      if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+      yield* fake.nextOpen;
+      const childInitial = yield* fake.nextRun;
+      const asked = yield* supervisor.toolPort.askAgent(
+        child.id,
+        makeToolInvocationId("ask-running-root"),
+        { to: makeAgentPath("root"), question: "Which branch should I use?" },
+      );
+
+      yield* fake.complete(rootId, "ordinary result that must be deferred");
+      const coordination = yield* fake.nextRun;
+      expect(coordination.sessionId).toBe(rootInitial.sessionId);
+      expect(coordination.prompt).toContain("<brood_coordination_wake");
+      const inbox = yield* supervisor.toolPort.readMessages(
+        rootId,
+        makeToolInvocationId("read-running-question"),
+        {},
+      );
+      expect(inbox.items[0]).toMatchObject({ request: asked.request });
+      yield* supervisor.toolPort.replyToRequest(
+        rootId,
+        makeToolInvocationId("reply-running-question"),
+        { request: asked.request, message: "Use the integration branch." },
+      );
+      yield* fake.complete(rootId, "answered request");
+
+      yield* fake.suspend(child.id, [
+        {
+          _tag: "RequestWait",
+          tool: "ask_agent",
+          invocationId: makeToolInvocationId("ask-running-root"),
+          request: asked.request,
+        },
+      ]);
+      const childResumed = yield* fake.nextRun;
+      expect(childResumed.sessionId).toBe(childInitial.sessionId);
+      expect(childResumed.prompt).toContain("Use the integration branch.");
+      yield* fake.complete(child.id, "child done");
+
+      const rootOutcome = yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+      expect(rootOutcome).toMatchObject({
+        _tag: "Completed",
+        result: { summary: "answered request" },
+      });
+    }),
+  ),
 );
 
 it.effect("reports bounded capacity and a canonical wait tree", () =>

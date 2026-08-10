@@ -31,10 +31,8 @@ import {
   makeAgentName,
   makeBatchId,
   type AgentId,
-  type AgentCommand,
   type AgentName,
   type AgentOutcome,
-  type AgentResult,
   type AgentStatus,
   type BatchId,
   type BroodRunRequest,
@@ -42,11 +40,13 @@ import {
   type DelegateToolDetails,
   type DrainReport,
   type InterruptReason,
-  type PiRunOutcome,
   type WaitId,
   type ToolInvocationId,
   type WaitToolDetails,
 } from "./agent.js";
+import type { AgentCommand } from "./control.js";
+import type { CommunicationToolPort } from "./communication.js";
+import { makeCommunicationTools } from "./communication-tools.js";
 import type { ProfileCatalogue, PublicModelProfile, ResolvedModelProfile } from "./profiles.js";
 import {
   dependencyOutcomeFromAgent,
@@ -67,6 +67,8 @@ import {
   type CommittedSettlement,
   type CommittedInterruptRequest,
   type CommandInterrupted,
+  type CommandToken,
+  type FinishTurnDecision,
   type RegisteredAgent,
   type ShutdownResult,
 } from "./registry.js";
@@ -162,7 +164,7 @@ export interface AgentSupervisor {
   ) => Effect.Effect<AgentId, UnknownAgentReference>;
   readonly drain: Effect.Effect<DrainReport>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
-  readonly toolPort: ControlToolPort;
+  readonly toolPort: ControlToolPort & CommunicationToolPort;
 }
 
 type ControllerError =
@@ -280,6 +282,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     profile: agent.profile,
     status: agent.status,
     waitTargets: agent.waitTargets,
+    ...(agent.activity === undefined ? {} : { activity: agent.activity }),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
     ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
@@ -346,63 +349,92 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
 
   // ── The controller: one fiber per agent, one permit per turn ─────────────
 
-  const acceptRunOutcome = Effect.fn("Brood.Supervisor.acceptRunOutcome")(function* (
-    id: AgentId,
-    agent: PiAgent,
-    outcome: PiRunOutcome,
-  ) {
-    if (outcome._tag === "Completed") {
-      const result: AgentResult = normalizeAgentResult(
-        id,
-        agent.sessionId,
-        outcome.result.finalText,
-        options.maxAgentResultChars,
-      );
-      return Option.some<AgentOutcome>({ _tag: "Completed", result });
-    }
-    const activation = yield* registry.activateWaits(id);
-    if (activation._tag === "Waiting") {
-      yield* publishStatus(id, "Waiting");
-      yield* publishLifecycle({
-        type: "AgentSuspended",
-        agentId: id,
-        waitId: activation.waitId,
-        targetIds: activation.targetIds,
-      });
-    } else {
-      yield* publishStatus(id, "Queued");
-    }
-    return Option.none<AgentOutcome>();
-  });
+  type ControllerStep =
+    | { readonly _tag: "Continue" }
+    | { readonly _tag: "Settled"; readonly outcome: AgentOutcome };
 
-  const announceCommand = (id: AgentId, command: AgentCommand) =>
-    command._tag === "Resume"
+  const announceReadyCommand = (id: AgentId, command: AgentCommand): Effect.Effect<void> =>
+    command._tag === "WaitSatisfied"
       ? publishLifecycle({ type: "AgentResumed", agentId: id, waitId: command.waitId })
       : Effect.void;
 
-  const runTurn = Effect.fn("Brood.Supervisor.runTurn")(function* (
-    agentId: AgentId,
+  const acceptFinishDecision = Effect.fn("Brood.Supervisor.acceptFinishDecision")(function* (
+    id: AgentId,
+    decision: FinishTurnDecision,
+  ): Effect.fn.Return<ControllerStep> {
+    switch (decision._tag) {
+      case "Settled":
+        yield* publishSettlement({ agentId: id, outcome: decision.outcome });
+        return { _tag: "Settled", outcome: decision.outcome };
+      case "RunNext":
+        yield* publishStatus(id, "Queued");
+        return { _tag: "Continue" };
+      case "Park":
+        yield* publishStatus(id, "Waiting");
+        yield* publishLifecycle({
+          type: "AgentSuspended",
+          agentId: id,
+          waitId: decision.waitId,
+          targetIds: decision.targetIds,
+        });
+        return { _tag: "Continue" };
+    }
+  });
+
+  const runClaim = Effect.fn("Brood.Supervisor.runClaim")(function* (
+    registration: RegisteredAgent,
     agent: PiAgent,
-    command: AgentCommand,
-  ) {
-    yield* registry.markRunning(agentId);
-    yield* publishStatus(agentId, "Running");
-    // Snapshot inside the run permit, immediately before the Pi call, so time
-    // spent queued for concurrency does not unnecessarily stale the envelope.
-    const capacity = yield* registry.admissionCapacity;
-    const outcome = yield* agent.run(
-      renderAgentPrompt(command, capacity, options.maxResumePromptChars),
-    );
-    return yield* acceptRunOutcome(agentId, agent, outcome);
+    token: CommandToken,
+  ): Effect.fn.Return<
+    ControllerStep,
+    PiRunError | PiProtocolError | UnknownAgent | CommandInterrupted
+  > {
+    const began = yield* registry.beginRun(registration.id, token);
+    switch (began._tag) {
+      case "Settled":
+        yield* publishSettlement({ agentId: registration.id, outcome: began.outcome });
+        return { _tag: "Settled", outcome: began.outcome };
+      case "Stale":
+        yield* publishStatus(registration.id, began.status);
+        return { _tag: "Continue" };
+      case "Ready": {
+        yield* announceReadyCommand(registration.id, began.command);
+        yield* publishStatus(registration.id, "Running");
+        // Snapshot inside the run permit, immediately before the Pi call, so
+        // time spent queued for concurrency cannot stale the capacity envelope.
+        const capacity = yield* registry.admissionCapacity;
+        const piOutcome = yield* agent.run(
+          renderAgentPrompt(began.command, capacity, options.maxResumePromptChars),
+        );
+        const decision =
+          piOutcome._tag === "Completed"
+            ? yield* registry.finishTurn({
+                agentId: registration.id,
+                commandToken: token,
+                piOutcome,
+                completedResult: normalizeAgentResult(
+                  registration.id,
+                  agent.sessionId,
+                  piOutcome.result.finalText,
+                  options.maxAgentResultChars,
+                ),
+              })
+            : yield* registry.finishTurn({
+                agentId: registration.id,
+                commandToken: token,
+                piOutcome,
+              });
+        return yield* acceptFinishDecision(registration.id, decision);
+      }
+    }
   });
 
   const controller = Effect.fn("Brood.Supervisor.controller")(
     (registration: RegisteredAgent, profile: ResolvedModelProfile): Effect.Effect<void> =>
       Effect.scoped(
         Effect.gen(function* () {
-          const first = yield* registry.takePendingCommand(registration.id);
-          yield* announceCommand(registration.id, first);
-          const opened = yield* withRunSlot(
+          const firstClaim = yield* registry.takePendingCommand(registration.id);
+          const agent = yield* withRunSlot(
             Effect.gen(function* () {
               yield* registry.markStarting(registration.id);
               yield* publishStatus(registration.id, "Starting");
@@ -410,22 +442,24 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
               const request: PiOpenRequest = {
                 agentId: registration.id,
                 profile,
-                tools: toolFactory.forCaller(registration.id, toolPort),
+                tools: [
+                  ...toolFactory.forCaller(registration.id, toolPort),
+                  ...makeCommunicationTools(registration.id, toolPort),
+                ],
                 systemPrompt: systemPromptFor(registration, profile, instructions),
               };
-              const agent = yield* options.piAdapter.open(request);
-              yield* agent.events.pipe(Stream.runForEach(publishPiEvent), Effect.forkScoped);
-              const next = yield* runTurn(registration.id, agent, first);
-              return { agent, next };
+              const opened = yield* options.piAdapter.open(request);
+              yield* opened.events.pipe(Stream.runForEach(publishPiEvent), Effect.forkScoped);
+              const step = yield* runClaim(registration, opened, firstClaim.token);
+              return { opened, step };
             }),
           );
-          if (Option.isSome(opened.next)) return opened.next.value;
+          if (agent.step._tag === "Settled") return agent.step.outcome;
 
           while (true) {
-            const command = yield* registry.takePendingCommand(registration.id);
-            yield* announceCommand(registration.id, command);
-            const next = yield* withRunSlot(runTurn(registration.id, opened.agent, command));
-            if (Option.isSome(next)) return next.value;
+            const claim = yield* registry.takePendingCommand(registration.id);
+            const step = yield* withRunSlot(runClaim(registration, agent.opened, claim.token));
+            if (step._tag === "Settled") return step.outcome;
           }
         }).pipe(
           Effect.onExit((exit) =>
@@ -475,7 +509,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
 
   // ── Public surface: tools port, root admission, interrupt, drain ─────────
 
-  const toolPort: ControlToolPort = {
+  const toolPort: ControlToolPort & CommunicationToolPort = {
     delegate: Effect.fn("Brood.Supervisor.delegate")(
       function* (callerId, invocationId, tasks, wait) {
         const resolved = yield* resolveTasks(tasks);
@@ -566,6 +600,14 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
         return details;
       },
     ),
+    listAgents: registry.listAgents,
+    setActivity: registry.setActivity,
+    sendMessage: registry.sendMessage,
+    askAgent: registry.askAgent,
+    readMessages: registry.readMessages,
+    replyToRequest: registry.replyToRequest,
+    postBulletin: registry.postBulletin,
+    readBulletins: registry.readBulletins,
   };
 
   // The request arrives already normalized by main.ts's single semantic gate;
