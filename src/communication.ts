@@ -22,6 +22,7 @@ export const MAX_QUESTION_CHARS = 4_000;
 export const MAX_REPLY_CHARS = 1_000;
 export const MAX_BULLETIN_CHARS = 4_000;
 export const MAX_UNREAD_MESSAGES_PER_AGENT = 100;
+export const MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT = 4;
 export const MAX_INCOMING_REQUESTS_PER_AGENT = 16;
 export const MAX_REQUEST_TARGETS_PER_WAIT = 4;
 export const MAX_INBOX_READ_ITEMS = 8;
@@ -159,6 +160,24 @@ export interface InboxRequest extends Schema.Schema.Type<typeof InboxRequest> {}
 
 export const InboxItem = Schema.Union([InboxMessage, InboxRequest]);
 export type InboxItem = typeof InboxItem.Type;
+
+/**
+ * Operator messages never travel through the peer inbox. They are rendered by
+ * Brood into a `<brood_operator_message>` block and injected directly into the
+ * agent's conversation — steered mid-run, or embedded in the next command.
+ * Peers cannot produce that block: peer-authored text is always escaped or
+ * JSON-quoted wherever it is rendered, so a raw block can only come from Brood.
+ */
+export const OperatorMessageId = Schema.String.check(
+  Schema.isMaxLength(80),
+  Schema.isPattern(/^opmsg_[A-Za-z0-9-]+$/),
+).pipe(Schema.brand("OperatorMessageId"));
+export type OperatorMessageId = typeof OperatorMessageId.Type;
+export const makeOperatorMessageId = Schema.decodeUnknownSync(OperatorMessageId);
+
+/** Boundary decoder for operator-authored message bodies entering the registry. */
+export const OperatorMessageBody = boundedBody(MAX_MESSAGE_CHARS, "operator message");
+export const decodeOperatorMessageBody = Schema.decodeUnknownEffect(OperatorMessageBody);
 
 export const InboxCounts = Schema.Struct({
   unreadMessages: Schema.Natural,

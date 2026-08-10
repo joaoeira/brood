@@ -7,13 +7,24 @@ import type { PiRunOutcome, SuspensionMarker } from "../../src/control.js";
 import type { PiAdapter, PiAgent, PiOpenRequest, PiSessionEvent } from "../../src/pi-adapter.js";
 
 export type FakeRunStep =
-  | { readonly _tag: "Complete"; readonly text: string }
+  | {
+      readonly _tag: "Complete";
+      readonly text: string;
+      readonly delivered?: ReadonlyArray<string>;
+    }
   | {
       readonly _tag: "Suspend";
       readonly markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>];
+      readonly delivered?: ReadonlyArray<string>;
     }
   | { readonly _tag: "RunFailure"; readonly message: string }
   | { readonly _tag: "ProtocolFailure"; readonly message: string };
+
+export interface FakeSteerObservation {
+  readonly agentId: AgentId;
+  readonly text: string;
+  readonly accepted: boolean;
+}
 
 export interface FakeRunObservation {
   readonly agentId: AgentId;
@@ -60,11 +71,17 @@ interface FakeState {
 export interface FakePiAdapter extends PiAdapter {
   readonly nextOpen: Effect.Effect<PiOpenRequest>;
   readonly nextRun: Effect.Effect<FakeRunObservation>;
+  readonly nextSteer: Effect.Effect<FakeSteerObservation>;
   readonly nextCleanup: Effect.Effect<AgentId>;
-  readonly complete: (agentId: AgentId, text: string) => Effect.Effect<void>;
+  readonly complete: (
+    agentId: AgentId,
+    text: string,
+    delivered?: ReadonlyArray<string>,
+  ) => Effect.Effect<void>;
   readonly suspend: (
     agentId: AgentId,
     markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>],
+    delivered?: ReadonlyArray<string>,
   ) => Effect.Effect<void>;
   readonly failRun: (agentId: AgentId, message: string) => Effect.Effect<void>;
   readonly failProtocol: (agentId: AgentId, message: string) => Effect.Effect<void>;
@@ -90,9 +107,14 @@ const outcomeForStep = (
           finalMessageId: `message-${agentId}`,
           stopReason: "stop",
         },
+        ...(step.delivered === undefined ? {} : { deliveredOperatorMessages: step.delivered }),
       });
     case "Suspend":
-      return Effect.succeed({ _tag: "Suspended", markers: step.markers });
+      return Effect.succeed({
+        _tag: "Suspended",
+        markers: step.markers,
+        ...(step.delivered === undefined ? {} : { deliveredOperatorMessages: step.delivered }),
+      });
     case "RunFailure":
       return Effect.fail(new PiRunError({ agentId, message: step.message }));
     case "ProtocolFailure":
@@ -115,6 +137,7 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
 ) {
   const opened = yield* Queue.unbounded<PiOpenRequest>();
   const runs = yield* Queue.unbounded<FakeRunObservation>();
+  const steers = yield* Queue.unbounded<FakeSteerObservation>();
   const cleanups = yield* Queue.unbounded<AgentId>();
   const stateRef = yield* Ref.make<FakeState>({
     agents: new Map(),
@@ -183,8 +206,14 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
       }),
     );
 
+    // Mirrors the real adapter: steers are accepted only while a run is in
+    // flight, and the caller sees the refusal synchronously.
+    const live = { active: false };
     const run = Effect.fn("Brood.Test.FakePi.run")((prompt: string) =>
       Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          live.active = true;
+        });
         const runNumber = yield* Ref.modify(stateRef, (state) => {
           const current = state.agents.get(request.agentId);
           if (current === undefined) {
@@ -214,18 +243,35 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
         return yield* outcomeForStep(request.agentId, step);
       }).pipe(
         Effect.ensuring(
-          Ref.update(stateRef, (state) => ({
-            ...state,
-            activeRuns: state.activeRuns - 1,
-          })),
+          Effect.sync(() => {
+            live.active = false;
+          }).pipe(
+            Effect.andThen(
+              Ref.update(stateRef, (state) => ({
+                ...state,
+                activeRuns: state.activeRuns - 1,
+              })),
+            ),
+          ),
         ),
       ),
     );
+
+    const steer = (renderedMessage: string): boolean => {
+      const accepted = live.active;
+      Queue.offerUnsafe(steers, {
+        agentId: request.agentId,
+        text: renderedMessage,
+        accepted,
+      });
+      return accepted;
+    };
 
     return {
       sessionId,
       events: Stream.fromQueue(events),
       run,
+      steer,
     } satisfies PiAgent;
   });
 
@@ -279,9 +325,20 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
     open,
     nextOpen: Queue.take(opened),
     nextRun: Queue.take(runs),
+    nextSteer: Queue.take(steers),
     nextCleanup: Queue.take(cleanups),
-    complete: (agentId, text) => offerStep(agentId, { _tag: "Complete", text }),
-    suspend: (agentId, markers) => offerStep(agentId, { _tag: "Suspend", markers }),
+    complete: (agentId, text, delivered?) =>
+      offerStep(agentId, {
+        _tag: "Complete",
+        text,
+        ...(delivered === undefined ? {} : { delivered }),
+      }),
+    suspend: (agentId, markers, delivered?) =>
+      offerStep(agentId, {
+        _tag: "Suspend",
+        markers,
+        ...(delivered === undefined ? {} : { delivered }),
+      }),
     failRun: (agentId, message) => offerStep(agentId, { _tag: "RunFailure", message }),
     failProtocol: (agentId, message) => offerStep(agentId, { _tag: "ProtocolFailure", message }),
     emitEvent,

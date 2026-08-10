@@ -458,6 +458,237 @@ it.effect(
     ),
 );
 
+it.effect("publishes metadata-only communication events and an operator bulletin view", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 2, maxAgentAdmissions: 2 }),
+      });
+      const eventSubscription = yield* supervisor.events;
+      const lifecycle = yield* Stream.fromSubscription(eventSubscription).pipe(
+        Stream.filter((event) => event.source === "supervisor"),
+        Stream.takeUntil((event) => event.type === "DrainCompleted"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      const delegated = yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-peer"),
+        [{ name: makeAgentName("peer"), goal: "peer work" }],
+        "none",
+      );
+      const peer = delegated.agents[0];
+      if (peer === undefined) return yield* Effect.die(new Error("peer was not registered"));
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+
+      const messageBody = "COMMS_EVENT_MESSAGE_BODY_77b13";
+      const questionBody = "COMMS_EVENT_QUESTION_BODY_5c2e8";
+      const replyBody = "COMMS_EVENT_REPLY_BODY_0a9d4";
+      const bulletinBody = "COMMS_EVENT_BULLETIN_BODY_e31f6";
+      yield* supervisor.toolPort.sendMessage(peer.id, makeToolInvocationId("peer-message"), {
+        to: makeAgentPath("root"),
+        message: messageBody,
+      });
+      const asked = yield* supervisor.toolPort.askAgent(peer.id, makeToolInvocationId("peer-ask"), {
+        to: makeAgentPath("root"),
+        question: questionBody,
+      });
+      yield* supervisor.toolPort.readMessages(rootId, makeToolInvocationId("root-read"), {});
+      yield* supervisor.toolPort.replyToRequest(rootId, makeToolInvocationId("root-answer"), {
+        request: asked.request,
+        message: replyBody,
+      });
+      yield* supervisor.toolPort.postBulletin(peer.id, makeToolInvocationId("peer-bulletin"), {
+        message: bulletinBody,
+      });
+
+      const board = yield* supervisor.bulletins;
+      expect(board).toEqual([{ sequence: 1, author: "root/peer", body: bulletinBody }]);
+
+      yield* fake.suspend(peer.id, [
+        {
+          _tag: "RequestWait",
+          tool: "ask_agent",
+          invocationId: makeToolInvocationId("peer-ask"),
+          request: asked.request,
+        },
+      ]);
+      const peerResumed = yield* fake.nextRun;
+      expect(peerResumed.prompt).toContain(replyBody);
+      yield* fake.complete(peer.id, "peer done");
+      yield* fake.complete(rootId, "root done");
+      yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+
+      const events = Array.from(yield* Fiber.join(lifecycle));
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "MessageAccepted", fromId: peer.id, toPath: "root" }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "RequestOpened",
+          requestId: asked.request,
+          fromId: peer.id,
+          toPath: "root",
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "RequestReplied",
+          requestId: asked.request,
+          byId: rootId,
+          toPath: "root/peer",
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "BulletinPosted", authorId: peer.id }),
+      );
+      const serialized = JSON.stringify(events);
+      expect(serialized).not.toContain(messageBody);
+      expect(serialized).not.toContain(questionBody);
+      expect(serialized).not.toContain(replyBody);
+      expect(serialized).not.toContain(bulletinBody);
+    }),
+  ),
+);
+
+it.effect("delivers operator messages by path and embeds the body in the wake prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 2, maxAgentAdmissions: 2 }),
+      });
+      const eventSubscription = yield* supervisor.events;
+      const lifecycle = yield* Stream.fromSubscription(eventSubscription).pipe(
+        Stream.filter((event) => event.source === "supervisor"),
+        Stream.takeUntil((event) => event.type === "DrainCompleted"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+      yield* fake.nextOpen;
+      const rootInitial = yield* fake.nextRun;
+      const delegated = yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-child"),
+        [{ name: makeAgentName("child"), goal: "child work" }],
+        "all",
+      );
+      const child = delegated.agents[0];
+      if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+      yield* fake.suspend(rootId, [
+        {
+          _tag: "AgentWait",
+          tool: "delegate",
+          invocationId: makeToolInvocationId("delegate-child"),
+        },
+      ]);
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+
+      const unknown = yield* Effect.flip(supervisor.sendOperatorMessage("root/nope", "hello"));
+      const blank = yield* Effect.flip(supervisor.sendOperatorMessage("root", "   "));
+
+      const secret = "OPERATOR_STEER_BODY_ab12f";
+      const delivery = yield* supervisor.sendOperatorMessage("root", secret);
+      const steerAttempt = yield* fake.nextSteer;
+      const wake = yield* fake.nextRun;
+      yield* fake.complete(rootId, "acknowledged the steer");
+
+      yield* fake.complete(child.id, "child done");
+      const resumed = yield* fake.nextRun;
+      yield* fake.complete(rootId, "root done");
+      yield* supervisor.awaitOutcome(rootId);
+      yield* supervisor.drain;
+
+      expect(unknown._tag).toBe("UnknownAgentReference");
+      expect(blank).toMatchObject({ _tag: "OperatorMessageRejected", reason: "InvalidBody" });
+      // Whether the delivery lands just before or just after the root's park
+      // transaction commits, the same coordination wake follows; only the
+      // informational state differs.
+      expect(delivery.to).toBe("root");
+      expect(["running", "waiting"]).toContain(delivery.recipientState);
+      expect(steerAttempt.text).toContain(secret);
+      expect(steerAttempt.text).toContain('<brood_operator_message id="opmsg_');
+      expect(wake.sessionId).toBe(rootInitial.sessionId);
+      // The wake prompt carries the body itself, as a Brood-rendered block
+      // without a steer id, plus the instruction to address it.
+      expect(wake.prompt).toContain('<brood_operator_message authority="run_charter">');
+      expect(wake.prompt).toContain(secret);
+      expect(wake.prompt).toContain("Address the operator message above");
+      expect(resumed.prompt).toContain("child done");
+
+      const events = Array.from(yield* Fiber.join(lifecycle));
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "OperatorMessageAccepted", toId: rootId }),
+      );
+      expect(JSON.stringify(events)).not.toContain(secret);
+    }),
+  ),
+);
+
+it.effect("confirms a steered delivery and skips the follow-up coordination turn", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig(),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig({ maxConcurrency: 1, maxAgentAdmissions: 1 }),
+      });
+
+      const rootId = yield* supervisor.startRoot({ goal: "long task" });
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+
+      const delivery = yield* supervisor.sendOperatorMessage("root", "Steer now.");
+      const steer = yield* fake.nextSteer;
+      const match = /id="(opmsg_[A-Za-z0-9-]+)"/.exec(steer.text);
+      if (match?.[1] === undefined) return yield* Effect.die(new Error("steer carried no id"));
+      yield* fake.complete(rootId, "root done", [match[1]]);
+      const outcome = yield* supervisor.awaitOutcome(rootId);
+      const drain = yield* supervisor.drain;
+      const stats = yield* fake.snapshot;
+
+      expect(delivery).toEqual({ to: "root", recipientState: "running" });
+      expect(steer.accepted).toBe(true);
+      expect(steer.text).toContain("Steer now.");
+      expect(outcome._tag).toBe("Completed");
+      // The confirmed injection settles the message: exactly one Pi run, no
+      // trailing coordination turn to re-deliver it.
+      expect(stats.runCounts.get(rootId)).toBe(1);
+      expect(drain.terminalAgentCount).toBe(1);
+    }),
+  ),
+);
+
 it.effect("does not settle a run when a question arrives before its turn finishes", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -955,6 +1186,7 @@ it.effect("publishes authoritative interruption and timeout events when operator
           Effect.succeed({
             sessionId: "blocking-session",
             events: Stream.empty,
+            steer: () => false,
             run: () =>
               Latch.open(runStarted).pipe(
                 Effect.andThen(Effect.never),

@@ -19,6 +19,7 @@ import type {
 } from "./agent.js";
 import { makeWaitId } from "./agent.js";
 import {
+  MAX_MESSAGE_CHARS,
   MAX_REPLY_CHARS,
   MAX_REQUEST_TARGETS_PER_WAIT,
   makeAgentPath,
@@ -321,6 +322,27 @@ export const MAX_REQUEST_OUTCOME_HEADER_CHARS = Math.max(
 // delimiter neutralization.
 export const MAX_ENCODED_REPLY_CHARS = codePointLength(escapeXmlText("&".repeat(MAX_REPLY_CHARS)));
 
+/**
+ * One operator-authored message as a Brood-rendered block. The body is
+ * XML-escaped, so nothing an operator pastes can forge surrounding structure,
+ * and peers can never produce this block at all: peer text is escaped or
+ * JSON-quoted wherever it is rendered. `id` is attached only on the steered
+ * (mid-run) form so the adapter can confirm the injection landed.
+ */
+export const renderOperatorMessage = (body: string, id?: string): string =>
+  [
+    `<brood_operator_message${id === undefined ? "" : ` id="${escapeXmlAttribute(id)}"`} authority="run_charter">`,
+    escapeXmlText(normalizeText(body)),
+    "</brood_operator_message>",
+  ].join("\n");
+
+const MAX_OPERATOR_MESSAGE_ID_CHARS = 80;
+
+/** Worst-case rendered operator block, derived from the real renderer. */
+export const MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS = codePointLength(
+  renderOperatorMessage("&".repeat(MAX_MESSAGE_CHARS), "o".repeat(MAX_OPERATOR_MESSAGE_ID_CHARS)),
+);
+
 const BASE_RESUME_PROMPT_CHARS = 512;
 const PER_DEPENDENCY_RESUME_CHARS = 320;
 
@@ -328,7 +350,10 @@ export const minimumResumePromptChars = (maxAgentAdmissions: number): number =>
   BASE_RESUME_PROMPT_CHARS +
   maxAgentAdmissions * PER_DEPENDENCY_RESUME_CHARS +
   MAX_RUNTIME_ENVELOPE_CHARS +
-  MAX_REQUEST_TARGETS_PER_WAIT * (MAX_ENCODED_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS);
+  MAX_REQUEST_TARGETS_PER_WAIT * (MAX_ENCODED_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS) +
+  // Commands carry at most one drained operator message; reserve it whole so
+  // an operator body can never squeeze out a dependency or request outcome.
+  MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS;
 
 export const DEFAULT_MAX_RESUME_PROMPT_CHARS = minimumResumePromptChars(128);
 
@@ -365,6 +390,9 @@ const renderWaitSatisfied = (
   const notice = renderNotice(command.notice);
   const rendered: string[] = [];
 
+  if (command.operatorMessage !== undefined) {
+    rendered.push(renderOperatorMessage(command.operatorMessage));
+  }
   if (dependencies.length > 0) {
     rendered.push(
       `<brood_dependency_outcomes version="1" wait_id="${escapeXmlAttribute(command.waitId)}" trust="untrusted_peer_data">`,
@@ -413,14 +441,25 @@ const renderCoordinationWake = (
   command: Extract<AgentCommand, { readonly _tag: "CoordinationWake" }>,
   maxResumePromptChars: number,
 ): string => {
+  const hasPeerWork = command.notice.openRequests > 0 || command.notice.unreadMessages > 0;
   const rendered = [
+    command.operatorMessage === undefined
+      ? undefined
+      : renderOperatorMessage(command.operatorMessage),
     renderNotice(command.notice),
     '<brood_coordination_wake version="1">',
     `  <active_wait agent_completions="${command.waitingFor.agentCompletions}" replies="${command.waitingFor.replies}" />`,
-    "  A peer is waiting for your answer.",
-    "  Call read_messages, then use reply_to_request for each request you can answer.",
-    "  Put answers longer than the reply limit under .brood/shared/ and name the path in the reply.",
-    "  After handling the request, the controller can repark you on the active wait shown above.",
+    ...(command.operatorMessage === undefined
+      ? []
+      : ["  Address the operator message above before continuing."]),
+    ...(command.notice.openRequests > 0 ? ["  A peer is waiting for your answer."] : []),
+    ...(hasPeerWork
+      ? [
+          "  Call read_messages, then use reply_to_request for each request you can answer.",
+          "  Put answers longer than the reply limit under .brood/shared/ and name the path in the reply.",
+        ]
+      : []),
+    "  After handling the messages, the controller can repark you on the active wait shown above.",
     "</brood_coordination_wake>",
   ]
     .filter((part) => part !== undefined)
@@ -435,8 +474,12 @@ const renderCoordinationWake = (
 
 export const renderAgentCommand = (command: AgentCommand, maxResumePromptChars: number): string => {
   switch (command._tag) {
-    case "InitialGoal":
-      return appendNotice(normalizeText(command.goal), command.notice);
+    case "InitialGoal": {
+      const goal = appendNotice(normalizeText(command.goal), command.notice);
+      return command.operatorMessage === undefined
+        ? goal
+        : `${renderOperatorMessage(command.operatorMessage)}\n\n${goal}`;
+    }
     case "WaitSatisfied":
       return renderWaitSatisfied(command, maxResumePromptChars);
     case "CoordinationWake":

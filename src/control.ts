@@ -29,10 +29,16 @@ export interface PiRunResult {
 }
 
 export type PiRunOutcome =
-  | { readonly _tag: "Completed"; readonly result: PiRunResult }
+  | {
+      readonly _tag: "Completed";
+      readonly result: PiRunResult;
+      /** Operator messages the adapter observed being injected during this run. */
+      readonly deliveredOperatorMessages?: ReadonlyArray<string>;
+    }
   | {
       readonly _tag: "Suspended";
       readonly markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>];
+      readonly deliveredOperatorMessages?: ReadonlyArray<string>;
     };
 
 export const CoordinationNotice = Schema.Struct({
@@ -42,20 +48,26 @@ export const CoordinationNotice = Schema.Struct({
 });
 export interface CoordinationNotice extends Schema.Schema.Type<typeof CoordinationNotice> {}
 
+// `operatorMessage` is one normalized operator-authored body drained from the
+// registry: at most one per command, so the resume budget can always reserve
+// space for it whole. Remaining pending messages trigger further commands.
 export const AgentCommand = Schema.TaggedUnion({
   InitialGoal: {
     goal: Schema.String,
+    operatorMessage: Schema.optionalKey(Schema.String),
     notice: Schema.optionalKey(CoordinationNotice),
   },
   WaitSatisfied: {
     waitId: WaitId,
     dependencies: Schema.Array(DependencyOutcome),
     requests: Schema.Array(PeerRequestOutcome),
+    operatorMessage: Schema.optionalKey(Schema.String),
     notice: Schema.optionalKey(CoordinationNotice),
   },
   CoordinationWake: {
     notice: CoordinationNotice,
     waitingFor: AgentWaitCounts,
+    operatorMessage: Schema.optionalKey(Schema.String),
   },
 });
 export type AgentCommand = typeof AgentCommand.Type;

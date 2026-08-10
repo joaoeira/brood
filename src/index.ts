@@ -23,10 +23,16 @@ export {
 export { ModelProfile, ModelThinkingLevel } from "./profiles.js";
 export {
   makeBroodApplication,
+  makeBroodApplicationFromUnknown,
   runBrood,
   type BroodApplication,
   type BroodController,
 } from "./main.js";
+export {
+  OperatorMessageRejected,
+  type BulletinView,
+  type OperatorMessageDelivery,
+} from "./registry.js";
 export { BroodConfigInput, type BroodConfigEncoded } from "./runtime.js";
 export { AgentDetail, SwarmStatus, type StatusAgent } from "./status.js";
 export type { SupervisorEvent } from "./supervisor.js";

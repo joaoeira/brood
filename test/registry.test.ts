@@ -19,6 +19,8 @@ import {
   MAX_REQUEST_TARGETS_PER_WAIT,
   MAX_TOOL_RESULT_CHARS,
   MAX_UNREAD_MESSAGES_PER_AGENT,
+  MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT,
+  makeOperatorMessageId,
   makeAgentPath,
   makeRequestId,
   type RequestId,
@@ -1252,6 +1254,233 @@ it.effect("keeps a parked recipient asleep through passive coordination updates"
         _tag: "WaitSatisfied",
         notice: { unreadMessages: 1, unseenBulletins: 1 },
       },
+    });
+  }),
+);
+
+it.effect("wakes a parked recipient with an operator message and reparks after handling", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    const claim = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, claim.token);
+    const dependency = (yield* registry.registerBatch({
+      parentId: worker.id,
+      invocationId: makeToolInvocationId("delegate-dependency"),
+      children: [{ name: makeAgentName("dependency"), goal: "dependency", profile }],
+      wait: "all",
+    })).children[0]!;
+    yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-dependency"),
+          },
+        ],
+      },
+    });
+    const taker = yield* Effect.forkChild(registry.takePendingCommand(worker.id));
+
+    const delivery = yield* registry.deliverOperatorMessage(
+      worker.id,
+      makeOperatorMessageId("opmsg_park-steer"),
+      "Focus on the API surface first.",
+    );
+    const wakeClaim = yield* Fiber.join(taker);
+    const woken = yield* registry.beginRun(worker.id, wakeClaim.token);
+    const decision = yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: wakeClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "noted", finalMessageId: undefined, stopReason: "stop" },
+      },
+      completedResult: result(worker.id, "noted"),
+    });
+
+    expect(delivery).toEqual({ to: worker.path, recipientState: "waiting" });
+    expect(wakeClaim.trigger).toBe("coordination");
+    expect(woken).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "CoordinationWake",
+        operatorMessage: "Focus on the API surface first.",
+        notice: { unreadMessages: 0, openRequests: 0, unseenBulletins: 0 },
+      },
+    });
+    expect(decision).toMatchObject({ _tag: "Park", targetIds: [dependency.id] });
+  }),
+);
+
+it.effect(
+  "rejects operator messages to terminal or saturated recipients and keeps them out of the inbox",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+      const root = yield* registry.registerRoot({
+        name: makeAgentName("root"),
+        goal: "coordinate",
+        profile,
+      });
+      const children = (yield* registry.registerBatch({
+        parentId: root.id,
+        invocationId: makeToolInvocationId("delegate-children"),
+        children: [
+          { name: makeAgentName("worker"), goal: "work", profile },
+          { name: makeAgentName("doomed"), goal: "die", profile },
+        ],
+        wait: "none",
+      })).children;
+      const worker = children[0]!;
+      const doomed = children[1]!;
+
+      yield* registry.settle(doomed.id, completed(doomed.id));
+      const terminal = yield* Effect.flip(
+        registry.deliverOperatorMessage(doomed.id, makeOperatorMessageId("opmsg_late"), "too late"),
+      );
+
+      yield* registry.sendMessage(root.id, makeToolInvocationId("peer-first"), {
+        to: worker.path,
+        message: "peer context",
+      });
+      yield* registry.deliverOperatorMessage(
+        worker.id,
+        makeOperatorMessageId("opmsg_direct"),
+        "operator steer",
+      );
+      const read = yield* registry.readMessages(worker.id, makeToolInvocationId("read-mixed"), {});
+
+      yield* Effect.forEach(
+        Array.from({ length: MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT - 1 }, (_, index) => index),
+        (index) =>
+          registry.deliverOperatorMessage(
+            worker.id,
+            makeOperatorMessageId(`opmsg_fill-${index}`),
+            `steer ${index}`,
+          ),
+      );
+      const overflow = yield* Effect.flip(
+        registry.deliverOperatorMessage(
+          worker.id,
+          makeOperatorMessageId("opmsg_overflow"),
+          "one too many",
+        ),
+      );
+
+      expect(terminal).toMatchObject({
+        _tag: "OperatorMessageRejected",
+        reason: "RecipientTerminal",
+      });
+      // Operator messages never surface through the peer inbox.
+      expect(read.items).toEqual([{ kind: "message", from: root.path, message: "peer context" }]);
+      expect(overflow).toMatchObject({
+        _tag: "OperatorMessageRejected",
+        reason: "CapacityExceeded",
+      });
+    }),
+);
+
+it.effect(
+  "turns an operator message racing completion into a coordination turn before settlement",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ maxAgentAdmissions: 1, ...deterministicIds() });
+      const root = yield* registry.registerRoot({
+        name: makeAgentName("root"),
+        goal: "coordinate",
+        profile,
+      });
+      const claim = yield* registry.takePendingCommand(root.id);
+      yield* registry.beginRun(root.id, claim.token);
+
+      yield* registry.deliverOperatorMessage(
+        root.id,
+        makeOperatorMessageId("opmsg_race"),
+        "One more thing before you finish.",
+      );
+      const raced = yield* registry.finishTurn({
+        agentId: root.id,
+        commandToken: claim.token,
+        piOutcome: {
+          _tag: "Completed",
+          result: { finalText: "premature", finalMessageId: undefined, stopReason: "stop" },
+        },
+        completedResult: result(root.id, "premature"),
+      });
+      const wakeClaim = yield* registry.takePendingCommand(root.id);
+      const woken = yield* registry.beginRun(root.id, wakeClaim.token);
+      const final = yield* registry.finishTurn({
+        agentId: root.id,
+        commandToken: wakeClaim.token,
+        piOutcome: {
+          _tag: "Completed",
+          result: { finalText: "final", finalMessageId: undefined, stopReason: "stop" },
+        },
+        completedResult: result(root.id, "final"),
+      });
+
+      expect(raced).toEqual({ _tag: "RunNext" });
+      expect(woken).toMatchObject({
+        _tag: "Ready",
+        command: {
+          _tag: "CoordinationWake",
+          operatorMessage: "One more thing before you finish.",
+        },
+      });
+      expect(final).toMatchObject({
+        _tag: "Settled",
+        outcome: { _tag: "Completed", result: { summary: "final" } },
+      });
+    }),
+);
+
+it.effect("settles directly when a steered operator message was confirmed injected", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 1, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const claim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, claim.token);
+
+    yield* registry.deliverOperatorMessage(
+      root.id,
+      makeOperatorMessageId("opmsg_steered"),
+      "Steered mid-run.",
+    );
+    const final = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "done", finalMessageId: undefined, stopReason: "stop" },
+        deliveredOperatorMessages: ["opmsg_steered"],
+      },
+      completedResult: result(root.id, "done"),
+    });
+
+    // The confirmed injection settles the message in the same transaction, so
+    // no coordination turn is owed and no duplicate delivery can follow.
+    expect(final).toMatchObject({
+      _tag: "Settled",
+      outcome: { _tag: "Completed", result: { summary: "done" } },
     });
   }),
 );

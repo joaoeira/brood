@@ -42,6 +42,7 @@ import {
   MAX_INCOMING_REQUESTS_PER_AGENT,
   MAX_REQUEST_TARGETS_PER_WAIT,
   MAX_TOOL_RESULT_CHARS,
+  MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT,
   MAX_UNREAD_MESSAGES_PER_AGENT,
   PostBulletinRejected,
   ReadBulletinsRejected,
@@ -70,6 +71,7 @@ import {
   type PeerRequestOutcome,
   type ReplyToRequestInput,
   type ReplyToRequestResult,
+  type OperatorMessageId,
   type RequestId,
   type SendMessageInput,
   type SendMessageResult,
@@ -171,6 +173,28 @@ export interface RegistrySnapshot {
   readonly retainedBulletinCount: number;
 }
 
+/** Operator projection of one retained bulletin post. Bodies are model-authored
+ * text: operator surfaces may show them, agent-facing events must not. */
+export interface BulletinView {
+  readonly sequence: number;
+  readonly author: AgentPath;
+  readonly body: string;
+}
+
+/** Operator-surface rejection for a direct operator message; never crosses the Pi boundary. */
+export class OperatorMessageRejected extends Schema.TaggedError<OperatorMessageRejected>()(
+  "OperatorMessageRejected",
+  {
+    reason: Schema.Literals(["InvalidBody", "RecipientTerminal", "CapacityExceeded"]),
+    message: Schema.String,
+  },
+) {}
+
+export interface OperatorMessageDelivery {
+  readonly to: AgentPath;
+  readonly recipientState: "queued" | "starting" | "running" | "waiting";
+}
+
 interface WaitTargets {
   readonly dependencies: ReadonlyArray<AgentId>;
   readonly requests: ReadonlyArray<RequestId>;
@@ -212,6 +236,14 @@ type InboxEntry =
       readonly requestId: RequestId;
       readonly presented: boolean;
     };
+
+/** One operator message the registry holds only until a delivery commits:
+ * either the adapter confirms a steered injection, or the next command drains
+ * it into the prompt. Never readable through the peer inbox. */
+interface PendingOperatorMessage {
+  readonly id: OperatorMessageId;
+  readonly body: string;
+}
 
 type RequestState =
   | { readonly _tag: "Open" }
@@ -255,6 +287,7 @@ interface AgentEntry extends RegisteredAgent {
   readonly bulletinCursor: number;
   readonly requestWakeGeneration: number;
   readonly claimedRequestWakeGeneration: number;
+  readonly operatorMessages: ReadonlyArray<PendingOperatorMessage>;
   readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWait>;
   readonly activeWait: ActiveWait | undefined;
   readonly childrenByName: ReadonlyMap<AgentName, AgentId>;
@@ -458,6 +491,18 @@ export interface AgentRegistry {
   ) => Effect.Effect<ReadonlyArray<CommittedSettlement>>;
   readonly awaitQuiescence: Effect.Effect<void>;
   readonly snapshot: Effect.Effect<RegistrySnapshot>;
+  /** Full retained bulletin board in global sequence order, for operator
+   * surfaces only. Never rendered into agent-facing prompts or events. */
+  readonly bulletinBoard: Effect.Effect<ReadonlyArray<BulletinView>>;
+  /** Operator-only direct delivery. Unlike peer sends this wakes a parked
+   * recipient: the operator is steering the run, not leaving passive mail.
+   * The message is retained only until a delivery commits — a steer confirmed
+   * through finishTurn, or a drain into the next command by beginRun. */
+  readonly deliverOperatorMessage: (
+    id: AgentId,
+    messageId: OperatorMessageId,
+    body: string,
+  ) => Effect.Effect<OperatorMessageDelivery, UnknownAgent | OperatorMessageRejected>;
 }
 
 const makeEntry = (
@@ -485,6 +530,7 @@ const makeEntry = (
   bulletinCursor: 0,
   requestWakeGeneration: 0,
   claimedRequestWakeGeneration: 0,
+  operatorMessages: [],
   plannedWaits: new Map(),
   activeWait: undefined,
   childrenByName: new Map(),
@@ -1060,6 +1106,53 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     });
   });
 
+  const deliverOperatorMessage = Effect.fn("Brood.Registry.deliverOperatorMessage")(function* (
+    id: AgentId,
+    messageId: OperatorMessageId,
+    body: string,
+  ) {
+    const deliveredAt = yield* Clock.currentTimeMillis;
+    return yield* transact(
+      (state): Transition<OperatorMessageDelivery, UnknownAgent | OperatorMessageRejected> =>
+        withAgent<OperatorMessageDelivery, OperatorMessageRejected>(state, id, (recipient) => {
+          if (recipient.outcome !== undefined) {
+            return noChange(
+              state,
+              Result.fail(
+                new OperatorMessageRejected({
+                  reason: "RecipientTerminal",
+                  message: `${recipient.path} is terminal and cannot read new messages.`,
+                }),
+              ),
+            );
+          }
+          if (recipient.operatorMessages.length >= MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT) {
+            return noChange(
+              state,
+              Result.fail(
+                new OperatorMessageRejected({
+                  reason: "CapacityExceeded",
+                  message: `${recipient.path} already has ${MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT} undelivered operator messages.`,
+                }),
+              ),
+            );
+          }
+          return {
+            next: replaceAgent(state, {
+              ...recipient,
+              operatorMessages: [...recipient.operatorMessages, { id: messageId, body }],
+              updatedAt: deliveredAt,
+            }),
+            actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
+            result: Result.succeed({
+              to: recipient.path,
+              recipientState: addressableState(recipient.status),
+            }),
+          };
+        }),
+    );
+  });
+
   const askAgent = Effect.fn("Brood.Registry.askAgent")(function* (
     callerId: AgentId,
     invocationId: ToolInvocationId,
@@ -1254,6 +1347,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             question: request.question,
           };
         }
+        // Deliberate overestimates: every count is bounded by the whole inbox,
+        // so the budget check can only be more conservative than the result.
         const projectedChars = inboxProjectionSize({
           items: [...selected.map(({ item: selectedItem }) => selectedItem), item],
           inbox: {
@@ -1265,15 +1360,15 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         if (projectedChars + 512 > MAX_TOOL_RESULT_CHARS) break;
         selected.push({ source, item });
       }
-      const selectedMessages = new Set(
-        selected.flatMap(({ source }) => (source._tag === "Message" ? [source.sequence] : [])),
+      const selectedSequences = new Set(
+        selected.flatMap(({ source }) => (source._tag === "Request" ? [] : [source.sequence])),
       );
       const selectedRequests = new Set(
         selected.flatMap(({ source }) => (source._tag === "Request" ? [source.requestId] : [])),
       );
       const retainedInbox = caller.inbox.flatMap((item): ReadonlyArray<InboxEntry> => {
-        if (item._tag === "Message") return selectedMessages.has(item.sequence) ? [] : [item];
-        return selectedRequests.has(item.requestId) ? [] : [item];
+        if (item._tag === "Request") return selectedRequests.has(item.requestId) ? [] : [item];
+        return selectedSequences.has(item.sequence) ? [] : [item];
       });
       const presentedRequests = selected.flatMap(({ source }): ReadonlyArray<InboxEntry> =>
         source._tag === "Request" ? [{ ...source, presented: true }] : [],
@@ -1636,6 +1731,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       ({ wakeGeneration }) => wakeGeneration > entry.claimedRequestWakeGeneration,
     );
 
+  // Pending operator messages are level-triggered without a watermark: every
+  // command drains one, so the count strictly decreases and cannot wake-loop.
+  const hasPendingOperatorMessage = (entry: AgentEntry): boolean =>
+    entry.operatorMessages.length > 0;
+
+  const hasCoordinationTrigger = (state: RegistryState, entry: AgentEntry): boolean =>
+    hasNewOpenRequest(state, entry) || hasPendingOperatorMessage(entry);
+
   const activeWaitSatisfied = (state: RegistryState, entry: AgentEntry): boolean => {
     const active = entry.activeWait;
     if (active === undefined) return false;
@@ -1719,7 +1822,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
               ? "initial"
               : activeWaitSatisfied(state, entry)
                 ? "wait-satisfied"
-                : hasNewOpenRequest(state, entry)
+                : hasCoordinationTrigger(state, entry)
                   ? "coordination"
                   : entry.status === "Queued"
                     ? "coordination"
@@ -1807,7 +1910,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           for (const requestId of active.requests) retainedRequests.delete(requestId);
           nextState = { ...state, requests: retainedRequests };
           nextEntry = { ...entry, activeWait: undefined };
-        } else if (hasNewOpenRequest(state, entry)) {
+        } else if (hasCoordinationTrigger(state, entry)) {
           const requiredNotice = notice ?? {
             unreadMessages: 0,
             openRequests: openIncomingRequests(state, entry).length,
@@ -1868,6 +1971,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             result: Result.succeed({ _tag: "Stale", status: "Waiting" }),
           };
         }
+        // Every command drains the oldest pending operator message whole; the
+        // resume budget reserves room for exactly one, and any remainder keeps
+        // the coordination trigger armed for the next turn.
+        const [pendingOperator, ...remainingOperator] = nextEntry.operatorMessages;
+        if (pendingOperator !== undefined) {
+          command = { ...command, operatorMessage: pendingOperator.body };
+          nextEntry = { ...nextEntry, operatorMessages: remainingOperator };
+        }
         const runningCommand: RunningCommand = {
           token,
         };
@@ -1923,6 +2034,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         activeWait: undefined,
         activity: undefined,
         inbox: [],
+        operatorMessages: [],
         outcome,
         updatedAt: settledAt,
         terminalAt: settledAt,
@@ -2082,12 +2194,20 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         }
       }
 
+      // Steer-confirmed operator messages settle here, in the same transaction
+      // that decides what happens next, so a delivered message can never also
+      // be drained into the following command.
+      const deliveredOperator = new Set(input.piOutcome.deliveredOperatorMessages ?? []);
       const reconciled: AgentEntry = {
         ...entry,
         runningCommand: undefined,
         turnInvocations: new Map(),
         plannedWaits: new Map(),
         activeWait,
+        operatorMessages:
+          deliveredOperator.size === 0
+            ? entry.operatorMessages
+            : entry.operatorMessages.filter(({ id }) => !deliveredOperator.has(id)),
         updatedAt: finishedAt,
       };
       const reconciledState = replaceAgent(state, reconciled);
@@ -2118,7 +2238,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           result: Result.succeed(FinishTurnDecision.RunNext()),
         };
       }
-      if (hasNewOpenRequest(reconciledState, reconciled)) {
+      if (hasCoordinationTrigger(reconciledState, reconciled)) {
         const pendingCompletedResult =
           input.piOutcome._tag === "Completed" && "completedResult" in input
             ? input.completedResult
@@ -2277,6 +2397,16 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
   // ── Snapshot ─────────────────────────────────────────────────────────────
 
+  const bulletinBoard = Ref.get(stateRef).pipe(
+    Effect.map((state): ReadonlyArray<BulletinView> =>
+      state.bulletins.map(({ sequence, authorPath, body }) => ({
+        sequence,
+        author: authorPath,
+        body,
+      })),
+    ),
+  );
+
   const snapshot = Ref.get(stateRef).pipe(
     Effect.map((state): RegistrySnapshot => {
       const agents = Array.from(state.agents.values(), (entry): AgentSnapshot => {
@@ -2311,7 +2441,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             entry.initialGoal !== undefined ||
             entry.claimedCommand !== undefined ||
             activeWaitSatisfied(state, entry) ||
-            hasNewOpenRequest(state, entry) ||
+            hasCoordinationTrigger(state, entry) ||
             entry.status === "Queued",
           interruptRequested: entry.interruptRequested,
           outcome: entry.outcome,
@@ -2359,5 +2489,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     settlePendingInstallations,
     awaitQuiescence,
     snapshot,
+    bulletinBoard,
+    deliverOperatorMessage,
   } satisfies AgentRegistry;
 });

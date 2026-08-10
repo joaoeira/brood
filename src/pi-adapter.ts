@@ -56,6 +56,14 @@ export interface PiAgent {
   readonly sessionId: string;
   readonly events: Stream.Stream<PiSessionEvent>;
   readonly run: (prompt: string) => Effect.Effect<PiRunOutcome, PiRunError | PiProtocolError>;
+  /**
+   * Queue a Brood-rendered message for injection at the live run's next turn
+   * boundary. Returns false — without queueing — when no run is in flight or
+   * the current run has already committed to stopping; the caller falls back
+   * to command-boundary delivery. Injection is confirmed through the settled
+   * run's `deliveredOperatorMessages`, never assumed.
+   */
+  readonly steer: (renderedMessage: string) => boolean;
 }
 
 export interface PiOpenRequest {
@@ -213,13 +221,28 @@ interface RunClassifier {
   finalTurn: AssistantMessage | undefined;
   protocolError: PiProtocolError | undefined;
   suspension: Suspension;
+  /** True once shouldStopAfterTurn committed to ending this run; steers are refused after. */
+  stopDecided: boolean;
+  /** Operator-message ids observed as injected user messages during this run. */
+  deliveredOperatorMessages: Array<string>;
 }
 
 const freshClassifier = (): RunClassifier => ({
   finalTurn: undefined,
   protocolError: undefined,
   suspension: Suspension.None(),
+  stopDecided: false,
+  deliveredOperatorMessages: [],
 });
+
+const OPERATOR_MESSAGE_ID_PATTERN = /^<brood_operator_message id="(opmsg_[A-Za-z0-9-]+)"/;
+
+const userMessageText = (content: string | ReadonlyArray<{ type: string }>): string =>
+  typeof content === "string"
+    ? content
+    : content
+        .map((block) => ("text" in block && typeof block.text === "string" ? block.text : ""))
+        .join("\n");
 
 const safeMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
@@ -291,7 +314,11 @@ const classifySettledRun = (
         new PiProtocolError({ agentId, message: "Suspension marker was not on a toolUse turn" }),
       );
     }
-    return Effect.succeed({ _tag: "Suspended", markers: state.suspension.markers });
+    return Effect.succeed({
+      _tag: "Suspended",
+      markers: state.suspension.markers,
+      deliveredOperatorMessages: state.deliveredOperatorMessages,
+    });
   }
 
   const stopReason: StopReason = turn.stopReason;
@@ -312,6 +339,7 @@ const classifySettledRun = (
           finalMessageId: turn.responseId,
           stopReason: "stop",
         },
+        deliveredOperatorMessages: state.deliveredOperatorMessages,
       });
     case "pending":
     case "length":
@@ -478,10 +506,18 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
             Continue: () => false,
             Suspend: ({ markers }) => {
               classifier.suspension = Suspension.Marked({ turn: message, markers });
+              classifier.stopDecided = true;
+              // The loop stops without draining steering, and AgentSession
+              // would auto-continue a stopped run whose queue is nonempty —
+              // which the classifier must reject. Undrained steers stay
+              // pending in the registry, so clearing loses nothing.
+              session.agent.clearSteeringQueue();
               return true;
             },
             Malformed: ({ error }) => {
               setFirstProtocolError(classifier, error);
+              classifier.stopDecided = true;
+              session.agent.clearSteeringQueue();
               return true;
             },
           });
@@ -489,6 +525,20 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
         const unsubscribe = session.subscribe((event) => {
           try {
             switch (event.type) {
+              case "message_end":
+                // A steered operator message becomes a persisted user message;
+                // its id attribute is the delivery confirmation finishTurn
+                // consumes. Command-embedded blocks carry no id.
+                if (event.message.role === "user") {
+                  const match = OPERATOR_MESSAGE_ID_PATTERN.exec(
+                    userMessageText(event.message.content),
+                  );
+                  const delivered = match?.[1];
+                  if (delivered !== undefined) {
+                    classifier.deliveredOperatorMessages.push(delivered);
+                  }
+                }
+                break;
               case "turn_start":
                 if (classifier.suspension._tag === "Marked") {
                   classifier.suspension = Suspension.Continued();
@@ -572,9 +622,15 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
       `Pi extensions loaded for ${request.agentId}`,
     );
 
+    let runInFlight = false;
     const acquireRun = Ref.getAndSet(inFlight, true).pipe(
       Effect.flatMap((alreadyActive) =>
         alreadyActive ? Effect.die(new ConcurrentPiRunDefect(request.agentId)) : Effect.void,
+      ),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          runInFlight = true;
+        }),
       ),
     );
 
@@ -597,14 +653,31 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
             Effect.andThen(Effect.suspend(() => classifySettledRun(request.agentId, state))),
           );
         },
-        () => Ref.set(inFlight, false),
+        () =>
+          Effect.sync(() => {
+            runInFlight = false;
+          }).pipe(Effect.andThen(Ref.set(inFlight, false))),
       ),
     );
+
+    const steer = (renderedMessage: string): boolean => {
+      // The event loop is single-threaded: stopDecided is set synchronously
+      // inside the stop hook, so a steer observed here either lands before the
+      // final drain or is refused — never silently dropped by the clear.
+      if (!runInFlight || classifier.stopDecided) return false;
+      session.agent.steer({
+        role: "user",
+        content: renderedMessage,
+        timestamp: Date.now(),
+      });
+      return true;
+    };
 
     return {
       sessionId: session.sessionId,
       events: Stream.fromQueue(queue),
       run,
+      steer,
     } satisfies PiAgent;
   }),
 });

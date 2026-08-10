@@ -452,6 +452,7 @@ describe("Pi control-result inspection", () => {
             finalMessageId: "response-1",
             stopReason: "stop",
           },
+          deliveredOperatorMessages: [],
         });
         expect(completed.events.map(({ sessionSequence }) => sessionSequence)).toEqual([
           1, 2, 3, 4,
@@ -587,6 +588,7 @@ describe("Pi control-result inspection", () => {
         );
         expect(outcomes.suspended).toEqual({
           _tag: "Suspended",
+          deliveredOperatorMessages: [],
           markers: [
             {
               _tag: "AgentWait",
@@ -691,6 +693,7 @@ describe("Pi control-result inspection", () => {
 
         expect(outcomes.suspended).toEqual({
           _tag: "Suspended",
+          deliveredOperatorMessages: [],
           markers: [
             {
               _tag: "RequestWait",
