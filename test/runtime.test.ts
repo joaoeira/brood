@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Duration, Effect } from "effect";
-import { minimumResumePromptChars } from "../src/render.js";
+import { DEFAULT_MAX_RESUME_PROMPT_CHARS, minimumResumePromptChars } from "../src/render.js";
 import {
   buildBroodRuntime,
   decodeBroodConfig,
@@ -44,6 +44,7 @@ describe("Brood runtime configuration", () => {
     const config = await Effect.runPromise(decodeBroodConfig(validConfig()));
     expect(config.maxAgentAdmissions).toBe(128);
     expect(config.maxAgentResultChars).toBe(12_000);
+    expect(config.maxResumePromptChars).toBe(DEFAULT_MAX_RESUME_PROMPT_CHARS);
     expect(config.maxProfileHelpChars).toBe(4_000);
     expect(Duration.toMillis(config.drainTimeout)).toBe(600_000);
     expect(Duration.toMillis(config.sessionCleanupTimeout)).toBe(30_000);

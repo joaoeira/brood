@@ -16,6 +16,7 @@ import {
   type ProfilesConfigInput,
 } from "./profiles.js";
 import {
+  DEFAULT_MAX_RESUME_PROMPT_CHARS,
   DEFAULT_MAX_FAILURE_MESSAGE_CHARS,
   MIN_BOUNDED_TEXT_CHARS,
   minimumResumePromptChars,
@@ -50,7 +51,9 @@ const BroodConfigFields = Schema.Struct({
   maxFailureMessageChars: BoundedTextChars.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(DEFAULT_MAX_FAILURE_MESSAGE_CHARS)),
   ),
-  maxResumePromptChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(48_000))),
+  maxResumePromptChars: PositiveInt.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(DEFAULT_MAX_RESUME_PROMPT_CHARS)),
+  ),
   maxProfileHelpChars: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(4_000))),
   drainTimeout: PositiveFiniteDuration.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed("10 minutes")),
