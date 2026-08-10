@@ -59,11 +59,16 @@ const WaitForAgentsInput = Schema.Struct({
   children: Schema.Array(AgentName).check(Schema.isMinLength(1)),
 });
 
+const strict = { onExcessProperty: "error" as const };
+
 const normalizeDelegateInput = Effect.fn("Brood.Tools.normalizeDelegateInput")(function* (
   input: unknown,
   catalogue: ProfileCatalogue,
 ) {
-  return yield* Schema.decodeUnknownEffect(DelegateInput)(input).pipe(
+  return yield* Schema.decodeUnknownEffect(
+    DelegateInput,
+    strict,
+  )(input).pipe(
     Effect.mapError((error) => invalidDelegate(`Invalid task batch: ${String(error)}`)),
     Effect.flatMap(
       (
@@ -97,7 +102,10 @@ const normalizeDelegateInput = Effect.fn("Brood.Tools.normalizeDelegateInput")(f
 });
 
 const normalizeNames = Effect.fn("Brood.Tools.normalizeNames")(function* (input: unknown) {
-  return yield* Schema.decodeUnknownEffect(WaitForAgentsInput)(input).pipe(
+  return yield* Schema.decodeUnknownEffect(
+    WaitForAgentsInput,
+    strict,
+  )(input).pipe(
     Effect.mapError(
       (error) =>
         new WaitRejected({

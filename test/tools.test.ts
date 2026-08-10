@@ -179,6 +179,35 @@ describe("Brood tools", () => {
     expect(port.delegate).not.toHaveBeenCalled();
   });
 
+  it("rejects excess control-tool properties before mutation", async () => {
+    const port = makePort();
+    const [delegate, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
+
+    await expect(
+      delegate.execute(
+        "call_1",
+        {
+          tasks: [{ name: "research", goal: "go", hidden: "ignored before" }],
+        } as never,
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("Invalid task batch");
+    await expect(
+      wait.execute(
+        "call_2",
+        { children: ["research"], hidden: "ignored before" } as never,
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("Invalid agent selection");
+
+    expect(port.delegate).not.toHaveBeenCalled();
+    expect(port.waitForAgents).not.toHaveBeenCalled();
+  });
+
   it("validates all wait names and renders terminal outcomes from details", async () => {
     const port = makePort();
     const [, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
