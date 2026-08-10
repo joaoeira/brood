@@ -452,13 +452,15 @@ const renderCoordinationWake = (
     ...(command.operatorMessage === undefined
       ? []
       : ["  Address the operator message above before continuing."]),
-    ...(command.notice.openRequests > 0 ? ["  A peer is waiting for your answer."] : []),
-    ...(hasPeerWork
+    ...(command.notice.openRequests > 0
       ? [
+          "  A peer is waiting for your answer.",
           "  Call read_messages, then use reply_to_request for each request you can answer.",
           "  Put answers longer than the reply limit under .brood/shared/ and name the path in the reply.",
         ]
-      : []),
+      : hasPeerWork
+        ? ["  A peer sent mail urgent enough to wake you; read it with read_messages."]
+        : []),
     "  After handling the messages, the controller can repark you on the active wait shown above.",
     "</brood_coordination_wake>",
   ]

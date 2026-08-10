@@ -229,6 +229,8 @@ type InboxEntry =
       readonly sequence: number;
       readonly fromId: AgentId;
       readonly body: string;
+      /** Present only on urgent sends; compared against the claimed watermark. */
+      readonly wakeGeneration?: number;
     }
   | {
       readonly _tag: "Request";
@@ -287,6 +289,8 @@ interface AgentEntry extends RegisteredAgent {
   readonly bulletinCursor: number;
   readonly requestWakeGeneration: number;
   readonly claimedRequestWakeGeneration: number;
+  readonly urgentWakeGeneration: number;
+  readonly claimedUrgentWakeGeneration: number;
   readonly operatorMessages: ReadonlyArray<PendingOperatorMessage>;
   readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWait>;
   readonly activeWait: ActiveWait | undefined;
@@ -530,6 +534,8 @@ const makeEntry = (
   bulletinCursor: 0,
   requestWakeGeneration: 0,
   claimedRequestWakeGeneration: 0,
+  urgentWakeGeneration: 0,
+  claimedUrgentWakeGeneration: 0,
   operatorMessages: [],
   plannedWaits: new Map(),
   activeWait: undefined,
@@ -1084,20 +1090,33 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         );
       }
       const sequence = nextSafeCounter(recipient.nextInboxSequence, "Inbox sequence");
+      const urgent = input.urgent === true;
+      const wakeGeneration = urgent
+        ? nextSafeCounter(recipient.urgentWakeGeneration, "Urgent wake generation")
+        : undefined;
       const agents = new Map(state.agents);
       agents.set(callerId, { ...claimed.success, updatedAt: deliveredAt });
       agents.set(recipientId, {
         ...recipient,
         inbox: [
           ...recipient.inbox,
-          { _tag: "Message", sequence, fromId: callerId, body: input.message },
+          {
+            _tag: "Message",
+            sequence,
+            fromId: callerId,
+            body: input.message,
+            ...(wakeGeneration === undefined ? {} : { wakeGeneration }),
+          },
         ],
         nextInboxSequence: sequence,
+        ...(wakeGeneration === undefined ? {} : { urgentWakeGeneration: wakeGeneration }),
         updatedAt: deliveredAt,
       });
       return {
         next: { ...state, agents },
-        actions: [],
+        // An urgent send wakes a parked recipient exactly like a question
+        // does; ordinary mail stays passive and waits for a natural boundary.
+        actions: urgent ? [PostCommitAction.Open({ latch: recipient.mailbox })] : [],
         result: Result.succeed({
           to: recipient.path,
           recipientState: addressableState(recipient.status),
@@ -1736,8 +1755,18 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
   const hasPendingOperatorMessage = (entry: AgentEntry): boolean =>
     entry.operatorMessages.length > 0;
 
+  const hasNewUrgentMessage = (entry: AgentEntry): boolean =>
+    entry.inbox.some(
+      (item) =>
+        item._tag === "Message" &&
+        item.wakeGeneration !== undefined &&
+        item.wakeGeneration > entry.claimedUrgentWakeGeneration,
+    );
+
   const hasCoordinationTrigger = (state: RegistryState, entry: AgentEntry): boolean =>
-    hasNewOpenRequest(state, entry) || hasPendingOperatorMessage(entry);
+    hasNewOpenRequest(state, entry) ||
+    hasPendingOperatorMessage(entry) ||
+    hasNewUrgentMessage(entry);
 
   const activeWaitSatisfied = (state: RegistryState, entry: AgentEntry): boolean => {
     const active = entry.activeWait;
@@ -1989,6 +2018,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           runningCommand,
           pendingCompletedResult: undefined,
           claimedRequestWakeGeneration: entry.requestWakeGeneration,
+          claimedUrgentWakeGeneration: entry.urgentWakeGeneration,
           turnInvocations: new Map(),
           plannedWaits: new Map(),
           updatedAt: beganAt,

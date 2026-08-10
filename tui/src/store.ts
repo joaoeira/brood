@@ -153,7 +153,9 @@ const describeLifecycle = (
     case "AgentResumed":
       return { text: `${pathOf(event.agentId)}  resumed`, tone: "muted" };
     case "MessageAccepted":
-      return { text: `${pathOf(event.fromId)} → ${event.toPath}  message`, tone: "muted" };
+      return event.urgent
+        ? { text: `${pathOf(event.fromId)} → ${event.toPath}  urgent message`, tone: "warn" }
+        : { text: `${pathOf(event.fromId)} → ${event.toPath}  message`, tone: "muted" };
     case "RequestOpened":
       return { text: `${pathOf(event.fromId)} → ${event.toPath}  question opened`, tone: "info" };
     case "RequestReplied":

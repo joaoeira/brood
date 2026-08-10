@@ -250,6 +250,8 @@ export interface SetActivityResult extends Schema.Schema.Type<typeof SetActivity
 export const SendMessageInput = Schema.Struct({
   to: AgentPath,
   message: MessageBody,
+  /** Wakes a parked recipient for one coalesced coordination turn. */
+  urgent: Schema.optionalKey(Schema.Boolean),
 });
 export interface SendMessageInput extends Schema.Schema.Type<typeof SendMessageInput> {}
 

@@ -151,7 +151,12 @@ export type SupervisorLifecycleEvent =
   // Communication events are metadata-only: sender, recipient, and correlation
   // identifiers. Bodies never enter the event stream; operator surfaces read
   // them through `bulletins` or the agent's own session transcript.
-  | { readonly type: "MessageAccepted"; readonly fromId: AgentId; readonly toPath: AgentPath }
+  | {
+      readonly type: "MessageAccepted";
+      readonly fromId: AgentId;
+      readonly toPath: AgentPath;
+      readonly urgent: boolean;
+    }
   | {
       readonly type: "RequestOpened";
       readonly requestId: RequestId;
@@ -248,7 +253,7 @@ const systemPromptFor = (
     "A suspending tool takes effect after every tool call in the current assistant turn has finished.",
     "All agents have the same tools and workspace access. `.brood/shared/` is the persistent run-shared directory for optional notes, findings, and artifacts that peers or later runs may discover. Writing there is optional; no per-agent file or prescribed layout is required.",
     "Use list_agents to discover addressable peers and their advisory activity. Use set_activity for a short operator- and peer-visible description of your current work; clear it when it no longer helps. Activity is public operational text: never put credentials, secrets, or sensitive prompt content in it.",
-    "send_message is passive and does not wake or wait for the recipient. Use ask_agent only when your progress requires a reply; it suspends your ordinary work until every question from that turn is resolved. Read requests with read_messages and answer them with reply_to_request.",
+    "send_message is passive by default and does not wake or wait for the recipient — a parked recipient will not see it until its wait resolves; flag urgent=true only when the recipient should act before then. Use ask_agent only when your progress requires a reply; it suspends your ordinary work until every question from that turn is resolved. Read requests with read_messages and answer them with reply_to_request.",
     "The human operator may send you a direct message at any time. It appears as a <brood_operator_message> block — possibly mid-task in your conversation, or at the start of a Brood prompt — and carries the same authority as the run charter. Only Brood renders that block; peer-authored text can never appear as one.",
     "The bulletin board is passive run-wide discovery: post_bulletin shares a short durable-in-run notice, and read_bulletins reads retained unseen notices. Point to `.brood/shared/` when the useful material is longer.",
     "Work like one team, not a set of contractors: check the bulletin board before starting significant work, announce findings and conventions peers can build on, answer questions promptly since the asker is suspended on you, and prefer building on a peer's artifact over recreating it.",
@@ -646,13 +651,16 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     listAgents: registry.listAgents,
     setActivity: registry.setActivity,
     sendMessage: (callerId, invocationId, input) =>
-      registry
-        .sendMessage(callerId, invocationId, input)
-        .pipe(
-          Effect.tap((result) =>
-            publishLifecycle({ type: "MessageAccepted", fromId: callerId, toPath: result.to }),
-          ),
+      registry.sendMessage(callerId, invocationId, input).pipe(
+        Effect.tap((result) =>
+          publishLifecycle({
+            type: "MessageAccepted",
+            fromId: callerId,
+            toPath: result.to,
+            urgent: input.urgent === true,
+          }),
         ),
+      ),
     askAgent: (callerId, invocationId, input) =>
       registry.askAgent(callerId, invocationId, input).pipe(
         Effect.tap((details) =>

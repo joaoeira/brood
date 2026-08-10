@@ -87,6 +87,13 @@ const SendMessageParameters = Type.Object(
       description:
         "What the recipient needs to know; name .brood/shared/ paths for anything longer.",
     }),
+    urgent: Type.Optional(
+      Type.Boolean({
+        default: false,
+        description:
+          "Set true only when the recipient should act before its current wait resolves; it wakes a parked recipient for one coordination turn. Ordinary mail is read at the next natural pause.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -260,7 +267,7 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
     name: "send_message",
     label: "Send message",
     description:
-      "Hand a specific peer something that helps their work: a result they are building on, a warning that your findings change their assumptions, the path to an artifact you left under .brood/shared/. Delivery is passive — it never wakes the recipient or waits, and they may terminate before reading it — so use ask_agent when your progress depends on a reply, and post_bulletin when the whole swarm should know.",
+      "Hand a specific peer something that helps their work: a result they are building on, a warning that your findings change their assumptions, the path to an artifact you left under .brood/shared/. Ordinary delivery is passive — it never wakes the recipient, and a parked recipient will not see it until its wait resolves, possibly too late to act. Set urgent=true when the recipient should change course before then; it wakes them once without suspending you. Use ask_agent when your progress depends on a reply, and post_bulletin when the whole swarm should know.",
     parameters: SendMessageParameters,
     prepareArguments: (params) => prepareToolArguments(decodeSendMessageInput(params)),
     executionMode: "sequential",
@@ -272,7 +279,9 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
         const input = yield* decodeSendMessageInput(params);
         const result = yield* port.sendMessage(callerId, invocationId, input);
         return textResult(
-          `Accepted a passive message for ${result.to}, currently ${result.recipientState}. It may not be read before that agent terminates.`,
+          input.urgent === true
+            ? `Accepted an urgent message for ${result.to}, currently ${result.recipientState}; a parked recipient is woken once to read it.`
+            : `Accepted a passive message for ${result.to}, currently ${result.recipientState}. It may not be read before that agent terminates.`,
           result,
         );
       });

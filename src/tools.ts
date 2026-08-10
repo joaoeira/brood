@@ -203,7 +203,7 @@ export const compileAgentToolFactory = (catalogue: ProfileCatalogue) => {
   );
   const delegateDescription = [
     "Create one or more equally capable agents in one atomic batch.",
-    "Children start with no context beyond their goal text: write each goal as a self-contained brief — the background they need, the concrete deliverable, where to leave artifacts under .brood/shared/, and what to report back.",
+    "Children start with no context beyond their goal text: write each goal as a self-contained brief — the background they need, the concrete deliverable, where to leave artifacts under .brood/shared/, what to report back, and when to interrupt you (an urgent send_message or an ask_agent question) instead of pressing on.",
     "The default is wait=all. Use wait=none only for deliberate fire-and-forget work.",
     "Suspension takes effect after every tool call in the current assistant turn completes. Tool calls later in the same turn must not assume delegated results are available.",
     [

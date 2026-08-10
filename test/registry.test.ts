@@ -1449,6 +1449,136 @@ it.effect(
     }),
 );
 
+it.effect("urgent messages wake a parked recipient once, coalesced, and repark after reading", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const children = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-children"),
+      children: [
+        { name: makeAgentName("worker"), goal: "work", profile },
+        { name: makeAgentName("scout"), goal: "scout", profile },
+      ],
+      wait: "none",
+    })).children;
+    const worker = children[0]!;
+    const scout = children[1]!;
+    const claim = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, claim.token);
+    const dependency = (yield* registry.registerBatch({
+      parentId: worker.id,
+      invocationId: makeToolInvocationId("delegate-dependency"),
+      children: [{ name: makeAgentName("dependency"), goal: "dependency", profile }],
+      wait: "all",
+    })).children[0]!;
+    yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-dependency"),
+          },
+        ],
+      },
+    });
+    const taker = yield* Effect.forkChild(registry.takePendingCommand(worker.id));
+
+    yield* registry.sendMessage(scout.id, makeToolInvocationId("urgent-1"), {
+      to: worker.path,
+      message: "The approach is wrong; stop and reroute.",
+      urgent: true,
+    });
+    yield* registry.sendMessage(scout.id, makeToolInvocationId("urgent-2"), {
+      to: worker.path,
+      message: "Second finding, same theme.",
+      urgent: true,
+    });
+    const wakeClaim = yield* Fiber.join(taker);
+    const woken = yield* registry.beginRun(worker.id, wakeClaim.token);
+    const read = yield* registry.readMessages(worker.id, makeToolInvocationId("read-urgent"), {});
+    const decision = yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: wakeClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "rerouted", finalMessageId: undefined, stopReason: "stop" },
+      },
+      completedResult: result(worker.id, "rerouted"),
+    });
+
+    expect(wakeClaim.trigger).toBe("coordination");
+    // Two urgent sends before the claim coalesce into one wake with both readable.
+    expect(woken).toMatchObject({
+      _tag: "Ready",
+      command: { _tag: "CoordinationWake", notice: { unreadMessages: 2 } },
+    });
+    expect(read.items).toHaveLength(2);
+    expect(decision).toMatchObject({ _tag: "Park", targetIds: [dependency.id] });
+  }),
+);
+
+it.effect("an urgent message racing completion forces one more turn before settlement", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const scout = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-scout"),
+      children: [{ name: makeAgentName("scout"), goal: "scout", profile }],
+      wait: "none",
+    })).children[0]!;
+    const claim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, claim.token);
+
+    yield* registry.sendMessage(scout.id, makeToolInvocationId("urgent-race"), {
+      to: root.path,
+      message: "Wait — read this before you conclude.",
+      urgent: true,
+    });
+    const raced = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "premature", finalMessageId: undefined, stopReason: "stop" },
+      },
+      completedResult: result(root.id, "premature"),
+    });
+    const wakeClaim = yield* registry.takePendingCommand(root.id);
+    const woken = yield* registry.beginRun(root.id, wakeClaim.token);
+    yield* registry.readMessages(root.id, makeToolInvocationId("read-race"), {});
+    const final = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: wakeClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "final", finalMessageId: undefined, stopReason: "stop" },
+      },
+      completedResult: result(root.id, "final"),
+    });
+
+    expect(raced).toEqual({ _tag: "RunNext" });
+    expect(woken).toMatchObject({ _tag: "Ready", command: { _tag: "CoordinationWake" } });
+    expect(final).toMatchObject({
+      _tag: "Settled",
+      outcome: { _tag: "Completed", result: { summary: "final" } },
+    });
+  }),
+);
+
 it.effect("settles directly when a steered operator message was confirmed injected", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({ maxAgentAdmissions: 1, ...deterministicIds() });
