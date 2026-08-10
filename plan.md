@@ -252,7 +252,12 @@ export const AgentWaitSummary = Schema.Struct({
 });
 export interface AgentWaitSummary extends Schema.Schema.Type<typeof AgentWaitSummary> {}
 
-export const AgentActivity = Schema.String;
+export const AgentActivity = Schema.String.pipe(
+  Schema.decode({
+    decode: SchemaGetter.transform(normalizeActivity),
+    encode: SchemaGetter.transform(normalizeActivity),
+  }),
+).check(Schema.isMinLength(1), codePointLimit(MAX_ACTIVITY_CHARS, "activity"));
 export type AgentActivity = typeof AgentActivity.Type;
 
 export const AgentDirectoryEntry = Schema.Struct({
@@ -308,10 +313,12 @@ A passive message is returned once and then deleted. An open request remains eli
 export const PeerRequestOutcome = Schema.TaggedUnion({
   Replied: {
     request: RequestId,
+    to: AgentPath,
     reply: Schema.String,
   },
   Unavailable: {
     request: RequestId,
+    to: AgentPath,
     recipientState: Schema.Literals(["completed", "failed", "interrupted"]),
     message: Schema.String,
   },
@@ -846,6 +853,12 @@ export const CoordinationNotice = Schema.Struct({
 });
 export interface CoordinationNotice extends Schema.Schema.Type<typeof CoordinationNotice> {}
 
+export const ActiveWaitCounts = Schema.Struct({
+  agentCompletions: Schema.Natural,
+  replies: Schema.Natural,
+});
+export interface ActiveWaitCounts extends Schema.Schema.Type<typeof ActiveWaitCounts> {}
+
 export const AgentCommand = Schema.TaggedUnion({
   InitialGoal: {
     goal: Schema.String,
@@ -859,7 +872,7 @@ export const AgentCommand = Schema.TaggedUnion({
   },
   CoordinationWake: {
     notice: CoordinationNotice,
-    waitingFor: AgentWaitSummary,
+    waitingFor: ActiveWaitCounts,
   },
 });
 export type AgentCommand = typeof AgentCommand.Type;
@@ -867,7 +880,7 @@ export type AgentCommand = typeof AgentCommand.Type;
 
 The notice contains no model-authored bodies. `openRequests` counts every request addressed to this agent that still needs its reply, including requests returned by an earlier `read_messages` call. It appears on every subsequent command until those requests settle. `unseenBulletins` counts retained posts after the caller's bulletin cursor but never creates a command by itself. This prevents a read-but-unanswered request from silently disappearing while keeping the board passive.
 
-`CoordinationWake` is caused only by a newly accepted question. Passive messages never create it. The prompt tells the recipient to call `read_messages`, answer outstanding requests before reparking when possible, and use the shared directory if an answer requires more than `MAX_REPLY_CHARS`.
+`CoordinationWake` is caused only by a newly accepted question. Passive messages never create it. It reports bounded counts rather than canonical-path arrays: exact targets remain available through `list_agents` and operator status, while a valid deep path set cannot overflow `maxResumePromptChars`. The prompt tells the recipient to call `read_messages`, answer outstanding requests before reparking when possible, and use the shared directory if an answer requires more than `MAX_REPLY_CHARS`.
 
 Open requests are not automatically re-woken forever. Repeated `read_messages` can recover them, and every later command repeats the open count, but v1 does not spend unbounded provider calls on a model that repeatedly refuses to answer. If the recipient terminates, the requester receives `Unavailable`.
 
@@ -926,6 +939,7 @@ type InboxEntry =
       readonly _tag: "Request";
       readonly sequence: InboxSequence;
       readonly requestId: RequestId;
+      readonly presented: boolean;
     };
 
 interface RequestRecord {
@@ -964,6 +978,8 @@ interface AgentCommunicationState {
         readonly token: CommandToken;
         readonly kind: "ordinary" | "coordination";
         readonly claimedRequestWakeGeneration: RequestWakeGeneration;
+        readonly invocations: ReadonlyMap<ToolInvocationId, ToolOperationName>;
+        readonly plannedWaits: ReadonlyMap<ToolInvocationId, PlannedWaitTargets>;
       }
     | undefined;
 }
@@ -977,7 +993,7 @@ interface RegistryCommunicationState {
 
 Sequence/generation counters start at 0 and first emission is 1. Increment past `Number.MAX_SAFE_INTEGER` is an invariant defect. They are trusted internal constructors, never decoded from model input or exposed in tool results.
 
-`MAX_UNREAD_MESSAGES_PER_AGENT` counts unread passive messages. `MAX_INCOMING_REQUESTS_PER_AGENT` separately counts open incoming requests, so message spam cannot block the clarification channel. Reading deletes passive messages but not requests. Reply or recipient termination removes the recipient's inbox reference but retains the settled `RequestRecord` until its outcome is claimed by the requester. Requester termination removes both. Therefore one agent cannot accumulate unbounded pending inbound state without discarding an undelivered outcome.
+`MAX_UNREAD_MESSAGES_PER_AGENT` counts unread passive messages. `MAX_INCOMING_REQUESTS_PER_AGENT` separately counts open incoming requests, so message spam cannot block the clarification channel. Reading deletes passive messages but not requests. A page selects unpresented open requests first, then passive messages, then already-presented open requests; selected requests become presented. This prevents the first page of unanswered requests from starving later requests while keeping every open request recoverable. Reply or recipient termination removes the recipient's inbox reference but retains the settled `RequestRecord` until its outcome is claimed by the requester. Requester termination removes both. Therefore one agent cannot accumulate unbounded pending inbound state without discarding an undelivered outcome.
 
 `MAX_REQUEST_TARGETS_PER_WAIT` counts planned, active, and settled-but-not-delivered request targets. This bounds the final continuation even when coordination turns merge more asks while a long-running dependency remains unresolved. Once an outcome is projected into a taken `WaitSatisfied` command, the request record is deleted: the prompt is now persisted by the Pi session. Requester termination also deletes its request records and recipient inbox references. No replay store or terminal-request tombstone is retained.
 
@@ -1003,7 +1019,7 @@ type FinishTurnInput =
     };
 
 type FinishTurnDecision = Data.TaggedEnum<{
-  Settle: { readonly outcome: AgentOutcome };
+  Settled: { readonly outcome: AgentOutcome };
   RunNext: Record<never, never>;
   Park: Record<never, never>;
 }>;
@@ -1017,7 +1033,7 @@ It atomically:
 2. activates exactly the planned waits named by the adapter's marker set;
 3. merges them into the active composite wait without exceeding `MAX_REQUEST_TARGETS_PER_WAIT`—successful admission has already reserved that target position;
 4. observes dependency outcomes, request outcomes, recipient terminal states, and newly accepted question generations;
-5. records pending work and returns one decision.
+5. commits terminal settlement, including request cleanup, terminal activity clearing, and completion wake actions, within this same transition when the result is terminal; otherwise it records pending work and returns one decision.
 
 Decision precedence is:
 
@@ -1029,14 +1045,16 @@ Decision precedence is:
 
 Passive unread messages and unseen bulletins do not prevent ordinary terminal settlement. Questions do: an accepted question arriving during a running prompt creates a newer request generation and therefore schedules a coordination command before normal completion.
 
-`RunNext` does not carry a prematurely built command. `takePendingCommand` closes the existing mailbox latch, rechecks authoritative state, and atomically:
+`RunNext` does not carry a prematurely built command. Command claiming and command materialization are intentionally split:
 
-- combines simultaneous wait satisfaction and a request wake;
-- builds one command with current inbox/open-request counts;
-- claims the current request-wake generation;
-- discards a stale request-wake trigger when no still-open incoming request carries a generation newer than the claimed watermark; a newer deleted ask cannot re-wake merely because an older unanswered request remains;
-- if the wait is satisfied, projects every outcome, clears the active wait, and deletes delivered request records exactly once;
-- records a fresh command token.
+```ts
+takePendingCommand(agentId: AgentId): Effect.Effect<CommandClaim, CommandInterrupted>;
+beginRun(agentId: AgentId, token: CommandToken): Effect.Effect<AgentCommand, CommandRejected>;
+```
+
+`takePendingCommand` runs outside the run semaphore. It closes the existing mailbox latch, rechecks authoritative state, discards a stale request-wake trigger when no still-open incoming request carries a generation newer than the claimed watermark, and atomically reserves a fresh command token without freezing the prompt payload. A newer deleted ask therefore cannot re-wake merely because an older unanswered request remains.
+
+After the controller acquires a run permit and lazily opens the Pi session, `beginRun` verifies ownership of that token, derives precedence from current state, combines simultaneous wait satisfaction and a request wake, changes queued/starting state to running, and materializes the final command with the current notice and wait state. If a wait is satisfied, this transition projects every outcome, clears the active wait, and deletes delivered request records exactly once. It then claims the current request-wake generation. A question accepted while the controller is queued or starting is therefore visible in that run; a question accepted after `beginRun` receives a newer generation and is handled by `finishTurn`. No controller waits on an empty mailbox while holding a run permit.
 
 If wait satisfaction and a question wake coexist, one `WaitSatisfied` command carries the notice; no second command competes for the single slot.
 
@@ -1127,7 +1145,7 @@ Do not add a broad `CommunicationService` merely to wrap the registry. The scope
 
 ### 11.2 Pi stop hook
 
-The adapter extends its closed successful-control-result decoder with `AskAgentToolDetails`. Pi 0.84.1 finalizes, appends, emits, and persists all tool results before awaiting `shouldStopAfterTurn`; parallel results retain assistant source order. The adapter can therefore stop transcript-safely after decoding every marker.
+The adapter extends its closed successful-control-result decoder with `AskAgentToolDetails`. Pi 0.84.1 finalizes, appends, emits, and persists all tool results before awaiting `shouldStopAfterTurn`; tool results retain assistant source order. The adapter can therefore stop transcript-safely after decoding every marker. The source-order fact is characterized with ordinary parallel tools; v1 marker-bearing Brood tools are sequential and do not pretend to exercise an unreachable parallel-marker path.
 
 The real-adapter test must prove that each accepted ask's successful result and details exist in agent state and session JSONL before `run()` returns `Suspended`.
 
@@ -1279,7 +1297,7 @@ Do not add a Queue per inbox. Queue ownership would split message/request state 
 Update `docs/phase-0-pi-compatibility.md` and pin tests for:
 
 1. successful tool details persist before `shouldStopAfterTurn`;
-2. parallel result ordering follows assistant source order;
+2. parallel ordinary-tool result ordering follows assistant source order;
 3. failed callbacks retain only `error.message` and empty details;
 4. Pi exposes steering methods but no safe dynamic hook for this protocol;
 5. v1 never calls steering or restores preparation hooks;
@@ -1475,7 +1493,7 @@ These are not semaphore deadlocks. A model may still create a semantic cycle by 
 - settlement precedes potentially blocking Pi cleanup;
 - post-commit cancellation cannot leave a committed request wake asleep;
 - tests use `it.effect`, explicit fakes, `Deferred`, `Latch`, and `TestClock`, never sleeps or scheduler guesses;
-- recognizable secrets in messages/questions/replies/files never appear in status, show, events, or tool descriptions;
+- communication stores are never mechanically projected into status, show, events, or tool descriptions; `show` may still contain model-authored text that independently quotes something the model previously read;
 - bulletin bodies never cross operational projections; activity is the explicitly operator-visible exception and is tested separately;
 - status/detail schema version 2 round-trips normalized activity, while version-1 decoders do not silently accept version-2 records;
 - a recognizable activity value appears in peer discovery and operator status exactly because activity is public;
@@ -1485,7 +1503,7 @@ These are not semaphore deadlocks. A model may still create a semantic cycle by 
 ### 18.13 Pinned Pi tests
 
 - successful ask details exist in agent state and JSONL before `Suspended` returns;
-- parallel markers preserve assistant source order;
+- multiple sequential markers in one assistant batch preserve assistant source order, while a separate pinned characterization proves Pi's parallel ordinary-tool ordering;
 - one failed ask does not erase successful markers from the same batch;
 - failed tool details remain empty while the actionable message persists;
 - no code calls Pi steering or preparation hooks;
