@@ -175,7 +175,7 @@ it.effect("reports bounded capacity and a canonical wait tree", () =>
 
       expect(JSON.stringify(status)).not.toContain("agent_");
       expect(status).toEqual({
-        version: 1,
+        version: 2,
         state: "running",
         elapsedMillis: 2_500,
         capacity: {
@@ -339,7 +339,7 @@ it.effect("keeps status outcome-free and exposes bounded detail by path or ID", 
       expect(JSON.stringify(status)).not.toContain("bounded result summary");
       expect(byPath).toEqual(byId);
       expect(byPath).toMatchObject({
-        version: 1,
+        version: 2,
         path: "root",
         id: rootId,
         state: "completed",
