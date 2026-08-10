@@ -1,10 +1,10 @@
 /**
- * Shared Brood vocabulary: identifiers, agent outcomes, the control protocol,
- * and every error the system can fail with.
+ * Shared Brood vocabulary: identifiers, agent outcomes, lifecycle state, and
+ * every error the system can fail with.
  *
  * This is the leaf module — it imports nothing else from src/, and every other
- * module builds on it. Model-profile types live in profiles.ts; the text the
- * model reads is produced in render.ts.
+ * module builds on it. Turn control lives in control.ts, model profiles in
+ * profiles.ts, and model-facing text in render.ts.
  */
 import { Cause, Schema } from "effect";
 
@@ -88,24 +88,6 @@ export const DependencyOutcome = Schema.Union([
   }),
 ]);
 export type DependencyOutcome = typeof DependencyOutcome.Type;
-
-export type AgentCommand =
-  | { readonly _tag: "InitialGoal"; readonly goal: string }
-  | {
-      readonly _tag: "Resume";
-      readonly waitId: WaitId;
-      readonly outcomes: ReadonlyArray<DependencyOutcome>;
-    };
-
-export type PiRunOutcome =
-  | { readonly _tag: "Completed"; readonly result: PiRunResult }
-  | { readonly _tag: "Suspended" };
-
-interface PiRunResult {
-  readonly finalText: string;
-  readonly finalMessageId: string | undefined;
-  readonly stopReason: "stop";
-}
 
 export const InterruptReason = Schema.Union([
   Schema.Struct({
@@ -203,9 +185,9 @@ export interface BroodRunRequest {
 }
 
 // ── Control protocol ────────────────────────────────────────────────────────
-// The transcript-visible contract between the two Brood tools and the Pi
-// adapter's suspension hook. Details payloads ride on tool results; the
-// adapter decodes them without importing the tool implementations.
+// Transcript-visible details for the two lifecycle-control tools. The Pi
+// adapter decodes them alongside communication markers without importing tool
+// implementations.
 
 export const BroodControl = Schema.Union([
   Schema.Struct({

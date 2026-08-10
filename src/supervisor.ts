@@ -213,7 +213,7 @@ const systemPromptFor = (
     "Use delegate for bounded parallel work and wait_for_agents to await direct children from earlier turns.",
     "A suspending tool takes effect after every tool call in the current assistant turn has finished.",
     "All agents have the same tools and workspace access. `.brood/shared/` is the persistent run-shared directory for optional notes, findings, and artifacts that peers or later runs may discover. Writing there is optional; no per-agent file or prescribed layout is required.",
-    "Use list_agents to discover addressable peers and their advisory activity. Use set_activity for a short operator- and peer-visible description of your current work; clear it when it no longer helps.",
+    "Use list_agents to discover addressable peers and their advisory activity. Use set_activity for a short operator- and peer-visible description of your current work; clear it when it no longer helps. Activity is public operational text: never put credentials, secrets, or sensitive prompt content in it.",
     "send_message is passive and does not wake or wait for the recipient. Use ask_agent only when your progress requires a reply; it suspends your ordinary work until every question from that turn is resolved. Read requests with read_messages and answer them with reply_to_request.",
     "The bulletin board is passive run-wide discovery: post_bulletin shares a short durable-in-run notice, and read_bulletins reads retained unseen notices. Point to `.brood/shared/` when the useful material is longer.",
     "Do not assume exclusive file ownership. Preserve unrelated existing work and account for concurrent edits by other agents.",

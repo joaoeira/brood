@@ -69,6 +69,9 @@ it.effect("runs the root with its configured profile and settles its normalized 
       expect(opened.systemPrompt).toContain("ask_agent only when your progress requires a reply");
       expect(opened.systemPrompt).toContain("bulletin board");
       expect(opened.systemPrompt).toContain("set_activity");
+      expect(opened.systemPrompt).toContain(
+        "never put credentials, secrets, or sensitive prompt content in it",
+      );
       expect(opened.systemPrompt).toContain("Canonical agent path: root; parent: none.");
       expect(opened.systemPrompt).not.toContain(rootId);
       expect(run.prompt).toContain('<agent_admissions limit="8" used="1" remaining="7" />');
@@ -160,7 +163,7 @@ it.effect(
 );
 
 it.effect(
-  "with one permit a child can question its parked parent and both resume their original waits",
+  "with one permit a parent handles child communication and resumes every dependency once",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -173,7 +176,7 @@ it.effect(
         const supervisor = yield* makeSupervisor({
           catalogue,
           piAdapter: fake,
-          ...testSupervisorConfig({ maxConcurrency: 1, maxAgentAdmissions: 2 }),
+          ...testSupervisorConfig({ maxConcurrency: 1, maxAgentAdmissions: 3 }),
         });
         const eventSubscription = yield* supervisor.events;
         const lifecycle = yield* Stream.fromSubscription(eventSubscription).pipe(
@@ -188,31 +191,49 @@ it.effect(
         const rootInitial = yield* fake.nextRun;
         const delegated = yield* supervisor.toolPort.delegate(
           rootId,
-          makeToolInvocationId("delegate-api"),
-          [{ name: makeAgentName("api"), goal: "implement the API" }],
+          makeToolInvocationId("delegate-api-and-audit"),
+          [
+            { name: makeAgentName("audit"), goal: "audit the API" },
+            { name: makeAgentName("api"), goal: "implement the API" },
+          ],
           "all",
         );
-        const child = delegated.agents[0];
-        if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
+        const audit = delegated.agents[0];
+        const api = delegated.agents[1];
+        if (api === undefined || audit === undefined) {
+          return yield* Effect.die(new Error("children were not registered"));
+        }
         yield* fake.suspend(rootId, [
           {
             _tag: "AgentWait",
             tool: "delegate",
-            invocationId: makeToolInvocationId("delegate-api"),
+            invocationId: makeToolInvocationId("delegate-api-and-audit"),
           },
         ]);
 
-        yield* fake.nextOpen;
-        const childInitial = yield* fake.nextRun;
+        const auditOpen = yield* fake.nextOpen;
+        const auditInitial = yield* fake.nextRun;
+        expect(auditOpen.agentId).toBe(audit.id);
+        const passiveMessage = "AUDIT_PRIVATE_BODY_54af9";
+        yield* supervisor.toolPort.sendMessage(
+          audit.id,
+          makeToolInvocationId("audit-message-root"),
+          { to: makeAgentPath("root"), message: passiveMessage },
+        );
+        yield* fake.complete(audit.id, "audit complete exactly once");
+
+        const apiOpen = yield* fake.nextOpen;
+        const apiInitial = yield* fake.nextRun;
+        expect(apiOpen.agentId).toBe(api.id);
         const asked = yield* supervisor.toolPort.askAgent(
-          child.id,
+          api.id,
           makeToolInvocationId("ask-root"),
           {
             to: makeAgentPath("root"),
             question: "Should this endpoint accept PUT?",
           },
         );
-        yield* fake.suspend(child.id, [
+        yield* fake.suspend(api.id, [
           {
             _tag: "RequestWait",
             tool: "ask_agent",
@@ -225,6 +246,12 @@ it.effect(
         expect(rootCoordination.sessionId).toBe(rootInitial.sessionId);
         expect(rootCoordination.prompt).toContain("<brood_coordination_wake");
         expect(rootCoordination.prompt).toContain('open_requests="1"');
+        expect(rootCoordination.prompt).toContain('unread_messages="1"');
+        const openStatus = yield* supervisor.status;
+        const apiWhileOpen = openStatus.agents[0]?.children.find(({ path }) => path === "root/api");
+        expect(apiWhileOpen?.waitTargets).toEqual(["root"]);
+        expect(JSON.stringify(openStatus)).not.toContain("Should this endpoint accept PUT?");
+        expect(JSON.stringify(openStatus)).not.toContain(passiveMessage);
         const inbox = yield* supervisor.toolPort.readMessages(
           rootId,
           makeToolInvocationId("read-root-question"),
@@ -235,22 +262,34 @@ it.effect(
           request: asked.request,
           from: "root/api",
         });
+        expect(inbox.items[1]).toMatchObject({
+          kind: "message",
+          from: "root/audit",
+          message: passiveMessage,
+        });
         yield* supervisor.toolPort.replyToRequest(rootId, makeToolInvocationId("answer-api"), {
           request: asked.request,
           message: "No. Implement POST and GET only.",
         });
+        const repliedStatus = yield* supervisor.status;
+        const apiAfterReply = repliedStatus.agents[0]?.children.find(
+          ({ path }) => path === "root/api",
+        );
+        expect(apiAfterReply?.waitTargets).toEqual([]);
+        expect(JSON.stringify(repliedStatus)).not.toContain("No. Implement POST and GET only.");
         yield* fake.complete(rootId, "answered clarification");
 
-        const childResumed = yield* fake.nextRun;
-        expect(childResumed.sessionId).toBe(childInitial.sessionId);
-        expect(childResumed.prompt).toContain("<brood_request_outcomes");
-        expect(childResumed.prompt).toContain("No. Implement POST and GET only.");
-        yield* fake.complete(child.id, "api complete");
+        const apiResumed = yield* fake.nextRun;
+        expect(apiResumed.sessionId).toBe(apiInitial.sessionId);
+        expect(apiResumed.prompt).toContain("<brood_request_outcomes");
+        expect(apiResumed.prompt).toContain("No. Implement POST and GET only.");
+        yield* fake.complete(api.id, "api complete exactly once");
 
         const rootResumed = yield* fake.nextRun;
         expect(rootResumed.sessionId).toBe(rootInitial.sessionId);
         expect(rootResumed.prompt).toContain("<brood_dependency_outcomes");
-        expect(rootResumed.prompt).toContain("api complete");
+        expect(rootResumed.prompt.match(/api complete exactly once/gu)).toHaveLength(1);
+        expect(rootResumed.prompt.match(/audit complete exactly once/gu)).toHaveLength(1);
         yield* fake.complete(rootId, "root complete");
 
         const outcome = yield* supervisor.awaitOutcome(rootId);
@@ -262,11 +301,13 @@ it.effect(
         const stats = yield* fake.snapshot;
 
         expect(outcome._tag).toBe("Completed");
-        expect(resumedIds).toEqual([child.id, rootId]);
+        expect(resumedIds).toEqual([api.id, rootId]);
         expect(stats.maxActiveRuns).toBe(1);
         expect(stats.runCounts.get(rootId)).toBe(3);
-        expect(stats.runCounts.get(child.id)).toBe(2);
-        expect(drain.terminalAgentCount).toBe(2);
+        expect(stats.runCounts.get(api.id)).toBe(2);
+        expect(stats.runCounts.get(audit.id)).toBe(1);
+        expect(auditInitial.runNumber).toBe(1);
+        expect(drain.terminalAgentCount).toBe(3);
       }),
     ),
 );

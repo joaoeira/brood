@@ -5,15 +5,15 @@ Brood runs a swarm of AI coding agents against a single goal.
 You give it one goal and one working folder. It starts one agent. That agent can
 recruit more agents to split the work — and those agents can recruit more. They
 work concurrently in the shared folder, wait on each other's results, and the
-run ends when the first agent delivers its final answer. You watch the whole
-swarm live from your terminal and can interrupt any part of it.
+run ends when the root agent delivers its final answer and stragglers drain. You
+watch the whole swarm live from your terminal and can interrupt any part of it.
 
 Under the hood, each agent is a real coding agent (built on the
 [Pi coding-agent SDK](https://pi.dev)) with file, edit, and shell tools — plus
-two Brood tools: `delegate`, which creates child agents, and `wait_for_agents`,
-which waits for their results. Brood itself is the supervisor: it schedules the
-swarm, enforces the limits, and guarantees that nothing deadlocks, leaks, or
-hangs forever.
+Brood tools for delegation, waiting, discovery, direct communication, activity,
+and a run-wide bulletin feed. Brood itself is the supervisor: it schedules the
+swarm, enforces the limits, settles failures, and prevents waiting agents from
+deadlocking the concurrency pool.
 
 ## What a run looks like
 
@@ -67,9 +67,18 @@ parent — the parent wakes up with a bounded failure summary alongside its
 siblings' results and decides what to do next.
 
 **The workspace is the real output.** Agents are instructed to write
-substantial work into the shared folder and keep their final responses short,
-naming the files they produced. Agent-to-agent results are bounded summaries;
-the deliverables live on disk.
+substantial work into the workspace and keep their final responses short,
+naming the files they produced. Brood also prepares `.brood/shared/` as an
+optional, durable place for notes or artifacts that later agents and later runs
+may discover. It has no prescribed layout and writing there is never mandatory.
+
+**Coordination is explicit.** Every addressable agent has a canonical path.
+Agents can discover peers, publish a short current activity, leave a passive
+message, or ask a correlated question that suspends the asker until the reply
+arrives. A run-wide bulletin feed is the passive, Twitter-like surface for
+findings useful to an unknown set of peers. Bodies remain bounded and out of
+operator status; longer material belongs in `.brood/shared/`, with its path in
+the message, reply, or bulletin.
 
 ## Quick start
 
@@ -176,12 +185,40 @@ For a live UI, use `makeBroodApplication` inside `Effect.scoped`: it exposes
 `run` plus a narrow controller with `status`, `show`, `interrupt`, and an
 `events` subscription. Agent tools and the model runtime stay private.
 
+## Agent communication
+
+Every agent receives the same coordination surface regardless of ancestry:
+
+```text
+list_agents       discover every nonterminal, addressable peer
+set_activity      replace or clear the caller's short operator-visible status
+send_message      leave passive information; it does not wake a parked peer
+ask_agent         ask a correlated question and wait for its reply
+read_messages     read passive messages and outstanding questions
+reply_to_request  resolve one question by its request ID
+post_bulletin     publish an attributed, run-wide passive post
+read_bulletins    read retained posts in sequence order
+```
+
+`ask_agent` is deliberately stronger than `send_message`: it wakes a parked
+recipient and prevents the asker from returning to ordinary work until the
+request settles. A recipient already running is notified only when its current
+model turn ends; Brood does not inject tokens into an in-flight provider call.
+Passive messages and bulletins never create work by themselves and may remain
+unread when an agent terminates. Communication targets use canonical paths such
+as `root/api/audit`, never raw UUIDs.
+
+The bulletin feed is run-scoped and retention is bounded. `.brood/shared/` is
+the cross-run mechanism: agents may organize it however the work demands, and
+may point peers to a file simply by including its path in ordinary text. There
+is no attachment field or required per-agent journal.
+
 ## What Brood deliberately does not do (v1)
 
 - No crash recovery: a killed process does not resume its swarm (transcripts
   survive for auditing).
-- No mid-run steering: you cannot message a running agent; you can only
-  interrupt it. The charter is fixed at start.
+- No token-level steering: a question accepted during a provider call is
+  reconciled at that turn's boundary. The run charter remains fixed at start.
 - No file locking or merge protocol in the workspace: agents are instructed to
   preserve concurrent work, not prevented from colliding.
 - No spend accounting: agent count is the only budget; tokens and cost are not
@@ -207,22 +244,25 @@ the opt-in provider smoke test.
 
 ### Where things live
 
-The module graph is a DAG rooted in three vocabulary files; every module
-imports only downward. Tests mirror `src/` one file to one file.
+The module graph is organized as a bottom-up DAG; vocabulary and control modules
+sit below stateful services. Tests mirror `src/` one file to one file.
 
-| Module              | Role                                                                         |
-| ------------------- | ---------------------------------------------------------------------------- |
-| `src/agent.ts`      | Shared vocabulary: identifiers, outcomes, the control protocol, every error. |
-| `src/profiles.ts`   | Model-profile schemas and one-time catalogue compilation.                    |
-| `src/render.ts`     | Everything a model reads: normalization, truncation, prompt envelopes.       |
-| `src/status.ts`     | Bounded status/detail projections and the human renderers.                   |
-| `src/registry.ts`   | The serialized state machine: admission, waits, settlement, shutdown.        |
-| `src/pi-adapter.ts` | The only module that talks to Pi: sessions, prompt bridge, suspension hook.  |
-| `src/tools.ts`      | The `delegate` / `wait_for_agents` tools.                                    |
-| `src/supervisor.ts` | Scheduling: the run semaphore, controller fibers, drain, monitoring.         |
-| `src/runtime.ts`    | Config decode/validation and wiring.                                         |
-| `src/main.ts`       | Programmatic entry point.                                                    |
-| `src/cli.ts`        | Thin operator shell.                                                         |
+| Module                       | Role                                                                        |
+| ---------------------------- | --------------------------------------------------------------------------- |
+| `src/agent.ts`               | Leaf vocabulary: identifiers, outcomes, lifecycle, and errors.              |
+| `src/communication.ts`       | Peer paths, messages, requests, bulletins, activity, and typed errors.      |
+| `src/control.ts`             | Turn commands and exact transcript suspension markers.                      |
+| `src/profiles.ts`            | Model-profile schemas and one-time catalogue compilation.                   |
+| `src/render.ts`              | Everything a model reads: normalization, truncation, and prompt envelopes.  |
+| `src/status.ts`              | Bounded status/detail projections and the human renderers.                  |
+| `src/registry.ts`            | Serialized admission, communication, waits, settlement, and shutdown state. |
+| `src/pi-adapter.ts`          | Pi sessions, prompt bridge, transcript inspection, and suspension hook.     |
+| `src/tools.ts`               | The `delegate` and `wait_for_agents` control tools.                         |
+| `src/communication-tools.ts` | The eight caller-bound peer-coordination tools.                             |
+| `src/supervisor.ts`          | Scheduling, session controllers, run permits, drain, and monitoring.        |
+| `src/runtime.ts`             | Config validation, shared-directory preparation, and wiring.                |
+| `src/main.ts`                | Programmatic entry point.                                                   |
+| `src/cli.ts`                 | Thin operator shell.                                                        |
 
 Architecture, protocol invariants, and the full test contract are documented in
 [`plan.md`](./plan.md); pinned Pi observations are in

@@ -129,6 +129,16 @@ the complete actionable sentence survives while typed fields do not. Brood
 must consequently put every model-actionable explanation in the error's
 `message`; rejected callbacks cannot carry a suspension marker in `details`.
 
+Before that callback, the pinned loop invokes an optional synchronous
+`tool.prepareArguments(raw)` and then passes its result to
+`validateToolArguments`. The latter clones the value and applies TypeBox
+`Value.Convert` before checking the schema. Brood therefore installs a
+`prepareArguments` function on every custom tool and runs its operation-specific
+strict Effect Schema decoder there. This rejects coercible values such as a
+numeric message body or a string-valued read limit before Pi can change their
+types. The asynchronous `execute` callback decodes the prepared value again as
+a defensive boundary.
+
 ## Steering, preparation, and prompt settlement
 
 The core loop polls steering once at loop startup. After a tool turn it invokes
@@ -158,3 +168,27 @@ or a custom name colliding with a built-in, fail session opening before Pi or th
 filesystem is touched. After creation, the adapter still compares the complete
 active set against that derived expectation and treats divergence as an
 invariant defect.
+
+## Effect v4 primitives
+
+Brood pins `effect@4.0.0-beta.105`; the implementation and deterministic tests
+compile against that exact version. The load-bearing APIs are:
+
+- `Semaphore.make(n)` and `semaphore.withPermit(effect)` for the global active-run
+  limit and the admission-to-installation shutdown barrier;
+- pure `Ref.modify` transactions for every registry check-and-commit transition;
+- v4 `Latch.make`, `Latch.await`, `Latch.open`, and `Latch.close` for condition
+  notifications whose truth remains in the authoritative registry state;
+- `Deferred` for exactly-once terminal outcomes;
+- `Clock.currentTimeMillis` so registry and monitoring time follows `TestClock`;
+- `PubSub.sliding` with effectful `PubSub.publish` for bounded, latest-biased,
+  explicitly lossy monitoring;
+- `Schema.TaggedError` and `Schema.TaggedUnion` for public errors and closed
+  protocol boundaries.
+
+No effectful work occurs inside a `Ref.modify` callback. A transaction returns
+idempotent wake actions (`Latch.open` or `Deferred.succeed`), and the caller runs
+those actions in an uninterruptible post-commit region. Lossy PubSub publication
+is intentionally outside that idempotent set. The focused registry, supervisor,
+status, and schema suites exercise these semantics without sleeps or scheduler
+yield guesses.

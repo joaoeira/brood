@@ -353,8 +353,9 @@ Author paths are stored with the post, so attribution survives author terminatio
 Each tool has:
 
 1. a TypeBox object schema passed to Pi, with `additionalProperties: false`, fixed maxima, defaults, and scheduling semantics in the description;
-2. an Effect Schema decoder for `unknown` at execution;
-3. semantic validation and mutation in the registry transaction.
+2. a synchronous `prepareArguments(unknown)` that runs the operation-specific strict Effect Schema decoder before Pi validates or coerces the value;
+3. the same Effect Schema decoder at execution as a second strict boundary;
+4. semantic validation and mutation in the registry transaction.
 
 Effect Schema structs ignore excess properties by default in the pinned version. Every tool decoder therefore uses:
 
@@ -362,7 +363,12 @@ Effect Schema structs ignore excess properties by default in the pinned version.
 Schema.decodeUnknownEffect(InputSchema, { onExcessProperty: "error" });
 ```
 
-TypeBox is useful model guidance, not the authoritative domain boundary.
+This ordering is required by Pi 0.84.1: without `prepareArguments`, Pi runs
+TypeBox `Value.Convert` before `execute`, so a numeric body or string-valued
+limit could be coerced into an accepted value. Preparation throws the
+operation-specific tagged error, whose actionable `message` Pi preserves in
+the failed tool result. TypeBox remains model guidance, not the authoritative
+domain boundary.
 
 ### 7.1 `delegate`
 
