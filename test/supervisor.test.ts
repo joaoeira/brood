@@ -108,7 +108,13 @@ it.effect(
         const child = delegated.agents[0];
         if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
         const childId = child.id;
-        yield* fake.suspend(rootId);
+        yield* fake.suspend(rootId, [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-1"),
+          },
+        ]);
 
         const childOpen = yield* fake.nextOpen;
         const childRun = yield* fake.nextRun;
@@ -166,7 +172,13 @@ it.effect("reports bounded capacity and a canonical wait tree", () =>
       );
       const child = delegated.agents[0];
       if (child === undefined) return yield* Effect.die(new Error("child was not registered"));
-      yield* fake.suspend(rootId);
+      yield* fake.suspend(rootId, [
+        {
+          _tag: "AgentWait",
+          tool: "delegate",
+          invocationId: makeToolInvocationId("delegate-status"),
+        },
+      ]);
       yield* fake.nextOpen;
       yield* fake.nextRun;
       yield* TestClock.adjust(2_500);

@@ -2,18 +2,16 @@
 import { Effect, Latch, Queue, Ref, Stream } from "effect";
 import type { Latch as LatchType } from "effect/Latch";
 import type { Queue as QueueType } from "effect/Queue";
-import {
-  PiOpenError,
-  PiProtocolError,
-  PiRunError,
-  type AgentId,
-  type PiRunOutcome,
-} from "../../src/agent.js";
+import { PiOpenError, PiProtocolError, PiRunError, type AgentId } from "../../src/agent.js";
+import type { PiRunOutcome, SuspensionMarker } from "../../src/control.js";
 import type { PiAdapter, PiAgent, PiOpenRequest, PiSessionEvent } from "../../src/pi-adapter.js";
 
 export type FakeRunStep =
   | { readonly _tag: "Complete"; readonly text: string }
-  | { readonly _tag: "Suspend" }
+  | {
+      readonly _tag: "Suspend";
+      readonly markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>];
+    }
   | { readonly _tag: "RunFailure"; readonly message: string }
   | { readonly _tag: "ProtocolFailure"; readonly message: string };
 
@@ -60,7 +58,10 @@ export interface FakePiAdapter extends PiAdapter {
   readonly nextRun: Effect.Effect<FakeRunObservation>;
   readonly nextCleanup: Effect.Effect<AgentId>;
   readonly complete: (agentId: AgentId, text: string) => Effect.Effect<void>;
-  readonly suspend: (agentId: AgentId) => Effect.Effect<void>;
+  readonly suspend: (
+    agentId: AgentId,
+    markers: readonly [SuspensionMarker, ...ReadonlyArray<SuspensionMarker>],
+  ) => Effect.Effect<void>;
   readonly failRun: (agentId: AgentId, message: string) => Effect.Effect<void>;
   readonly failProtocol: (agentId: AgentId, message: string) => Effect.Effect<void>;
   readonly emitEvent: (agentId: AgentId, type: PiSessionEvent["type"]) => Effect.Effect<void>;
@@ -87,7 +88,7 @@ const outcomeForStep = (
         },
       });
     case "Suspend":
-      return Effect.succeed({ _tag: "Suspended" });
+      return Effect.succeed({ _tag: "Suspended", markers: step.markers });
     case "RunFailure":
       return Effect.fail(new PiRunError({ agentId, message: step.message }));
     case "ProtocolFailure":
@@ -274,7 +275,7 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
     nextRun: Queue.take(runs),
     nextCleanup: Queue.take(cleanups),
     complete: (agentId, text) => offerStep(agentId, { _tag: "Complete", text }),
-    suspend: (agentId) => offerStep(agentId, { _tag: "Suspend" }),
+    suspend: (agentId, markers) => offerStep(agentId, { _tag: "Suspend", markers }),
     failRun: (agentId, message) => offerStep(agentId, { _tag: "RunFailure", message }),
     failProtocol: (agentId, message) => offerStep(agentId, { _tag: "ProtocolFailure", message }),
     emitEvent,
