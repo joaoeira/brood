@@ -36,7 +36,7 @@ describe("status projections", () => {
         agents: [],
       }),
     ).toEqual({
-      version: 1,
+      version: 2,
       state: "not_started",
       elapsedMillis: 0,
       capacity: {
@@ -90,5 +90,22 @@ describe("status projections", () => {
     expect(
       buildAgentDetail({ now: 2_000, agents: [agentSource()] }, "root/missing"),
     ).toBeUndefined();
+  });
+
+  it("projects one advisory activity line into status and detail", () => {
+    const root = agentSource({ activity: "checking Pi's stop hook" });
+    const status = buildSwarmStatus({
+      lifecycle: { state: "running", startedAt: 1_000 },
+      now: 2_000,
+      admissions: { limit: 8, used: 1, remaining: 7 },
+      maxConcurrency: 2,
+      activeRuns: 1,
+      agents: [root],
+    });
+
+    expect(status.agents[0]?.activity).toBe("checking Pi's stop hook");
+    expect(buildAgentDetail({ now: 2_000, agents: [root] }, "root")?.activity).toBe(
+      "checking Pi's stop hook",
+    );
   });
 });

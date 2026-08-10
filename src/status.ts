@@ -32,6 +32,7 @@ export interface StatusAgent {
   readonly name: string;
   readonly state: OperationalAgentState;
   readonly durationMillis: number;
+  readonly activity?: string;
   readonly waitTargets: ReadonlyArray<string>;
   readonly children: ReadonlyArray<StatusAgent>;
 }
@@ -41,12 +42,13 @@ export const StatusAgent = Schema.Struct({
   name: Schema.String,
   state: OperationalAgentState,
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  activity: Schema.optionalKey(Schema.String),
   waitTargets: Schema.Array(Schema.String),
   children: Schema.Array(Schema.suspend((): Schema.Codec<StatusAgent> => StatusAgent)),
 });
 
 export const SwarmStatus = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   state: SwarmRunState,
   elapsedMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   capacity: Schema.Struct({
@@ -71,7 +73,7 @@ export const SwarmStatus = Schema.Struct({
 export interface SwarmStatus extends Schema.Schema.Type<typeof SwarmStatus> {}
 
 export const AgentDetail = Schema.Struct({
-  version: Schema.Literal(1),
+  version: Schema.Literal(2),
   path: Schema.String,
   id: AgentId,
   parentId: Schema.optionalKey(AgentId),
@@ -79,6 +81,7 @@ export const AgentDetail = Schema.Struct({
   name: AgentName,
   state: OperationalAgentState,
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  activity: Schema.optionalKey(Schema.String),
   waitTargets: Schema.Array(Schema.String),
   children: Schema.Array(Schema.String),
   profile: PublicModelProfile,
@@ -102,6 +105,7 @@ export interface StatusAgentSource {
   readonly profile: PublicModelProfile;
   readonly status: AgentStatus;
   readonly waitTargets: ReadonlyArray<AgentId>;
+  readonly activity?: string;
   readonly outcome?: DependencyOutcome;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -205,6 +209,7 @@ const statusTree = (
       name: agent.name,
       state: operationalState(agent.status),
       durationMillis: Math.max(0, (agent.terminalAt ?? now) - agent.createdAt),
+      ...(agent.activity === undefined ? {} : { activity: agent.activity }),
       waitTargets: agent.waitTargets.map((targetId) => {
         const target = indexed.get(targetId);
         if (target === undefined) {
@@ -235,7 +240,7 @@ export const buildSwarmStatus = (input: StatusProjectionInput): SwarmStatus => {
   for (const agent of input.agents) counts[operationalState(agent.status)] += 1;
 
   return {
-    version: 1,
+    version: 2,
     state: input.lifecycle.state,
     elapsedMillis: elapsedMillis(input.lifecycle, input.now),
     capacity: {
@@ -262,7 +267,7 @@ export const buildAgentDetail = (
   const agent = selected.source;
   const parent = agent.parentId === undefined ? undefined : indexed.get(agent.parentId);
   return {
-    version: 1,
+    version: 2,
     path: selected.path,
     id: agent.id,
     ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
@@ -270,6 +275,7 @@ export const buildAgentDetail = (
     name: agent.name,
     state: operationalState(agent.status),
     durationMillis: Math.max(0, (agent.terminalAt ?? input.now) - agent.createdAt),
+    ...(agent.activity === undefined ? {} : { activity: agent.activity }),
     waitTargets: agent.waitTargets.map((targetId) => {
       const target = indexed.get(targetId);
       if (target === undefined) {
@@ -322,6 +328,7 @@ const renderStatusAgent = (
   const childPrefix = connector === "" ? prefix : `${prefix}${isLast ? "   " : "│  "}`;
   return [
     line,
+    ...(agent.activity === undefined ? [] : [`${childPrefix}   ${agent.activity}`]),
     ...agent.children.flatMap((child, index) =>
       renderStatusAgent(
         child,
@@ -358,6 +365,7 @@ export const formatAgentDetail = (detail: AgentDetail): string => {
     `Updated ${formatTimestamp(detail.updatedAt)}`,
   ];
   if (detail.parentPath !== undefined) lines.push(`Parent ${detail.parentPath}`);
+  if (detail.activity !== undefined) lines.push(`Activity ${detail.activity}`);
   if (detail.terminalAt !== undefined) lines.push(`Finished ${formatTimestamp(detail.terminalAt)}`);
   if (detail.waitTargets.length > 0) lines.push(`Waiting on ${detail.waitTargets.join(", ")}`);
   if (detail.children.length > 0) lines.push(`Children ${detail.children.join(", ")}`);

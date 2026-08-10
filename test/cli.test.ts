@@ -79,7 +79,7 @@ describe("CLI boundaries", () => {
 
   it("renders compact status without identifiers or outcome text", () => {
     const status: SwarmStatus = {
-      version: 1,
+      version: 2,
       state: "running",
       elapsedMillis: 2_500,
       capacity: {
@@ -128,7 +128,7 @@ describe("CLI boundaries", () => {
 
   it("renders bounded agent detail separately", () => {
     const detail: AgentDetail = {
-      version: 1,
+      version: 2,
       path: "root",
       id: makeAgentId("agent_123"),
       name: makeAgentName("root"),
