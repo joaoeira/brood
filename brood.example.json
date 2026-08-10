@@ -8,7 +8,6 @@
   "maxRunInstructionsChars": 4000,
   "maxAgentResultChars": 12000,
   "maxFailureMessageChars": 2000,
-  "maxResumePromptChars": 48000,
   "maxProfileHelpChars": 4000,
   "drainTimeout": "10 minutes",
   "sessionCleanupTimeout": "30 seconds",

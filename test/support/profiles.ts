@@ -1,5 +1,6 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExactModelLookup, ModelProfile, ProfilesConfigInput } from "../../src/profiles.js";
+import { DEFAULT_MAX_RESUME_PROMPT_CHARS } from "../../src/render.js";
 import type { SupervisorOptions } from "../../src/supervisor.js";
 
 export const scriptedModel: Model<"openai-responses"> = {
@@ -53,7 +54,7 @@ export const testSupervisorConfig = (
   maxAgentAdmissions: 8,
   maxAgentResultChars: 12_000,
   maxFailureMessageChars: 2_000,
-  maxResumePromptChars: 48_000,
+  maxResumePromptChars: DEFAULT_MAX_RESUME_PROMPT_CHARS,
   drainTimeoutMillis: 60_000,
   ...overrides,
 });

@@ -8,6 +8,7 @@ import { Effect } from "effect";
 import { expect, it } from "vitest";
 import { compileProfileCatalogue } from "../src/profiles.js";
 import { makePiAdapter } from "../src/pi-adapter.js";
+import { DEFAULT_MAX_RESUME_PROMPT_CHARS } from "../src/render.js";
 import { makeSupervisor } from "../src/supervisor.js";
 
 it("runs a real offline root-child-grandchild swarm through Pi at concurrency one", async () => {
@@ -100,7 +101,7 @@ it("runs a real offline root-child-grandchild swarm through Pi at concurrency on
             maxAgentAdmissions: 8,
             maxAgentResultChars: 12_000,
             maxFailureMessageChars: 2_000,
-            maxResumePromptChars: 48_000,
+            maxResumePromptChars: DEFAULT_MAX_RESUME_PROMPT_CHARS,
             drainTimeoutMillis: 60_000,
           });
           const rootId = yield* supervisor.startRoot({ goal: "coordinate recursively" });
