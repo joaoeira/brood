@@ -82,6 +82,22 @@ const makePort = (): ControlToolPort => ({
 });
 
 describe("Brood tools", () => {
+  it("strictly prepares every control-tool input before Pi can coerce it", () => {
+    const [delegate, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), makePort());
+
+    expect(delegate.prepareArguments).toBeTypeOf("function");
+    expect(wait.prepareArguments).toBeTypeOf("function");
+    expect(() => delegate.prepareArguments?.({ tasks: [{ name: "research", goal: 123 }] })).toThrow(
+      "Invalid task batch",
+    );
+    expect(() => wait.prepareArguments?.({ children: [123] })).toThrow("Invalid agent selection");
+    expect(
+      delegate.prepareArguments?.({
+        tasks: [{ name: " research ", goal: " investigate " }],
+      }),
+    ).toEqual({ tasks: [{ name: "research", goal: "investigate" }], wait: "all" });
+  });
+
   it("builds one delegate profile enum from the sorted run catalogue", () => {
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), makePort());
     expect(delegate?.name).toBe("delegate");

@@ -161,6 +161,8 @@ const renderWait = (details: WaitToolDetails, names: ReadonlyArray<AgentName>): 
 const runTool = <A, E>(effect: Effect.Effect<A, E>, signal: AbortSignal | undefined): Promise<A> =>
   Effect.runPromise(effect, signal === undefined ? undefined : { signal });
 
+const prepareToolArguments = <A, E>(effect: Effect.Effect<A, E>): A => Effect.runSync(effect);
+
 export const compileAgentToolFactory = (catalogue: ProfileCatalogue) => {
   const DelegateParameters = Type.Object(
     {
@@ -219,6 +221,10 @@ export const compileAgentToolFactory = (catalogue: ProfileCatalogue) => {
       label: "Delegate",
       description: delegateDescription,
       parameters: DelegateParameters,
+      prepareArguments: (params) => {
+        const input = prepareToolArguments(normalizeDelegateInput(params, catalogue));
+        return { tasks: input.tasks.map((task) => ({ ...task })), wait: input.wait };
+      },
       executionMode: "sequential",
       async execute(toolCallId, params, signal) {
         const program = Effect.gen(function* () {
@@ -240,6 +246,9 @@ export const compileAgentToolFactory = (catalogue: ProfileCatalogue) => {
       description:
         "Wait for named direct children created in an earlier turn. The full selection is validated atomically. If any are unfinished, this agent suspends only after every tool call in the current assistant turn completes.",
       parameters: WaitParameters,
+      prepareArguments: (params) => ({
+        children: [...prepareToolArguments(normalizeNames(params))],
+      }),
       executionMode: "sequential",
       async execute(toolCallId, params, signal) {
         const program = Effect.gen(function* () {

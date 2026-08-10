@@ -29,9 +29,16 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { makeAgentId } from "../src/agent.js";
+import {
+  MAX_BULLETIN_CHARS,
+  MAX_REPLY_CHARS,
+  type CommunicationToolPort,
+} from "../src/communication.js";
+import { makeCommunicationTools } from "../src/communication-tools.js";
 
 const thinkingLevels = [
   "off",
@@ -318,6 +325,116 @@ describe("pinned Pi SDK compatibility", () => {
         },
       ],
       details: {},
+    });
+  });
+
+  it("runs Brood preparation before Pi coercion and preserves actionable errors", async () => {
+    let portInvocations = 0;
+    const unreachable = () => {
+      portInvocations += 1;
+      return Effect.die("invalid raw input reached the communication port");
+    };
+    const port: CommunicationToolPort = {
+      listAgents: unreachable,
+      setActivity: unreachable,
+      sendMessage: unreachable,
+      askAgent: unreachable,
+      readMessages: unreachable,
+      replyToRequest: unreachable,
+      postBulletin: unreachable,
+      readBulletins: unreachable,
+    };
+    const definitions = makeCommunicationTools(makeAgentId("agent_compat"), port);
+    const tools = definitions.map((definition): AgentTool => {
+      const prepareArguments = definition.prepareArguments;
+      if (prepareArguments === undefined) {
+        throw new Error(`Missing argument preparer for ${definition.name}`);
+      }
+      return {
+        name: definition.name,
+        label: definition.label,
+        description: definition.description,
+        parameters: definition.parameters,
+        prepareArguments,
+        execute: (toolCallId, params, signal, onUpdate) =>
+          definition.execute(toolCallId, params, signal, onUpdate, {} as never),
+      };
+    });
+    const context: AgentContext = { systemPrompt: "", messages: [], tools };
+    let observedResults: ReadonlyArray<ToolResultMessage> = [];
+    const stream = agentLoop(
+      [createUserMessage("reject invalid raw inputs")],
+      context,
+      {
+        model: createModel(),
+        convertToLlm: identityConverter,
+        shouldStopAfterTurn: ({ toolResults }) => {
+          observedResults = toolResults;
+          return true;
+        },
+      },
+      undefined,
+      () => {
+        const response = new MockAssistantStream();
+        queueMicrotask(() => {
+          const message = createAssistantMessage(
+            [
+              {
+                type: "toolCall",
+                id: "invalid-message",
+                name: "send_message",
+                arguments: { to: "root/peer", message: 123 },
+              },
+              {
+                type: "toolCall",
+                id: "invalid-limit",
+                name: "read_messages",
+                arguments: { limit: "8" },
+              },
+              {
+                type: "toolCall",
+                id: "oversize-reply",
+                name: "reply_to_request",
+                arguments: {
+                  request: "request_1",
+                  message: "😀".repeat(MAX_REPLY_CHARS + 1),
+                },
+              },
+              {
+                type: "toolCall",
+                id: "oversize-bulletin",
+                name: "post_bulletin",
+                arguments: { message: "b".repeat(MAX_BULLETIN_CHARS + 1) },
+              },
+            ],
+            "toolUse",
+          );
+          response.push({ type: "done", reason: "toolUse", message });
+        });
+        return response;
+      },
+    );
+
+    await stream.result();
+
+    expect(portInvocations).toBe(0);
+    expect(observedResults).toHaveLength(4);
+    expect(observedResults.every(({ isError }) => isError)).toBe(true);
+    expect(observedResults[0]?.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Invalid send_message input"),
+    });
+    expect(observedResults[1]?.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Invalid read_messages limit"),
+    });
+    expect(observedResults[2]?.content[0]).toEqual({
+      type: "text",
+      text: `The reply contains ${MAX_REPLY_CHARS + 1} Unicode code points; the maximum is ${MAX_REPLY_CHARS}. Put the full answer under \`.brood/shared/\` and reply with a summary and path.`,
+    });
+    expect(observedResults[3]?.content[0]).toEqual({
+      type: "text",
+      text: `The bulletin contains ${MAX_BULLETIN_CHARS + 1} Unicode code points; the maximum is ${MAX_BULLETIN_CHARS}. Put the full material under \`.brood/shared/\` and post a short description with its path.`,
     });
   });
 

@@ -98,6 +98,27 @@ describe("communication vocabulary", () => {
     }),
   );
 
+  it.effect("reports exact oversize reply and bulletin counts with the shared-dir recovery", () =>
+    Effect.gen(function* () {
+      const reply = yield* Effect.flip(
+        decodeReplyToRequestInput({
+          request: "request_1",
+          message: repeated("😀", MAX_REPLY_CHARS + 1),
+        }),
+      );
+      const bulletin = yield* Effect.flip(
+        decodePostBulletinInput({ message: repeated("b", MAX_BULLETIN_CHARS + 1) }),
+      );
+
+      expect(reply.message).toBe(
+        `The reply contains ${MAX_REPLY_CHARS + 1} Unicode code points; the maximum is ${MAX_REPLY_CHARS}. Put the full answer under \`.brood/shared/\` and reply with a summary and path.`,
+      );
+      expect(bulletin.message).toBe(
+        `The bulletin contains ${MAX_BULLETIN_CHARS + 1} Unicode code points; the maximum is ${MAX_BULLETIN_CHARS}. Put the full material under \`.brood/shared/\` and post a short description with its path.`,
+      );
+    }),
+  );
+
   it.effect("turns activity into one inert display line and supports clearing it", () =>
     Effect.gen(function* () {
       const set = yield* decodeSetActivityInput({

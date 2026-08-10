@@ -67,6 +67,12 @@ const normalizePeerBody = (value: string): string =>
     .join("")
     .trim();
 
+const normalizedBodyLength = (input: unknown, field: string): number | undefined => {
+  if (typeof input !== "object" || input === null || !(field in input)) return undefined;
+  const value = Reflect.get(input, field);
+  return typeof value === "string" ? Array.from(normalizePeerBody(value)).length : undefined;
+};
+
 const codePointLimit = (maximum: number, label: string) =>
   Schema.makeFilter(
     (value: string) =>
@@ -477,13 +483,16 @@ export const decodeReplyToRequestInput = Effect.fn("Brood.Communication.decodeRe
       ReplyToRequestInput,
       strict,
     )(input).pipe(
-      Effect.mapError(
-        () =>
-          new ReplyRejected({
-            reason: "InvalidInput",
-            message: `Invalid reply_to_request input. Supply the exact request ID and a nonblank reply of at most ${MAX_REPLY_CHARS} Unicode code points; put longer material under .brood/shared/ and reply with its path.`,
-          }),
-      ),
+      Effect.mapError(() => {
+        const length = normalizedBodyLength(input, "message");
+        return new ReplyRejected({
+          reason: "InvalidInput",
+          message:
+            length !== undefined && length > MAX_REPLY_CHARS
+              ? `The reply contains ${length} Unicode code points; the maximum is ${MAX_REPLY_CHARS}. Put the full answer under \`.brood/shared/\` and reply with a summary and path.`
+              : `Invalid reply_to_request input. Supply the exact request ID and a nonblank reply of at most ${MAX_REPLY_CHARS} Unicode code points; put longer material under .brood/shared/ and reply with its path.`,
+        });
+      }),
     );
   },
 );
@@ -494,13 +503,16 @@ export const decodePostBulletinInput = Effect.fn("Brood.Communication.decodePost
       PostBulletinInput,
       strict,
     )(input).pipe(
-      Effect.mapError(
-        () =>
-          new PostBulletinRejected({
-            reason: "InvalidInput",
-            message: `Invalid post_bulletin input. Supply a nonblank post of at most ${MAX_BULLETIN_CHARS} Unicode code points; put longer material under .brood/shared/ and post its path.`,
-          }),
-      ),
+      Effect.mapError(() => {
+        const length = normalizedBodyLength(input, "message");
+        return new PostBulletinRejected({
+          reason: "InvalidInput",
+          message:
+            length !== undefined && length > MAX_BULLETIN_CHARS
+              ? `The bulletin contains ${length} Unicode code points; the maximum is ${MAX_BULLETIN_CHARS}. Put the full material under \`.brood/shared/\` and post a short description with its path.`
+              : `Invalid post_bulletin input. Supply a nonblank post of at most ${MAX_BULLETIN_CHARS} Unicode code points; put longer material under .brood/shared/ and post its path.`,
+        });
+      }),
     );
   },
 );
