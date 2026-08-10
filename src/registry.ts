@@ -1271,10 +1271,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       const selectedRequests = new Set(
         selected.flatMap(({ source }) => (source._tag === "Request" ? [source.requestId] : [])),
       );
-      const inbox = caller.inbox.flatMap((item): ReadonlyArray<InboxEntry> => {
+      const retainedInbox = caller.inbox.flatMap((item): ReadonlyArray<InboxEntry> => {
         if (item._tag === "Message") return selectedMessages.has(item.sequence) ? [] : [item];
-        return [selectedRequests.has(item.requestId) ? { ...item, presented: true } : item];
+        return selectedRequests.has(item.requestId) ? [] : [item];
       });
+      const presentedRequests = selected.flatMap(({ source }): ReadonlyArray<InboxEntry> =>
+        source._tag === "Request" ? [{ ...source, presented: true }] : [],
+      );
+      const inbox = [...retainedInbox, ...presentedRequests];
       const unreadMessages = inbox.filter((item) => item._tag === "Message").length;
       const openRequests = inbox.filter(
         (item) =>
@@ -1717,7 +1721,9 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
                 ? "wait-satisfied"
                 : hasNewOpenRequest(state, entry)
                   ? "coordination"
-                  : undefined;
+                  : entry.status === "Queued"
+                    ? "coordination"
+                    : undefined;
           if (trigger !== undefined) {
             const claim: CommandClaim = { token, trigger };
             return {
@@ -2277,14 +2283,20 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         const dependencyIds = withTargets(
           entry.activeWait?.dependencies ?? [],
           plannedDependencies(entry),
-        );
+        ).filter((dependencyId) => {
+          const dependency = state.agents.get(dependencyId);
+          if (dependency === undefined) {
+            throw new RegistryInvariantDefect(`Wait references missing agent ${dependencyId}`);
+          }
+          return dependency.outcome === undefined;
+        });
         const requestIds = withTargets(entry.activeWait?.requests ?? [], plannedRequests(entry));
-        const requestRecipientIds = requestIds.map((requestId) => {
+        const requestRecipientIds = requestIds.flatMap((requestId) => {
           const request = state.requests.get(requestId);
           if (request === undefined) {
             throw new RegistryInvariantDefect(`Wait references missing request ${requestId}`);
           }
-          return request.recipientId;
+          return request.state._tag === "Open" ? [request.recipientId] : [];
         });
         return {
           id: entry.id,
@@ -2299,7 +2311,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             entry.initialGoal !== undefined ||
             entry.claimedCommand !== undefined ||
             activeWaitSatisfied(state, entry) ||
-            hasNewOpenRequest(state, entry),
+            hasNewOpenRequest(state, entry) ||
+            entry.status === "Queued",
           interruptRequested: entry.interruptRequested,
           outcome: entry.outcome,
           createdAt: entry.createdAt,

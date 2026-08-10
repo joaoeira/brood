@@ -1,6 +1,6 @@
 /* oxlint-disable no-underscore-dangle, vitest/no-standalone-expect -- Effect variants use `_tag`; `it.effect` is not recognized by the Vitest lint plugin. */
 import { it } from "@effect/vitest";
-import { Cause, Effect, Exit, Fiber, Option } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Option } from "effect";
 import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import {
@@ -21,6 +21,7 @@ import {
   MAX_UNREAD_MESSAGES_PER_AGENT,
   makeAgentPath,
   makeRequestId,
+  type RequestId,
 } from "../src/communication.js";
 import type { PublicModelProfile } from "../src/profiles.js";
 import { makeRegistry } from "../src/registry.js";
@@ -457,6 +458,73 @@ it.effect("aggregates every planned wait and deduplicates direct-child targets",
   }),
 );
 
+it.effect("projects only unresolved planned and active wait targets", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const initialClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, initialClaim.token);
+    const dependencies = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-dependencies"),
+      children: [
+        { name: makeAgentName("done"), goal: "finish first", profile },
+        { name: makeAgentName("pending"), goal: "finish later", profile },
+      ],
+      wait: "all",
+    })).children;
+    const done = dependencies[0]!;
+    const pending = dependencies[1]!;
+    const recipient = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-recipient"),
+      children: [{ name: makeAgentName("advisor"), goal: "advise", profile }],
+      wait: "none",
+    })).children[0]!;
+    const asked = yield* registry.askAgent(root.id, makeToolInvocationId("ask-advisor"), {
+      to: recipient.path,
+      question: "Which contract should we use?",
+    });
+    yield* registry.settle(done.id, completed(done.id));
+    yield* registry.replyToRequest(recipient.id, makeToolInvocationId("reply-root"), {
+      request: asked.request,
+      message: "Use the narrow contract.",
+    });
+
+    const planned = yield* registry.snapshot;
+    expect(planned.agents.find(({ id }) => id === root.id)?.waitTargets).toEqual([pending.id]);
+
+    const activation = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: initialClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-dependencies"),
+          },
+          {
+            _tag: "RequestWait",
+            tool: "ask_agent",
+            invocationId: makeToolInvocationId("ask-advisor"),
+            request: asked.request,
+          },
+        ],
+      },
+    });
+    const active = yield* registry.snapshot;
+
+    expect(activation).toMatchObject({ _tag: "Park", targetIds: [pending.id] });
+    expect(active.agents.find(({ id }) => id === root.id)?.waitTargets).toEqual([pending.id]);
+  }),
+);
+
 it.effect("rejects a mismatched suspension marker without partially consuming its wait plan", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
@@ -510,6 +578,132 @@ it.effect("rejects a mismatched suspension marker without partially consuming it
     expect(rejected._tag).toBe("PiProtocolError");
     expect(afterRejection.agents.find(({ id }) => id === root.id)?.status).toBe("Running");
     expect(accepted).toMatchObject({ _tag: "Park", targetIds: [child.id] });
+  }),
+);
+
+it.effect("rejects the exact suspension-marker matrix atomically across turns", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const claim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, claim.token);
+    const firstTurnChildren = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-first-turn"),
+      children: [
+        { name: makeAgentName("api"), goal: "api", profile },
+        { name: makeAgentName("tests"), goal: "tests", profile },
+      ],
+      wait: "none",
+    })).children;
+    yield* registry.planWait({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("wait-api"),
+      childNames: [makeAgentName("api")],
+    });
+    yield* registry.planWait({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("wait-tests"),
+      childNames: [makeAgentName("tests")],
+    });
+    const apiMarker = {
+      _tag: "AgentWait" as const,
+      tool: "wait_for_agents" as const,
+      invocationId: makeToolInvocationId("wait-api"),
+    };
+    const testsMarker = {
+      _tag: "AgentWait" as const,
+      tool: "wait_for_agents" as const,
+      invocationId: makeToolInvocationId("wait-tests"),
+    };
+    const reject = (markers: readonly [typeof apiMarker, ...Array<typeof apiMarker>]) =>
+      Effect.flip(
+        registry.finishTurn({
+          agentId: root.id,
+          commandToken: claim.token,
+          piOutcome: { _tag: "Suspended", markers },
+        }),
+      );
+
+    const missing = yield* reject([apiMarker]);
+    const extra = yield* reject([
+      apiMarker,
+      testsMarker,
+      { ...apiMarker, invocationId: makeToolInvocationId("wait-extra") },
+    ]);
+    const duplicate = yield* reject([apiMarker, apiMarker, testsMarker]);
+    const completedWithPlans = yield* Effect.flip(
+      registry.finishTurn({
+        agentId: root.id,
+        commandToken: claim.token,
+        piOutcome: {
+          _tag: "Completed",
+          result: { finalText: "premature", finalMessageId: "root-1", stopReason: "stop" },
+        },
+        completedResult: result(root.id, "premature"),
+      }),
+    );
+    const afterRejectedMatrix = yield* registry.snapshot;
+    const parked = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: claim.token,
+      piOutcome: { _tag: "Suspended", markers: [apiMarker, testsMarker] },
+    });
+
+    for (const rejected of [missing, extra, duplicate, completedWithPlans]) {
+      expect(rejected._tag).toBe("PiProtocolError");
+    }
+    expect(afterRejectedMatrix.agents.find(({ id }) => id === root.id)).toMatchObject({
+      status: "Running",
+      waitTargets: firstTurnChildren.map(({ id }) => id),
+    });
+    expect(parked).toMatchObject({
+      _tag: "Park",
+      targetIds: firstTurnChildren.map(({ id }) => id),
+    });
+
+    yield* Effect.forEach(
+      firstTurnChildren,
+      (child) => registry.settle(child.id, completed(child.id)),
+      { discard: true },
+    );
+    const resumedClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, resumedClaim.token);
+    const currentChild = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-current-turn"),
+      children: [{ name: makeAgentName("docs"), goal: "docs", profile }],
+      wait: "all",
+    })).children[0]!;
+    const currentMarker = {
+      _tag: "AgentWait" as const,
+      tool: "delegate" as const,
+      invocationId: makeToolInvocationId("delegate-current-turn"),
+    };
+    const crossTurn = yield* Effect.flip(
+      registry.finishTurn({
+        agentId: root.id,
+        commandToken: resumedClaim.token,
+        piOutcome: { _tag: "Suspended", markers: [apiMarker, currentMarker] },
+      }),
+    );
+    const afterCrossTurn = yield* registry.snapshot;
+    const currentPark = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: resumedClaim.token,
+      piOutcome: { _tag: "Suspended", markers: [currentMarker] },
+    });
+
+    expect(crossTurn._tag).toBe("PiProtocolError");
+    expect(afterCrossTurn.agents.find(({ id }) => id === root.id)).toMatchObject({
+      status: "Running",
+      waitTargets: [currentChild.id],
+    });
+    expect(currentPark).toMatchObject({ _tag: "Park", targetIds: [currentChild.id] });
   }),
 );
 
@@ -992,6 +1186,76 @@ it.effect("delivers passive messages across branches once without waking the rec
   }),
 );
 
+it.effect("keeps a parked recipient asleep through passive coordination updates", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const recipient = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-recipient"),
+      children: [{ name: makeAgentName("recipient"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    const recipientClaim = yield* registry.takePendingCommand(recipient.id);
+    yield* registry.beginRun(recipient.id, recipientClaim.token);
+    const dependency = (yield* registry.registerBatch({
+      parentId: recipient.id,
+      invocationId: makeToolInvocationId("delegate-dependency"),
+      children: [{ name: makeAgentName("dependency"), goal: "dependency", profile }],
+      wait: "all",
+    })).children[0]!;
+    yield* registry.finishTurn({
+      agentId: recipient.id,
+      commandToken: recipientClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-dependency"),
+          },
+        ],
+      },
+    });
+    const taker = yield* Effect.forkChild(registry.takePendingCommand(recipient.id));
+
+    yield* registry.sendMessage(root.id, makeToolInvocationId("passive-message"), {
+      to: recipient.path,
+      message: "Passive context",
+    });
+    yield* registry.postBulletin(root.id, makeToolInvocationId("passive-bulletin"), {
+      message: "Passive bulletin",
+    });
+    yield* registry.setActivity(recipient.id, makeToolInvocationId("passive-activity"), {
+      activity: "still waiting",
+    });
+    const stillParked = yield* registry.snapshot;
+
+    yield* registry.settle(dependency.id, completed(dependency.id));
+    const resumeClaim = yield* Fiber.join(taker);
+    const resumed = yield* registry.beginRun(recipient.id, resumeClaim.token);
+
+    expect(stillParked.agents.find(({ id }) => id === recipient.id)).toMatchObject({
+      status: "Waiting",
+      activity: "still waiting",
+      waitTargets: [dependency.id],
+      hasPendingCommand: false,
+    });
+    expect(resumed).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "WaitSatisfied",
+        notice: { unreadMessages: 1, unseenBulletins: 1 },
+      },
+    });
+  }),
+);
+
 it.effect("keeps output-limited passive messages pending until a later read", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
@@ -1134,6 +1398,91 @@ it.effect("keeps an addressed question visible until its exact recipient replies
     expect(replied).toEqual({ request: asked.request, to: child.path });
     expect(afterReply.inbox.openRequests).toBe(0);
     expect(duplicate.reason).toBe("AlreadyReplied");
+  }),
+);
+
+it.effect("combines two asks into one source-ordered all-of continuation exactly once", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const claim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, claim.token);
+    const recipients = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-advisors"),
+      children: [
+        { name: makeAgentName("first"), goal: "first", profile },
+        { name: makeAgentName("second"), goal: "second", profile },
+      ],
+      wait: "none",
+    })).children;
+    const firstRecipient = recipients[0]!;
+    const secondRecipient = recipients[1]!;
+    const first = yield* registry.askAgent(root.id, makeToolInvocationId("ask-first"), {
+      to: firstRecipient.path,
+      question: "First answer?",
+    });
+    const second = yield* registry.askAgent(root.id, makeToolInvocationId("ask-second"), {
+      to: secondRecipient.path,
+      question: "Second answer?",
+    });
+    const parked = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "RequestWait",
+            tool: "ask_agent",
+            invocationId: makeToolInvocationId("ask-first"),
+            request: first.request,
+          },
+          {
+            _tag: "RequestWait",
+            tool: "ask_agent",
+            invocationId: makeToolInvocationId("ask-second"),
+            request: second.request,
+          },
+        ],
+      },
+    });
+    yield* registry.replyToRequest(secondRecipient.id, makeToolInvocationId("reply-second"), {
+      request: second.request,
+      message: "second reply",
+    });
+    const afterSecond = yield* registry.snapshot;
+    yield* registry.replyToRequest(firstRecipient.id, makeToolInvocationId("reply-first"), {
+      request: first.request,
+      message: "first reply",
+    });
+    const resumeClaim = yield* registry.takePendingCommand(root.id);
+    const resumed = yield* registry.beginRun(root.id, resumeClaim.token);
+    const afterDelivery = yield* registry.snapshot;
+
+    expect(parked).toMatchObject({
+      _tag: "Park",
+      targetIds: [firstRecipient.id, secondRecipient.id],
+    });
+    expect(afterSecond.agents.find(({ id }) => id === root.id)).toMatchObject({
+      status: "Waiting",
+      waitTargets: [firstRecipient.id],
+    });
+    expect(resumed).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "WaitSatisfied",
+        requests: [
+          { _tag: "Replied", request: first.request, reply: "first reply" },
+          { _tag: "Replied", request: second.request, reply: "second reply" },
+        ],
+      },
+    });
+    expect(afterDelivery.agents.find(({ id }) => id === root.id)?.waitTargets).toEqual([]);
   }),
 );
 
@@ -1384,6 +1733,143 @@ it.effect("merges a request created during coordination into the existing depend
   }),
 );
 
+it.effect("preserves committed ask, reply, and settlement wakes after caller cancellation", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootInitialClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootInitialClaim.token);
+    const asker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-asker"),
+      children: [{ name: makeAgentName("asker"), goal: "ask", profile }],
+      wait: "none",
+    })).children[0]!;
+    const dependency = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-dependency"),
+      children: [{ name: makeAgentName("dependency"), goal: "work", profile }],
+      wait: "all",
+    })).children[0]!;
+    yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: rootInitialClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait",
+            tool: "delegate",
+            invocationId: makeToolInvocationId("delegate-dependency"),
+          },
+        ],
+      },
+    });
+    const askerInitialClaim = yield* registry.takePendingCommand(asker.id);
+    yield* registry.beginRun(asker.id, askerInitialClaim.token);
+
+    const rootCoordinationTaker = yield* Effect.forkChild(registry.takePendingCommand(root.id));
+    const askedCommitted = yield* Deferred.make<RequestId>();
+    const asking = yield* Effect.forkChild(
+      registry
+        .askAgent(asker.id, makeToolInvocationId("ask-root"), {
+          to: root.path,
+          question: "Can I proceed?",
+        })
+        .pipe(
+          Effect.tap(({ request }) => Deferred.succeed(askedCommitted, request)),
+          Effect.andThen(Effect.never),
+        ),
+    );
+    const requestId = yield* Deferred.await(askedCommitted);
+    yield* Fiber.interrupt(asking);
+    yield* registry.finishTurn({
+      agentId: asker.id,
+      commandToken: askerInitialClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "RequestWait",
+            tool: "ask_agent",
+            invocationId: makeToolInvocationId("ask-root"),
+            request: requestId,
+          },
+        ],
+      },
+    });
+    const rootCoordinationClaim = yield* Fiber.join(rootCoordinationTaker);
+    const rootCoordination = yield* registry.beginRun(root.id, rootCoordinationClaim.token);
+
+    const askerResumeTaker = yield* Effect.forkChild(registry.takePendingCommand(asker.id));
+    const replyCommitted = yield* Latch.make(false);
+    const replying = yield* Effect.forkChild(
+      registry
+        .replyToRequest(root.id, makeToolInvocationId("reply-asker"), {
+          request: requestId,
+          message: "Proceed.",
+        })
+        .pipe(
+          Effect.tap(() => Latch.open(replyCommitted)),
+          Effect.andThen(Effect.never),
+        ),
+    );
+    yield* Latch.await(replyCommitted);
+    yield* Fiber.interrupt(replying);
+    const askerResumeClaim = yield* Fiber.join(askerResumeTaker);
+    const askerResumed = yield* registry.beginRun(asker.id, askerResumeClaim.token);
+    const rootParked = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: rootCoordinationClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "answered", finalMessageId: "root-2", stopReason: "stop" },
+      },
+      completedResult: result(root.id, "answered"),
+    });
+
+    const rootResumeTaker = yield* Effect.forkChild(registry.takePendingCommand(root.id));
+    const dependencyAwaiter = yield* Effect.forkChild(registry.awaitOutcome(dependency.id));
+    const settlementCommitted = yield* Latch.make(false);
+    const settling = yield* Effect.forkChild(
+      registry.settle(dependency.id, completed(dependency.id)).pipe(
+        Effect.tap(() => Latch.open(settlementCommitted)),
+        Effect.andThen(Effect.never),
+      ),
+    );
+    yield* Latch.await(settlementCommitted);
+    yield* Fiber.interrupt(settling);
+    const dependencyOutcome = yield* Fiber.join(dependencyAwaiter);
+    const rootResumeClaim = yield* Fiber.join(rootResumeTaker);
+    const rootResumed = yield* registry.beginRun(root.id, rootResumeClaim.token);
+
+    expect(rootCoordination).toMatchObject({
+      _tag: "Ready",
+      command: { _tag: "CoordinationWake", notice: { openRequests: 1 } },
+    });
+    expect(askerResumed).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "WaitSatisfied",
+        requests: [{ _tag: "Replied", request: requestId, reply: "Proceed." }],
+      },
+    });
+    expect(rootParked).toMatchObject({ _tag: "Park", targetIds: [dependency.id] });
+    expect(dependencyOutcome).toEqual(completed(dependency.id));
+    expect(rootResumed).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "WaitSatisfied",
+        dependencies: [{ agentId: dependency.id }],
+      },
+    });
+  }),
+);
+
 it.effect("includes questions accepted before a queued command begins in that command notice", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
@@ -1507,55 +1993,135 @@ it.effect("removes a terminal requester's question from the recipient inbox", ()
   }),
 );
 
-it.effect("does not revive an older request after a newer wake is deleted", () =>
-  Effect.gen(function* () {
-    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
-    const root = yield* registry.registerRoot({
-      name: makeAgentName("root"),
-      goal: "coordinate",
-      profile,
-    });
-    const askers = (yield* registry.registerBatch({
-      parentId: root.id,
-      invocationId: makeToolInvocationId("delegate-askers"),
-      children: [
-        { name: makeAgentName("old"), goal: "old", profile },
-        { name: makeAgentName("new"), goal: "new", profile },
-      ],
-      wait: "none",
-    })).children;
-    const oldAsker = askers[0]!;
-    const newAsker = askers[1]!;
-    yield* registry.askAgent(oldAsker.id, makeToolInvocationId("old-question"), {
-      to: root.path,
-      question: "Old unanswered question",
-    });
-    const claim = yield* registry.takePendingCommand(root.id);
-    yield* registry.beginRun(root.id, claim.token);
-    yield* registry.askAgent(newAsker.id, makeToolInvocationId("new-question"), {
-      to: root.path,
-      question: "New question that will be withdrawn",
-    });
+it.effect(
+  "keeps a queued coordination wake durable when its requester terminates before take",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+      const root = yield* registry.registerRoot({
+        name: makeAgentName("root"),
+        goal: "coordinate",
+        profile,
+      });
+      const askers = (yield* registry.registerBatch({
+        parentId: root.id,
+        invocationId: makeToolInvocationId("delegate-askers"),
+        children: [
+          { name: makeAgentName("old"), goal: "old", profile },
+          { name: makeAgentName("new"), goal: "new", profile },
+        ],
+        wait: "none",
+      })).children;
+      const oldAsker = askers[0]!;
+      const newAsker = askers[1]!;
+      yield* registry.askAgent(oldAsker.id, makeToolInvocationId("old-question"), {
+        to: root.path,
+        question: "Old unanswered question",
+      });
+      const claim = yield* registry.takePendingCommand(root.id);
+      yield* registry.beginRun(root.id, claim.token);
+      yield* registry.askAgent(newAsker.id, makeToolInvocationId("new-question"), {
+        to: root.path,
+        question: "New question that will be withdrawn",
+      });
 
-    const decision = yield* registry.finishTurn({
-      agentId: root.id,
-      commandToken: claim.token,
-      piOutcome: {
-        _tag: "Completed",
-        result: { finalText: "done", finalMessageId: "root-1", stopReason: "stop" },
-      },
-      completedResult: result(root.id),
-    });
-    expect(decision._tag).toBe("RunNext");
-    const coordinationClaim = yield* registry.takePendingCommand(root.id);
-    yield* registry.settle(newAsker.id, completed(newAsker.id));
-    const begun = yield* registry.beginRun(root.id, coordinationClaim.token);
+      const decision = yield* registry.finishTurn({
+        agentId: root.id,
+        commandToken: claim.token,
+        piOutcome: {
+          _tag: "Completed",
+          result: { finalText: "done", finalMessageId: "root-1", stopReason: "stop" },
+        },
+        completedResult: result(root.id),
+      });
+      expect(decision._tag).toBe("RunNext");
+      yield* registry.settle(newAsker.id, completed(newAsker.id));
+      const queued = yield* registry.snapshot;
+      expect(queued.agents.find(({ id }) => id === root.id)?.hasPendingCommand).toBe(true);
 
-    expect(begun._tag).toBe("Settled");
-    expect((yield* registry.snapshot).agents.find(({ id }) => id === root.id)?.status).toBe(
-      "Completed",
-    );
-  }),
+      const coordinationClaim = yield* registry.takePendingCommand(root.id);
+      const begun = yield* registry.beginRun(root.id, coordinationClaim.token);
+
+      expect(coordinationClaim.trigger).toBe("coordination");
+      expect(begun._tag).toBe("Settled");
+      expect((yield* registry.snapshot).agents.find(({ id }) => id === root.id)?.status).toBe(
+        "Completed",
+      );
+    }),
+);
+
+it.effect(
+  "restores an unresolved wait when a queued coordination wake disappears before take",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+      const root = yield* registry.registerRoot({
+        name: makeAgentName("root"),
+        goal: "coordinate",
+        profile,
+      });
+      const initialClaim = yield* registry.takePendingCommand(root.id);
+      yield* registry.beginRun(root.id, initialClaim.token);
+      const dependency = (yield* registry.registerBatch({
+        parentId: root.id,
+        invocationId: makeToolInvocationId("delegate-dependency"),
+        children: [{ name: makeAgentName("dependency"), goal: "dependency", profile }],
+        wait: "all",
+      })).children[0]!;
+      const asker = (yield* registry.registerBatch({
+        parentId: root.id,
+        invocationId: makeToolInvocationId("delegate-asker"),
+        children: [{ name: makeAgentName("asker"), goal: "ask", profile }],
+        wait: "none",
+      })).children[0]!;
+      yield* registry.finishTurn({
+        agentId: root.id,
+        commandToken: initialClaim.token,
+        piOutcome: {
+          _tag: "Suspended",
+          markers: [
+            {
+              _tag: "AgentWait",
+              tool: "delegate",
+              invocationId: makeToolInvocationId("delegate-dependency"),
+            },
+          ],
+        },
+      });
+      yield* registry.askAgent(asker.id, makeToolInvocationId("first-question"), {
+        to: root.path,
+        question: "First question",
+      });
+      const coordinationClaim = yield* registry.takePendingCommand(root.id);
+      yield* registry.beginRun(root.id, coordinationClaim.token);
+      yield* registry.askAgent(asker.id, makeToolInvocationId("second-question"), {
+        to: root.path,
+        question: "Question that will be withdrawn",
+      });
+      const decision = yield* registry.finishTurn({
+        agentId: root.id,
+        commandToken: coordinationClaim.token,
+        piOutcome: {
+          _tag: "Completed",
+          result: { finalText: "done", finalMessageId: "root-2", stopReason: "stop" },
+        },
+        completedResult: result(root.id),
+      });
+      yield* registry.settle(asker.id, completed(asker.id));
+      const queued = yield* registry.snapshot;
+      const staleClaim = yield* registry.takePendingCommand(root.id);
+      const begun = yield* registry.beginRun(root.id, staleClaim.token);
+      const restored = yield* registry.snapshot;
+
+      expect(decision._tag).toBe("RunNext");
+      expect(queued.agents.find(({ id }) => id === root.id)?.hasPendingCommand).toBe(true);
+      expect(begun).toEqual({ _tag: "Stale", status: "Waiting" });
+      expect(restored.agents.find(({ id }) => id === root.id)).toMatchObject({
+        status: "Waiting",
+        waitTargets: [dependency.id],
+        hasPendingCommand: false,
+      });
+    }),
 );
 
 it.effect("combines simultaneous dependency completion and a question into one command", () =>
@@ -1635,22 +2201,29 @@ it.effect("presents every new request before repeating earlier unanswered reques
       })),
       wait: "none",
     })).children;
-    yield* Effect.forEach(
-      askers,
-      (asker, index) =>
-        registry.askAgent(asker.id, makeToolInvocationId(`ask-${index + 1}`), {
+    const requestIds = yield* Effect.forEach(askers, (asker, index) =>
+      registry
+        .askAgent(asker.id, makeToolInvocationId(`ask-${index + 1}`), {
           to: root.path,
           question: `question ${index + 1}`,
-        }),
-      { discard: true },
+        })
+        .pipe(Effect.map(({ request }) => request)),
     );
 
     const first = yield* registry.readMessages(root.id, makeToolInvocationId("read-1"), {});
     const second = yield* registry.readMessages(root.id, makeToolInvocationId("read-2"), {});
+    const third = yield* registry.readMessages(root.id, makeToolInvocationId("read-3"), {});
+    const fourth = yield* registry.readMessages(root.id, makeToolInvocationId("read-4"), {});
+    const cycledRequestIds = new Set(
+      [...third.items, ...fourth.items].flatMap((item) =>
+        item.kind === "request" ? [item.request] : [],
+      ),
+    );
 
     expect(first.items).toHaveLength(8);
     expect(second.items[0]).toMatchObject({ kind: "request", question: "question 9" });
     expect(second.inbox.openRequests).toBe(9);
+    expect(cycledRequestIds).toEqual(new Set(requestIds));
   }),
 );
 
