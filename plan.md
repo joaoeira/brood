@@ -932,6 +932,7 @@ interface RequestRecord {
   readonly id: RequestId;
   readonly requesterId: AgentId;
   readonly recipientId: AgentId;
+  readonly wakeGeneration: RequestWakeGeneration;
   readonly question: string;
   readonly state:
     | { readonly _tag: "Open" }
@@ -976,7 +977,7 @@ interface RegistryCommunicationState {
 
 Sequence/generation counters start at 0 and first emission is 1. Increment past `Number.MAX_SAFE_INTEGER` is an invariant defect. They are trusted internal constructors, never decoded from model input or exposed in tool results.
 
-`MAX_UNREAD_MESSAGES_PER_AGENT` counts unread passive messages. `MAX_INCOMING_REQUESTS_PER_AGENT` separately counts open incoming requests, so message spam cannot block the clarification channel. Reading deletes passive messages but not requests. Reply, requester termination, or recipient termination removes the request entry. Therefore one agent cannot accumulate unbounded pending inbound state.
+`MAX_UNREAD_MESSAGES_PER_AGENT` counts unread passive messages. `MAX_INCOMING_REQUESTS_PER_AGENT` separately counts open incoming requests, so message spam cannot block the clarification channel. Reading deletes passive messages but not requests. Reply or recipient termination removes the recipient's inbox reference but retains the settled `RequestRecord` until its outcome is claimed by the requester. Requester termination removes both. Therefore one agent cannot accumulate unbounded pending inbound state without discarding an undelivered outcome.
 
 `MAX_REQUEST_TARGETS_PER_WAIT` counts planned, active, and settled-but-not-delivered request targets. This bounds the final continuation even when coordination turns merge more asks while a long-running dependency remains unresolved. Once an outcome is projected into a taken `WaitSatisfied` command, the request record is deleted: the prompt is now persisted by the Pi session. Requester termination also deletes its request records and recipient inbox references. No replay store or terminal-request tombstone is retained.
 
@@ -1022,7 +1023,7 @@ Decision precedence is:
 
 1. a previously committed interrupt/terminal outcome;
 2. a completely settled active wait;
-3. a request-wake generation newer than the command's claimed generation;
+3. an open incoming request whose own wake generation is newer than the command's claimed generation;
 4. an unresolved active wait, which parks;
 5. otherwise the completed Pi result settles the agent.
 
@@ -1033,7 +1034,7 @@ Passive unread messages and unseen bulletins do not prevent ordinary terminal se
 - combines simultaneous wait satisfaction and a request wake;
 - builds one command with current inbox/open-request counts;
 - claims the current request-wake generation;
-- discards a stale request-wake trigger when requester cleanup removed every question behind it before command take;
+- discards a stale request-wake trigger when no still-open incoming request carries a generation newer than the claimed watermark; a newer deleted ask cannot re-wake merely because an older unanswered request remains;
 - if the wait is satisfied, projects every outcome, clears the active wait, and deletes delivered request records exactly once;
 - records a fresh command token.
 
