@@ -147,6 +147,21 @@ describe("Brood runtime configuration", () => {
     });
   });
 
+  it("does not create shared material through an escaping .brood symlink", async () => {
+    const workspace = join(base, "workspace");
+    const outside = join(base, "outside");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(workspace, ".brood"), "dir");
+
+    await expect(Effect.runPromise(buildBroodRuntime(validConfig()))).rejects.toMatchObject({
+      _tag: "BroodConfigError",
+      reason: "InvalidField",
+      path: "workspacePath",
+    });
+    await expect(stat(join(outside, "shared"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("reports exact-model failures through the single config error family", async () => {
     await expect(
       Effect.runPromise(
