@@ -1,0 +1,762 @@
+/**
+ * A scripted swarm that needs no network, no credentials, and no Pi. It drives
+ * the same store the live bridge does, so every screen can be exercised — and
+ * smoke-tested — offline.
+ *
+ * The timeline below is deliberately shaped to hit the awkward states rather
+ * than the happy path: a parent that suspends on three children, a child that
+ * fails a tool and then fails outright, an ask/reply pair, two bulletins, and a
+ * compaction marker inside one of the synthetic transcripts.
+ */
+import type { AgentDetail, StatusAgent, SupervisorEvent, SwarmStatus } from "../brood";
+import { store } from "../store";
+import { makeMemoryTranscriptReader } from "../transcript/watch";
+import type { BridgeHandle, ConfigSummary } from "./types";
+
+const TICK_MILLIS = 200;
+const DRAIN_MILLIS = 900;
+
+/**
+ * Brood's ids, names, and profile names are branded at the schema boundary.
+ * Demo fixtures are hand-written rather than decoded, so the brands are
+ * asserted here in one place instead of scattered across the timeline.
+ */
+const brand = <T extends string>(value: string): T => value as unknown as T;
+
+type AgentState = StatusAgent["state"];
+type Profile = AgentDetail["profile"];
+type Outcome = NonNullable<AgentDetail["outcome"]>;
+
+interface DemoAgent {
+  readonly id: string;
+  readonly name: string;
+  readonly parentId?: string;
+  state: AgentState;
+  activity?: string | undefined;
+  waitTargets: ReadonlyArray<string>;
+  readonly createdAt: number;
+  terminalAt?: number | undefined;
+  readonly profile: Profile;
+  outcome?: Outcome | undefined;
+}
+
+const profile = (
+  name: string,
+  model: string,
+  thinkingLevel: Profile["thinkingLevel"],
+): Profile => ({
+  name: brand(name),
+  provider: "anthropic",
+  model,
+  thinkingLevel,
+});
+
+const COORDINATOR = profile("coordinator", "claude-sonnet-4-5", "high");
+const WORKER = profile("worker", "claude-sonnet-4-5", "medium");
+
+const jsonl = (lines: ReadonlyArray<unknown>): string =>
+  lines.map((line) => JSON.stringify(line)).join("\n") + "\n";
+
+const sessionHeader = (id: string) => ({
+  type: "session",
+  version: 3,
+  id,
+  timestamp: new Date().toISOString(),
+  cwd: "/Users/demo/code/side-project",
+});
+
+let entryCounter = 0;
+const messageEntry = (message: unknown) => {
+  entryCounter += 1;
+  return {
+    type: "message",
+    id: `e${entryCounter.toString(16).padStart(8, "0")}`,
+    parentId: entryCounter === 1 ? null : `e${(entryCounter - 1).toString(16).padStart(8, "0")}`,
+    timestamp: new Date().toISOString(),
+    message,
+  };
+};
+
+const userMessage = (text: string) =>
+  messageEntry({ role: "user", content: text, timestamp: Date.now() });
+
+const assistantMessage = (
+  text: string,
+  calls: ReadonlyArray<{ id: string; name: string; arguments: Record<string, unknown> }> = [],
+) =>
+  messageEntry({
+    role: "assistant",
+    content: [
+      ...(text === "" ? [] : [{ type: "text", text }]),
+      ...calls.map((call) => ({ type: "toolCall", ...call })),
+    ],
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: {} },
+    stopReason: calls.length === 0 ? "stop" : "toolUse",
+    timestamp: Date.now(),
+  });
+
+const toolResult = (
+  toolCallId: string,
+  toolName: string,
+  text: string,
+  options: { isError?: boolean; suspend?: boolean } = {},
+) =>
+  messageEntry({
+    role: "toolResult",
+    toolCallId,
+    toolName,
+    content: [{ type: "text", text }],
+    isError: options.isError === true,
+    timestamp: Date.now(),
+    ...(options.suspend === true
+      ? {
+          details: {
+            version: 1,
+            broodControl: { version: 1, kind: "suspend", invocationId: "inv_1" },
+          },
+        }
+      : {}),
+  });
+
+const buildTranscripts = (): ReadonlyMap<string, { fileName: string; text: string }> =>
+  new Map([
+    [
+      "agt_root",
+      {
+        fileName: "2026-08-10T09-14-02-113Z_0192f3c1.jsonl",
+        text: jsonl([
+          sessionHeader("0192f3c1"),
+          userMessage(
+            '<brood_runtime version="1">\n  <profiles>coordinator, worker</profiles>\n  <limits admissions="128" concurrency="4" />\n</brood_runtime>',
+          ),
+          userMessage("Ship the public read API for the changelog service."),
+          assistantMessage(
+            "Three pieces can move in parallel: the HTTP surface, the response schema, and a coherence audit once both land. I'll delegate all three and wait.",
+            [
+              {
+                id: "call_delegate_1",
+                name: "delegate",
+                arguments: {
+                  agents: [
+                    { name: "api", goal: "Implement the HTTP read endpoints" },
+                    { name: "schema", goal: "Define and validate the response schema" },
+                    { name: "audit", goal: "Cross-check the two for coherence" },
+                  ],
+                },
+              },
+            ],
+          ),
+          toolResult("call_delegate_1", "delegate", "Admitted 3 agents: api, schema, audit.", {
+            suspend: true,
+          }),
+          {
+            type: "compaction",
+            id: "c0000001",
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            summary: "Planning discussion condensed; delegation decisions retained.",
+            firstKeptEntryId: "e00000003",
+            tokensBefore: 48_120,
+          },
+          assistantMessage(
+            "api and audit completed; schema failed on its validation pass. The read API is usable, but the schema work needs a second attempt before this ships.",
+          ),
+        ]),
+      },
+    ],
+    [
+      "agt_api",
+      {
+        fileName: "2026-08-10T09-14-05-882Z_0192f3c2.jsonl",
+        text: jsonl([
+          sessionHeader("0192f3c2"),
+          userMessage("Implement the HTTP read endpoints for the changelog service."),
+          assistantMessage("Reading the existing router first.", [
+            { id: "call_read_1", name: "read_file", arguments: { path: "src/router.ts" } },
+          ]),
+          toolResult(
+            "call_read_1",
+            "read_file",
+            "export const router = createRouter();  // 214 lines",
+          ),
+          assistantMessage("Adding the two read handlers.", [
+            {
+              id: "call_write_1",
+              name: "write_file",
+              arguments: { path: "src/routes/changelog.ts", contents: "…" },
+            },
+          ]),
+          toolResult("call_write_1", "write_file", "Wrote 96 lines to src/routes/changelog.ts"),
+          assistantMessage(
+            "Both endpoints are in: GET /changelog paginates by cursor and GET /changelog/:id returns a single entry. Handlers are covered by the existing router tests.",
+          ),
+        ]),
+      },
+    ],
+    [
+      "agt_schema",
+      {
+        fileName: "2026-08-10T09-14-06-004Z_0192f3c3.jsonl",
+        text: jsonl([
+          sessionHeader("0192f3c3"),
+          userMessage("Define and validate the response schema."),
+          assistantMessage("Running the validator against the fixtures.", [
+            { id: "call_bash_1", name: "bash", arguments: { command: "pnpm validate:schema" } },
+          ]),
+          toolResult("call_bash_1", "bash", "error: 3 fixtures rejected by cursor field", {
+            isError: true,
+          }),
+          assistantMessage(
+            "The cursor field is typed as an opaque string upstream but the fixtures encode it as an integer. I cannot reconcile that without a decision on the wire format.",
+          ),
+        ]),
+      },
+    ],
+    [
+      "agt_peer",
+      {
+        fileName: "2026-08-10T09-14-09-441Z_0192f3c4.jsonl",
+        text: jsonl([
+          sessionHeader("0192f3c4"),
+          userMessage("Draft the pagination helper the read endpoints need."),
+          assistantMessage("Checking with the parent on cursor encoding before I commit to one.", [
+            {
+              id: "call_ask_1",
+              name: "ask_agent",
+              arguments: { to: "root/api", question: "Opaque cursor or numeric offset?" },
+            },
+          ]),
+          toolResult("call_ask_1", "ask_agent", "Question delivered to root/api.", {
+            suspend: true,
+          }),
+          assistantMessage("Opaque cursor it is. Helper written and exported."),
+        ]),
+      },
+    ],
+  ]);
+
+export const createDemoBridge = (): BridgeHandle => {
+  const agents = new Map<string, DemoAgent>();
+  const transcripts = buildTranscripts();
+  const bulletins: Array<{ sequence: number; author: string; body: string }> = [];
+
+  let sequence = 0;
+  let startedAt: number | undefined;
+  let finishedAt: number | undefined;
+  let lifecycle: SwarmStatus["state"] = "not_started";
+  let elapsed = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let cursor = 0;
+
+  const now = (): number => Date.now();
+
+  const emit = (lifecycleEvent: Record<string, unknown>): void => {
+    sequence += 1;
+    store.onEvent({
+      source: "supervisor",
+      sequence,
+      timestamp: now(),
+      ...lifecycleEvent,
+    } as unknown as SupervisorEvent);
+  };
+
+  const emitPi = (agentId: string, event: Record<string, unknown>): void => {
+    store.onEvent({
+      source: "pi",
+      timestamp: now(),
+      event: { agentId: brand(agentId), sessionId: "demo", sessionSequence: sequence, ...event },
+    } as unknown as SupervisorEvent);
+  };
+
+  const pathOf = (id: string): string => {
+    const agent = agents.get(id);
+    if (agent === undefined) return id;
+    return agent.parentId === undefined ? agent.name : `${pathOf(agent.parentId)}/${agent.name}`;
+  };
+
+  const add = (
+    id: string,
+    name: string,
+    agentProfile: Profile,
+    parentId?: string,
+    state: AgentState = "starting",
+  ): void => {
+    agents.set(id, {
+      id,
+      name,
+      ...(parentId === undefined ? {} : { parentId }),
+      state,
+      waitTargets: [],
+      createdAt: now(),
+      profile: agentProfile,
+    });
+    emit({
+      type: "AgentRegistered",
+      agentId: brand(id),
+      name: brand(name),
+      ...(parentId === undefined ? {} : { parentId: brand(parentId) }),
+      profile: agentProfile,
+    });
+  };
+
+  const update = (id: string, changes: Partial<DemoAgent>): void => {
+    const agent = agents.get(id);
+    if (agent === undefined) return;
+    Object.assign(agent, changes);
+  };
+
+  const settle = (
+    id: string,
+    status: "Completed" | "Failed" | "Interrupted",
+    outcome: Outcome,
+  ): void => {
+    const state: AgentState =
+      status === "Completed" ? "completed" : status === "Failed" ? "failed" : "interrupted";
+    update(id, { state, terminalAt: now(), outcome, activity: undefined, waitTargets: [] });
+    emit({ type: "AgentSettled", agentId: brand(id), status });
+  };
+
+  const completed = (id: string, summary: string): Outcome => ({
+    _tag: "Completed",
+    agentId: brand(id),
+    name: brand(agents.get(id)?.name ?? id),
+    result: {
+      agentId: brand(id),
+      sessionId: "demo",
+      summary,
+      truncated: false,
+      originalCharacterCount: summary.length,
+    },
+  });
+
+  const statusAgent = (agent: DemoAgent, children: ReadonlyArray<DemoAgent>): StatusAgent => ({
+    path: pathOf(agent.id),
+    name: agent.name,
+    state: agent.state,
+    durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
+    ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+    waitTargets: agent.waitTargets.map(pathOf),
+    children: children.map((child) => statusAgent(child, childrenOf(child.id))),
+  });
+
+  const childrenOf = (id: string): ReadonlyArray<DemoAgent> =>
+    [...agents.values()].filter((candidate) => candidate.parentId === id);
+
+  const buildStatus = (): SwarmStatus => {
+    const all = [...agents.values()];
+    const counts = {
+      starting: 0,
+      queued: 0,
+      running: 0,
+      waiting: 0,
+      completed: 0,
+      failed: 0,
+      interrupted: 0,
+    };
+    for (const agent of all) counts[agent.state] += 1;
+    const used = all.length;
+    const limit = 128;
+    const active = counts.running + counts.starting;
+    return {
+      version: 2,
+      state: lifecycle,
+      elapsedMillis: startedAt === undefined ? 0 : Math.max(0, (finishedAt ?? now()) - startedAt),
+      capacity: {
+        admissions: { limit, used, remaining: limit - used },
+        runs: { active, limit: 4, available: Math.max(0, 4 - active) },
+      },
+      counts,
+      agents: all
+        .filter((agent) => agent.parentId === undefined)
+        .map((agent) => statusAgent(agent, childrenOf(agent.id))),
+    };
+  };
+
+  const publishStatus = (): void => store.setStatus(buildStatus());
+
+  const publishBulletins = (): void =>
+    store.setBulletins(
+      bulletins.map((entry) => ({
+        sequence: entry.sequence,
+        author: brand(entry.author),
+        body: entry.body,
+      })),
+    );
+
+  const bulletin = (authorId: string, body: string): void => {
+    bulletins.push({ sequence: bulletins.length + 1, author: pathOf(authorId), body });
+    emit({ type: "BulletinPosted", authorId: brand(authorId) });
+    publishBulletins();
+  };
+
+  // ── The script ────────────────────────────────────────────────────────────
+  const script: ReadonlyArray<{ at: number; run: () => void }> = [
+    {
+      at: 0,
+      run: () => {
+        add("agt_root", "root", COORDINATOR, undefined, "running");
+        update("agt_root", { activity: "planning the split" });
+      },
+    },
+    { at: 800, run: () => update("agt_root", { activity: "delegating three tracks" }) },
+    {
+      at: 1_400,
+      run: () => {
+        add("agt_api", "api", WORKER, "agt_root", "running");
+        add("agt_schema", "schema", WORKER, "agt_root", "running");
+        add("agt_audit", "audit", WORKER, "agt_root", "queued");
+        emit({
+          type: "BatchAdmitted",
+          parentId: brand("agt_root"),
+          batchId: brand("batch_1"),
+          agentIds: ["agt_api", "agt_schema", "agt_audit"].map((id) => brand(id)),
+        });
+      },
+    },
+    {
+      at: 1_900,
+      run: () => {
+        const targets = ["agt_api", "agt_schema", "agt_audit"];
+        emit({
+          type: "WaitPlanned",
+          parentId: brand("agt_root"),
+          invocationId: brand("inv_1"),
+          targetIds: targets.map((id) => brand(id)),
+        });
+        update("agt_root", { state: "waiting", waitTargets: targets, activity: undefined });
+        emit({
+          type: "AgentSuspended",
+          agentId: brand("agt_root"),
+          waitId: brand("wait_1"),
+          targetIds: targets.map((id) => brand(id)),
+        });
+      },
+    },
+    {
+      at: 2_300,
+      run: () => {
+        update("agt_api", { activity: "reading the existing router" });
+        emitPi("agt_api", { type: "ToolStart", toolCallId: "call_read_1", toolName: "read_file" });
+      },
+    },
+    {
+      at: 3_000,
+      run: () =>
+        emitPi("agt_api", { type: "ToolEnd", toolCallId: "call_read_1", toolName: "read_file" }),
+    },
+    {
+      at: 3_300,
+      run: () => {
+        update("agt_api", { activity: "drafting the read handlers" });
+        emitPi("agt_api", {
+          type: "ToolStart",
+          toolCallId: "call_write_1",
+          toolName: "write_file",
+        });
+      },
+    },
+    {
+      at: 3_900,
+      run: () => {
+        add("agt_peer", "peer", WORKER, "agt_api", "starting");
+        emit({
+          type: "BatchAdmitted",
+          parentId: brand("agt_api"),
+          batchId: brand("batch_2"),
+          agentIds: [brand("agt_peer")],
+        });
+      },
+    },
+    {
+      at: 4_500,
+      run: () =>
+        update("agt_peer", { state: "running", activity: "drafting the pagination helper" }),
+    },
+    {
+      at: 5_000,
+      run: () =>
+        emit({
+          type: "RequestOpened",
+          requestId: brand("req_1"),
+          fromId: brand("agt_peer"),
+          toPath: brand("root/api"),
+        }),
+    },
+    {
+      at: 5_600,
+      run: () =>
+        emit({
+          type: "RequestReplied",
+          requestId: brand("req_1"),
+          byId: brand("agt_api"),
+          toPath: brand("root/peer"),
+        }),
+    },
+    {
+      at: 6_100,
+      run: () => {
+        update("agt_schema", { activity: "validating fixtures" });
+        emitPi("agt_schema", { type: "ToolStart", toolCallId: "call_bash_1", toolName: "bash" });
+      },
+    },
+    {
+      at: 6_900,
+      run: () =>
+        emitPi("agt_schema", {
+          type: "ToolEnd",
+          toolCallId: "call_bash_1",
+          toolName: "bash",
+          isError: true,
+        }),
+    },
+    {
+      at: 7_400,
+      run: () =>
+        bulletin(
+          "agt_api",
+          "Cursor encoding is settled: opaque base64 of (published_at, id). Anything paginating the changelog should use the shared helper in src/routes/pagination.ts rather than rolling its own.",
+        ),
+    },
+    {
+      at: 8_200,
+      run: () =>
+        settle(
+          "agt_peer",
+          "Completed",
+          completed("agt_peer", "Pagination helper written and exported."),
+        ),
+    },
+    {
+      at: 8_800,
+      run: () => {
+        emitPi("agt_api", { type: "ToolEnd", toolCallId: "call_write_1", toolName: "write_file" });
+        settle(
+          "agt_api",
+          "Completed",
+          completed(
+            "agt_api",
+            "Both read endpoints are in place.\nGET /changelog paginates by opaque cursor.\nGET /changelog/:id returns a single entry.\nCovered by the existing router tests; no new dependencies.",
+          ),
+        );
+      },
+    },
+    {
+      at: 9_700,
+      run: () =>
+        settle("agt_schema", "Failed", {
+          _tag: "Failed",
+          agentId: brand("agt_schema"),
+          name: brand("schema"),
+          code: "AgentRunFailed",
+          message:
+            "Fixture validation rejected 3 of 12 samples: the cursor field is an opaque string upstream but an integer in the fixtures. Reconciling needs a wire-format decision this agent cannot make alone.",
+        }),
+    },
+    {
+      at: 10_600,
+      run: () => update("agt_audit", { state: "running", activity: "cross-checking both tracks" }),
+    },
+    {
+      at: 11_800,
+      run: () =>
+        bulletin(
+          "agt_audit",
+          "Coherence check: the endpoints and the schema disagree on one field only (cursor). Everything else lines up, so this is a single-decision block rather than a redesign.",
+        ),
+    },
+    {
+      at: 13_000,
+      run: () =>
+        settle(
+          "agt_audit",
+          "Completed",
+          completed(
+            "agt_audit",
+            "One disagreement found: cursor typing. No other coherence issues.",
+          ),
+        ),
+    },
+    {
+      at: 14_000,
+      run: () => {
+        emit({ type: "AgentResumed", agentId: brand("agt_root"), waitId: brand("wait_1") });
+        update("agt_root", { state: "running", waitTargets: [], activity: "synthesizing results" });
+      },
+    },
+    {
+      at: 16_000,
+      run: () => {
+        settle(
+          "agt_root",
+          "Completed",
+          completed(
+            "agt_root",
+            "The read API ships; the schema track does not.\nGET /changelog and GET /changelog/:id are implemented and tested.\nThe schema agent failed on a wire-format disagreement about the cursor field, which needs an operator decision before a second attempt.",
+          ),
+        );
+        lifecycle = "draining";
+        emit({ type: "DrainStarted" });
+      },
+    },
+    {
+      at: 16_600,
+      run: () => {
+        emit({
+          type: "DrainCompleted",
+          report: { timedOut: false, interruptedAgentIds: [], terminalAgentCount: agents.size },
+        });
+        lifecycle = "completed";
+        finishedAt = now();
+        store.setRunOutcome({
+          kind: "completed",
+          text: "The read API ships; the schema track needs a wire-format decision first.",
+        });
+        stopTimeline();
+      },
+    },
+  ];
+
+  const stopTimeline = (): void => {
+    if (timer === undefined) return;
+    clearInterval(timer);
+    timer = undefined;
+  };
+
+  const tick = (): void => {
+    elapsed += TICK_MILLIS;
+    while (cursor < script.length) {
+      const step = script[cursor];
+      if (step === undefined || step.at > elapsed) break;
+      cursor += 1;
+      step.run();
+    }
+    publishStatus();
+  };
+
+  const configSummary: ConfigSummary = {
+    configPath: "brood.demo.json",
+    workspacePath: "/Users/demo/code/side-project",
+    sessionDirectory: "/Users/demo/.brood/sessions",
+    maxConcurrency: 4,
+    maxAgentAdmissions: 128,
+    defaultProfile: "worker",
+    profileNames: ["coordinator", "worker"],
+  };
+
+  return {
+    mode: "demo",
+    configSummary,
+    transcript: makeMemoryTranscriptReader((agentId) => transcripts.get(agentId)),
+
+    start: (goal) => {
+      if (startedAt !== undefined) return;
+      startedAt = now();
+      lifecycle = "running";
+      store.note(`run started — ${goal}`, "info");
+      publishStatus();
+      timer = setInterval(tick, TICK_MILLIS);
+    },
+
+    refreshStatus: async () => {
+      publishStatus();
+    },
+
+    fetchDetail: async (reference) => {
+      const agent = [...agents.values()].find(
+        (candidate) => candidate.id === reference || pathOf(candidate.id) === reference,
+      );
+      if (agent === undefined) {
+        store.setDetail(undefined);
+        return;
+      }
+      const parent = agent.parentId === undefined ? undefined : agents.get(agent.parentId);
+      store.setDetail({
+        version: 2,
+        path: pathOf(agent.id),
+        id: brand(agent.id),
+        ...(agent.parentId === undefined ? {} : { parentId: brand(agent.parentId) }),
+        ...(parent === undefined ? {} : { parentPath: pathOf(parent.id) }),
+        name: brand(agent.name),
+        state: agent.state,
+        durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
+        ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+        waitTargets: agent.waitTargets.map(pathOf),
+        children: childrenOf(agent.id).map((child) => pathOf(child.id)),
+        profile: agent.profile,
+        createdAt: agent.createdAt,
+        updatedAt: now(),
+        ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
+        ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
+      });
+    },
+
+    fetchBulletins: async () => {
+      publishBulletins();
+    },
+
+    sendOperatorMessage: async (reference, body) => {
+      const agent = [...agents.values()].find(
+        (candidate) => candidate.id === reference || pathOf(candidate.id) === reference,
+      );
+      if (agent === undefined) return `No agent is known at ${reference}.`;
+      if (agent.terminalAt !== undefined) {
+        return `${pathOf(agent.id)} is terminal and cannot read new messages.`;
+      }
+      if (body.trim() === "") return "Operator messages must be nonblank.";
+      emit({ type: "OperatorMessageAccepted", toId: brand(agent.id) });
+      store.note(`operator → ${pathOf(agent.id)}  message delivered`, "info");
+      return undefined;
+    },
+
+    interrupt: async (reference) => {
+      const agent = [...agents.values()].find(
+        (candidate) => candidate.id === reference || pathOf(candidate.id) === reference,
+      );
+      if (agent === undefined || agent.terminalAt !== undefined) return;
+      emit({
+        type: "AgentInterruptRequested",
+        agentId: brand(agent.id),
+        reason: { _tag: "OperatorRequested", source: "api" },
+      });
+      settle(agent.id, "Interrupted", {
+        _tag: "Interrupted",
+        agentId: brand(agent.id),
+        name: brand(agent.name),
+        reason: "OperatorRequested",
+      });
+      publishStatus();
+    },
+
+    quit: async () => {
+      stopTimeline();
+      if (startedAt === undefined || lifecycle === "completed") return;
+      lifecycle = "draining";
+      emit({ type: "DrainStarted" });
+      for (const agent of agents.values()) {
+        if (agent.terminalAt !== undefined) continue;
+        settle(agent.id, "Interrupted", {
+          _tag: "Interrupted",
+          agentId: brand(agent.id),
+          name: brand(agent.name),
+          reason: "OperatorRequested",
+        });
+      }
+      publishStatus();
+      await new Promise<void>((resolve) => setTimeout(resolve, DRAIN_MILLIS));
+      lifecycle = "completed";
+      finishedAt = now();
+      emit({
+        type: "DrainCompleted",
+        report: { timedOut: false, interruptedAgentIds: [], terminalAgentCount: agents.size },
+      });
+      publishStatus();
+    },
+
+    dispose: async () => {
+      stopTimeline();
+    },
+  };
+};
