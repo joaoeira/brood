@@ -1,9 +1,12 @@
+import { Schema } from "effect";
 import { describe, expect, it } from "vitest";
 import { makeAgentId, makeAgentName, makeProfileName } from "../src/agent.js";
+import { MAX_ACTIVITY_CHARS } from "../src/communication.js";
 import {
   buildAgentDetail,
   buildSwarmStatus,
   formatDuration,
+  StatusAgent,
   StatusInvariantDefect,
   type StatusAgentSource,
 } from "../src/status.js";
@@ -107,5 +110,32 @@ describe("status projections", () => {
     expect(buildAgentDetail({ now: 2_000, agents: [root] }, "root")?.activity).toBe(
       "checking Pi's stop hook",
     );
+  });
+
+  it("normalizes and bounds activity at the public status schema", () => {
+    const decode = Schema.decodeUnknownSync(StatusAgent, { onExcessProperty: "error" });
+    expect(
+      decode({
+        path: "root",
+        name: "root",
+        state: "running",
+        durationMillis: 1,
+        activity: "  checking\nPi  ",
+        waitTargets: [],
+        children: [],
+      }).activity,
+    ).toBe("checking Pi");
+
+    expect(() =>
+      decode({
+        path: "root",
+        name: "root",
+        state: "running",
+        durationMillis: 1,
+        activity: "x".repeat(MAX_ACTIVITY_CHARS + 1),
+        waitTargets: [],
+        children: [],
+      }),
+    ).toThrow(/activity/iu);
   });
 });

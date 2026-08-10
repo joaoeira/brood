@@ -11,6 +11,7 @@ import {
   DependencyOutcome,
   type AgentStatus,
 } from "./agent.js";
+import { AgentActivity, type AgentActivity as AgentActivityType } from "./communication.js";
 import { PublicModelProfile } from "./profiles.js";
 
 export const SwarmRunState = Schema.Literals(["not_started", "running", "draining", "completed"]);
@@ -32,7 +33,7 @@ export interface StatusAgent {
   readonly name: string;
   readonly state: OperationalAgentState;
   readonly durationMillis: number;
-  readonly activity?: string;
+  readonly activity?: AgentActivityType;
   readonly waitTargets: ReadonlyArray<string>;
   readonly children: ReadonlyArray<StatusAgent>;
 }
@@ -42,7 +43,7 @@ export const StatusAgent = Schema.Struct({
   name: Schema.String,
   state: OperationalAgentState,
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
-  activity: Schema.optionalKey(Schema.String),
+  activity: Schema.optionalKey(AgentActivity),
   waitTargets: Schema.Array(Schema.String),
   children: Schema.Array(Schema.suspend((): Schema.Codec<StatusAgent> => StatusAgent)),
 });
@@ -81,7 +82,7 @@ export const AgentDetail = Schema.Struct({
   name: AgentName,
   state: OperationalAgentState,
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
-  activity: Schema.optionalKey(Schema.String),
+  activity: Schema.optionalKey(AgentActivity),
   waitTargets: Schema.Array(Schema.String),
   children: Schema.Array(Schema.String),
   profile: PublicModelProfile,
@@ -105,7 +106,7 @@ export interface StatusAgentSource {
   readonly profile: PublicModelProfile;
   readonly status: AgentStatus;
   readonly waitTargets: ReadonlyArray<AgentId>;
-  readonly activity?: string;
+  readonly activity?: AgentActivityType;
   readonly outcome?: DependencyOutcome;
   readonly createdAt: number;
   readonly updatedAt: number;
