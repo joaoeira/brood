@@ -214,6 +214,8 @@ const MAX_TOOL_RESULT_CHARS = 32_000;
 
 These constants are colocated with the schemas/renderers they constrain and tested as one policy. Operators should not have to tune mailbox internals to run a swarm.
 
+Message, question, reply, and bulletin bodies normalize CRLF, remove unsafe C0/C1 and bidirectional formatting controls, replace lone UTF-16 surrogates with U+FFFD, trim, and then apply the Unicode code-point limit. This is part of the accepted boundary value, not render-time truncation. It guarantees that JSON/XML encoding cannot turn one accepted item into an unpageable head record; a worst-case accepted item must fit `MAX_TOOL_RESULT_CHARS` with its maximal sender path and fixed envelope.
+
 `MAX_REPLY_CHARS` is deliberately smaller than the other body limits. Together with `MAX_REQUEST_TARGETS_PER_WAIT`, it lets `minimumResumePromptChars(maxAgentAdmissions)` reserve enough space for every request-outcome header and every complete reply. The wait cap counts planned, active, and settled-but-not-yet-delivered request targets, including targets merged by later coordination turns. Replies are never truncated. A longer answer belongs under `.brood/shared/`; the reply should summarize it and name the path.
 
 The existing `maxResumePromptChars` remains configurable because it governs broader Brood resume rendering. Its minimum becomes:
@@ -246,11 +248,11 @@ export type RequestId = typeof RequestId.Type;
 export const AddressableAgentState = Schema.Literals(["queued", "starting", "running", "waiting"]);
 export type AddressableAgentState = typeof AddressableAgentState.Type;
 
-export const AgentWaitSummary = Schema.Struct({
-  agentCompletions: Schema.Array(AgentPath),
-  repliesFrom: Schema.Array(AgentPath),
+export const AgentWaitCounts = Schema.Struct({
+  agentCompletions: Schema.Natural,
+  replies: Schema.Natural,
 });
-export interface AgentWaitSummary extends Schema.Schema.Type<typeof AgentWaitSummary> {}
+export interface AgentWaitCounts extends Schema.Schema.Type<typeof AgentWaitCounts> {}
 
 export const AgentActivity = Schema.String.pipe(
   Schema.decode({
@@ -263,16 +265,16 @@ export type AgentActivity = typeof AgentActivity.Type;
 export const AgentDirectoryEntry = Schema.Struct({
   path: AgentPath,
   name: AgentName,
-  parentPath: Schema.optionalKey(AgentPath),
   state: AddressableAgentState,
   profile: ProfileName,
   activity: Schema.optionalKey(AgentActivity),
-  waitingFor: AgentWaitSummary,
+  waitingFor: AgentWaitCounts,
+  waitingForCaller: Schema.Boolean,
 });
 export interface AgentDirectoryEntry extends Schema.Schema.Type<typeof AgentDirectoryEntry> {}
 ```
 
-`waitingFor` is operational state, not permission. It helps an agent notice, for example, that its parent is waiting for it before deciding whether to ask that parent a question.
+`waitingFor` is fixed-size operational state, not permission. `waitingForCaller` answers the immediately useful question—whether this peer currently waits on the caller—without embedding an unbounded set of deep canonical paths in one directory row. Exact unresolved targets remain available in operator status. Canonical paths already encode provenance, so directory rows do not duplicate parent paths.
 
 There is no model-facing `MessageId`, timestamp, sequence, `asOf`, or original assignment. Ordering metadata remains internal. `InboxRequest` exposes only the `RequestId` that `reply_to_request` accepts, so the model cannot confuse two identifiers for one request.
 
@@ -320,13 +322,12 @@ export const PeerRequestOutcome = Schema.TaggedUnion({
     request: RequestId,
     to: AgentPath,
     recipientState: Schema.Literals(["completed", "failed", "interrupted"]),
-    message: Schema.String,
   },
 });
 export type PeerRequestOutcome = typeof PeerRequestOutcome.Type;
 ```
 
-The `Replied.reply` field always contains the complete accepted reply; it is normalized, XML-escaped when rendered, and bounded by `MAX_REPLY_CHARS`. It never uses `BoundedText` and never sets a truncation flag.
+The `Replied.reply` field always contains the complete accepted reply; it is normalized, XML-escaped when rendered, and bounded by `MAX_REPLY_CHARS`. It never uses `BoundedText` and never sets a truncation flag. `Unavailable` needs no model-authored message: the structured path and terminal state carry the variable facts, and the renderer supplies one fixed bounded explanation.
 
 ### 6.4 Bulletin projections
 
@@ -389,7 +390,6 @@ Result:
 ```ts
 export const AgentSelf = Schema.Struct({
   path: AgentPath,
-  parentPath: Schema.optionalKey(AgentPath),
 });
 export interface AgentSelf extends Schema.Schema.Type<typeof AgentSelf> {}
 
@@ -419,9 +419,9 @@ Semantics:
 - stop earlier rather than exceed `MAX_TOOL_RESULT_CHARS`;
 - set `nextAfter` only when another entry exists;
 - distinguish queued, starting, running, and waiting accurately;
-- disclose profile and wait targets, but no goal, prompt, raw ID, transcript, or result.
+- disclose profile, bounded wait counts, and whether the peer waits on the caller, but no goal, prompt, raw ID, transcript, or result.
 
-The result states the caller's parent explicitly through `self.parentPath`. The same path is placed directly in the child system prompt; agents do not have to infer it by string manipulation.
+The caller's canonical path and parent path are placed directly in its fixed system prompt. The directory result repeats only the caller path, which keeps one maximal row plus its lexical cursor within `MAX_TOOL_RESULT_CHARS`.
 
 ### 7.4 `set_activity`
 
@@ -449,7 +449,7 @@ setActivity(
 ): Effect.Effect<SetActivityResult, SetActivityRejected>
 ```
 
-`null` clears the current value. A string is normalized into one display line by removing ANSI/control characters, folding line breaks and repeated whitespace, and trimming. Blank or oversized normalized text is rejected. Replacement is atomic, does not wake another agent, and does not affect lifecycle state.
+`null` clears the current value. A string is normalized into one display line by removing ANSI, control, and bidirectional-formatting characters, folding line breaks and repeated whitespace, and trimming. Blank or oversized normalized text is rejected. Replacement is atomic, does not wake another agent, and does not affect lifecycle state.
 
 The system prompt recommends updating activity only at meaningful phase changes, for example “checking Pi's stop-hook ordering,” and clearing it when no current description is useful. Brood also clears it automatically on terminal settlement.
 
@@ -866,12 +866,6 @@ export const CoordinationNotice = Schema.Struct({
 });
 export interface CoordinationNotice extends Schema.Schema.Type<typeof CoordinationNotice> {}
 
-export const ActiveWaitCounts = Schema.Struct({
-  agentCompletions: Schema.Natural,
-  replies: Schema.Natural,
-});
-export interface ActiveWaitCounts extends Schema.Schema.Type<typeof ActiveWaitCounts> {}
-
 export const AgentCommand = Schema.TaggedUnion({
   InitialGoal: {
     goal: Schema.String,
@@ -885,7 +879,7 @@ export const AgentCommand = Schema.TaggedUnion({
   },
   CoordinationWake: {
     notice: CoordinationNotice,
-    waitingFor: ActiveWaitCounts,
+    waitingFor: AgentWaitCounts,
   },
 });
 export type AgentCommand = typeof AgentCommand.Type;
@@ -893,7 +887,7 @@ export type AgentCommand = typeof AgentCommand.Type;
 
 The notice contains no model-authored bodies. `openRequests` counts every request addressed to this agent that still needs its reply, including requests returned by an earlier `read_messages` call. It appears on every subsequent command until those requests settle. `unseenBulletins` counts retained posts after the caller's bulletin cursor but never creates a command by itself. This prevents a read-but-unanswered request from silently disappearing while keeping the board passive.
 
-`CoordinationWake` is caused only by a newly accepted question. Passive messages never create it. It reports bounded counts rather than canonical-path arrays: exact targets remain available through `list_agents` and operator status, while a valid deep path set cannot overflow `maxResumePromptChars`. The prompt tells the recipient to call `read_messages`, answer outstanding requests before reparking when possible, and use the shared directory if an answer requires more than `MAX_REPLY_CHARS`.
+`CoordinationWake` is caused only by a newly accepted question. Passive messages never create it. It reports bounded counts rather than canonical-path arrays: exact targets remain available through operator status, while a valid deep path set cannot overflow `maxResumePromptChars`. The prompt tells the recipient to call `read_messages`, answer outstanding requests before reparking when possible, and use the shared directory if an answer requires more than `MAX_REPLY_CHARS`.
 
 Open requests are not automatically re-woken forever. Repeated `read_messages` can recover them, and every later command repeats the open count, but v1 does not spend unbounded provider calls on a model that repeatedly refuses to answer. If the recipient terminates, the requester receives `Unavailable`.
 
@@ -1217,7 +1211,7 @@ Every system prompt states:
 Count-only notice example:
 
 ```text
-<brood_coordination_notice version="1" self="root/api">
+<brood_coordination_notice version="1">
   <inbox unread_messages="2" open_requests="1" unseen_bulletins="3" />
 </brood_coordination_notice>
 ```
@@ -1228,11 +1222,11 @@ Request outcomes use a distinct envelope:
 
 ```text
 <brood_request_outcomes version="1" wait_id="wait_...">
-  <request id="request_..." status="replied">
+  <request id="request_..." to="root/research" status="replied">
     Use the pinned Pi version; longer notes are in .brood/shared/pi/stop-hook.md.
   </request>
-  <request id="request_..." status="unavailable" reason="interrupted">
-    The recipient was interrupted before replying.
+  <request id="request_..." to="root/tests" status="unavailable" reason="interrupted">
+    The recipient became terminal before replying. Continue without this clarification or ask another addressable agent.
   </request>
 </brood_request_outcomes>
 ```
@@ -1392,7 +1386,7 @@ Run deterministic concurrency-one, many-child, arbitrary-peer, terminal-race, ca
 ### 18.2 Discovery tests
 
 - every addressable agent across unrelated branches appears;
-- caller and parent paths are explicit;
+- caller path is explicit in discovery, while caller and parent paths are explicit in the fixed system prompt;
 - queued, starting, running, and waiting remain distinct;
 - completed, failed, and interrupted agents are absent;
 - canonical paths disambiguate repeated names under different parents;
@@ -1478,7 +1472,7 @@ Assert one Pi session per logical agent and maximum observed active runs of one.
 - unrelated branches message each other;
 - siblings ask each other concurrently and both can be coordination-woken without permits;
 - replies settle exact requests without changing provenance;
-- waitingFor directory/status projection shows request recipient paths;
+- directory wait counts and `waitingForCaller` remain bounded, while operator status shows exact request-recipient paths;
 - no ancestry-specific lookup exists in communication transitions.
 
 These are not semaphore deadlocks. A model may still create a semantic cycle by refusing to answer a request from an agent it waits on; v1 addresses this with explicit wait visibility, request-first reads, repeated open-request notices, and recipient-terminal settlement rather than an autonomous deadlock breaker.
