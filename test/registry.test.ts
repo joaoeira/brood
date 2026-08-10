@@ -1579,6 +1579,98 @@ it.effect("an urgent message racing completion forces one more turn before settl
   }),
 );
 
+it.effect("tracks the full communication lifecycle in the operator traffic log", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const children = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-children"),
+      children: [
+        { name: makeAgentName("worker"), goal: "work", profile },
+        { name: makeAgentName("scout"), goal: "scout", profile },
+      ],
+      wait: "none",
+    })).children;
+    const worker = children[0]!;
+    const scout = children[1]!;
+
+    yield* registry.sendMessage(scout.id, makeToolInvocationId("traffic-message"), {
+      to: worker.path,
+      message: "The cursor format is settled.",
+    });
+    const asked = yield* registry.askAgent(scout.id, makeToolInvocationId("traffic-ask"), {
+      to: worker.path,
+      question: "Which fixture is canonical?",
+    });
+    const afterSend = yield* registry.trafficLog;
+
+    const claim = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, claim.token);
+    yield* registry.readMessages(worker.id, makeToolInvocationId("traffic-read"), {});
+    yield* registry.replyToRequest(worker.id, makeToolInvocationId("traffic-reply"), {
+      request: asked.request,
+      message: "fixture-7 is canonical.",
+    });
+    yield* registry.deliverOperatorMessage(
+      worker.id,
+      makeOperatorMessageId("opmsg_traffic"),
+      "Ship it.",
+    );
+    yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "done", finalMessageId: undefined, stopReason: "stop" },
+      },
+      completedResult: result(worker.id, "done"),
+    });
+    const wake = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, wake.token);
+    const afterDrain = yield* registry.trafficLog;
+
+    expect(afterSend.map(({ kind, status }) => [kind, status])).toEqual([
+      ["message", "unread"],
+      ["request", "unread"],
+    ]);
+    expect(afterDrain.map(({ kind, status }) => [kind, status])).toEqual([
+      ["message", "read"],
+      ["request", "answered"],
+      ["reply", "sent"],
+      ["operator", "delivered"],
+    ]);
+    expect(afterDrain.map(({ body }) => body)).toEqual([
+      "The cursor format is settled.",
+      "Which fixture is canonical?",
+      "fixture-7 is canonical.",
+      "Ship it.",
+    ]);
+    expect(afterDrain[0]).toMatchObject({
+      from: scout.path,
+      to: worker.path,
+      statusAt: expect.any(Number),
+    });
+    expect(afterDrain[2]).toMatchObject({ from: worker.path, to: scout.path });
+
+    // A requester dying with an open question voids its traffic record.
+    const secondAsk = yield* registry.askAgent(scout.id, makeToolInvocationId("traffic-ask-2"), {
+      to: root.path,
+      question: "Never answered.",
+    });
+    yield* registry.settle(scout.id, completed(scout.id));
+    const afterVoid = yield* registry.trafficLog;
+    expect(afterVoid.find(({ requestId }) => requestId === secondAsk.request)).toMatchObject({
+      kind: "request",
+      status: "void",
+    });
+  }),
+);
+
 it.effect("settles directly when a steered operator message was confirmed injected", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({ maxAgentAdmissions: 1, ...deterministicIds() });

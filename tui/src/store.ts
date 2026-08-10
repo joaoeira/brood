@@ -14,6 +14,7 @@ import type {
   StatusAgent,
   SupervisorEvent,
   SwarmStatus,
+  TrafficView,
 } from "./brood";
 
 const TICKER_CAPACITY = 250;
@@ -46,6 +47,7 @@ export type Overlay =
   | "bulletins"
   | "transcript"
   | "compose"
+  | "comms"
   | { readonly kind: "confirm-interrupt" | "confirm-quit" };
 
 export interface AppState {
@@ -61,6 +63,7 @@ export interface AppState {
   readonly ticker: ReadonlyArray<TickerEntry>;
   readonly recentTools: ReadonlyMap<string, ReadonlyArray<ToolEvent>>;
   readonly bulletins: ReadonlyArray<BulletinView>;
+  readonly traffic: ReadonlyArray<TrafficView>;
   /** Highest bulletin sequence the operator has had on screen; drives the hint-bar marker. */
   readonly seenBulletinSequence: number;
   readonly overlay: Overlay;
@@ -75,6 +78,7 @@ const initialState: AppState = {
   ticker: [],
   recentTools: new Map(),
   bulletins: [],
+  traffic: [],
   seenBulletinSequence: 0,
   overlay: "none",
   quitting: false,
@@ -164,6 +168,13 @@ const describeLifecycle = (
       return { text: `${pathOf(event.authorId)}  bulletin posted`, tone: "info" };
     case "OperatorMessageAccepted":
       return { text: `operator → ${pathOf(event.toId)}  message`, tone: "info" };
+    case "InboxRead": {
+      const parts = [
+        ...(event.messages > 0 ? [plural(event.messages, "message")] : []),
+        ...(event.requests > 0 ? [plural(event.requests, "question")] : []),
+      ];
+      return { text: `${pathOf(event.readerId)}  read ${parts.join(", ")}`, tone: "muted" };
+    }
     case "DrainStarted":
       return { text: "drain started", tone: "warn" };
     case "DrainTimedOut":
@@ -224,6 +235,7 @@ export const store = {
   setStatus: (status: SwarmStatus): void => patch({ status }),
   setDetail: (detail: AgentDetail | undefined): void => patch({ detail }),
   setBulletins: (bulletins: ReadonlyArray<BulletinView>): void => patch({ bulletins }),
+  setTraffic: (traffic: ReadonlyArray<TrafficView>): void => patch({ traffic }),
 
   /** Viewing the board is what marks it read; eviction can only shrink the count. */
   markBulletinsSeen: (): void => {

@@ -32,6 +32,9 @@ export {
   OperatorMessageRejected,
   type BulletinView,
   type OperatorMessageDelivery,
+  type TrafficKind,
+  type TrafficStatus,
+  type TrafficView,
 } from "./registry.js";
 export { BroodConfigInput, type BroodConfigEncoded } from "./runtime.js";
 export { AgentDetail, SwarmStatus, type StatusAgent } from "./status.js";

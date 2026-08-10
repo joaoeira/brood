@@ -41,6 +41,9 @@ export const glyphs = {
   suspended: "⏸",
   inbound: "◂",
   outbound: "▸",
+  operator: "⌁",
+  mail: "✉",
+  bolt: "⚡",
 } as const;
 
 export const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;

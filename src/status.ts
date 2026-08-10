@@ -28,6 +28,16 @@ export const OperationalAgentState = Schema.Literals([
 ]);
 export type OperationalAgentState = typeof OperationalAgentState.Type;
 
+export const CoordinationCounts = Schema.Struct({
+  unreadMessages: Schema.Natural,
+  unreadUrgent: Schema.Natural,
+  openRequestsIncoming: Schema.Natural,
+  openRequestsOutgoing: Schema.Natural,
+  pendingOperatorMessages: Schema.Natural,
+  unseenBulletins: Schema.Natural,
+});
+export interface CoordinationCounts extends Schema.Schema.Type<typeof CoordinationCounts> {}
+
 export interface StatusAgent {
   readonly path: string;
   readonly name: string;
@@ -35,6 +45,8 @@ export interface StatusAgent {
   readonly durationMillis: number;
   readonly activity?: AgentActivityType;
   readonly waitTargets: ReadonlyArray<string>;
+  /** Present only when at least one count is nonzero. Counts, never bodies. */
+  readonly coordination?: CoordinationCounts;
   readonly children: ReadonlyArray<StatusAgent>;
 }
 
@@ -45,6 +57,7 @@ export const StatusAgent = Schema.Struct({
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   activity: Schema.optionalKey(AgentActivity),
   waitTargets: Schema.Array(Schema.String),
+  coordination: Schema.optionalKey(CoordinationCounts),
   children: Schema.Array(Schema.suspend((): Schema.Codec<StatusAgent> => StatusAgent)),
 });
 
@@ -84,6 +97,7 @@ export const AgentDetail = Schema.Struct({
   durationMillis: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   activity: Schema.optionalKey(AgentActivity),
   waitTargets: Schema.Array(Schema.String),
+  coordination: Schema.optionalKey(CoordinationCounts),
   children: Schema.Array(Schema.String),
   profile: PublicModelProfile,
   createdAt: Schema.Number,
@@ -107,11 +121,27 @@ export interface StatusAgentSource {
   readonly status: AgentStatus;
   readonly waitTargets: ReadonlyArray<AgentId>;
   readonly activity?: AgentActivityType;
+  readonly coordination?: CoordinationCounts;
   readonly outcome?: DependencyOutcome;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly terminalAt?: number;
 }
+
+/** Projects counts only when something is nonzero, keeping quiet agents quiet. */
+const activeCoordination = (
+  coordination: CoordinationCounts | undefined,
+): CoordinationCounts | undefined =>
+  coordination !== undefined &&
+  coordination.unreadMessages +
+    coordination.unreadUrgent +
+    coordination.openRequestsIncoming +
+    coordination.openRequestsOutgoing +
+    coordination.pendingOperatorMessages +
+    coordination.unseenBulletins >
+    0
+    ? coordination
+    : undefined;
 
 export interface StatusProjectionInput {
   readonly lifecycle: RunLifecycle;
@@ -205,12 +235,14 @@ const statusTree = (
     if (indexedAgent === undefined) {
       throw new StatusInvariantDefect(`Agent ${agent.id} is missing from the status index`);
     }
+    const coordination = activeCoordination(agent.coordination);
     return {
       path: indexedAgent.path,
       name: agent.name,
       state: operationalState(agent.status),
       durationMillis: Math.max(0, (agent.terminalAt ?? now) - agent.createdAt),
       ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+      ...(coordination === undefined ? {} : { coordination }),
       waitTargets: agent.waitTargets.map((targetId) => {
         const target = indexed.get(targetId);
         if (target === undefined) {
@@ -267,6 +299,7 @@ export const buildAgentDetail = (
 
   const agent = selected.source;
   const parent = agent.parentId === undefined ? undefined : indexed.get(agent.parentId);
+  const coordination = activeCoordination(agent.coordination);
   return {
     version: 2,
     path: selected.path,
@@ -277,6 +310,7 @@ export const buildAgentDetail = (
     state: operationalState(agent.status),
     durationMillis: Math.max(0, (agent.terminalAt ?? input.now) - agent.createdAt),
     ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+    ...(coordination === undefined ? {} : { coordination }),
     waitTargets: agent.waitTargets.map((targetId) => {
       const target = indexed.get(targetId);
       if (target === undefined) {
@@ -318,6 +352,19 @@ export const formatDuration = (milliseconds: number): string => {
   return `${hours}h ${minutes.toString().padStart(2, "0")}m`;
 };
 
+const formatCoordination = (counts: CoordinationCounts): string => {
+  const parts: Array<string> = [];
+  if (counts.unreadMessages > 0) {
+    const urgent = counts.unreadUrgent > 0 ? ` (${counts.unreadUrgent} urgent)` : "";
+    parts.push(`mail ${counts.unreadMessages}${urgent}`);
+  }
+  if (counts.openRequestsIncoming > 0) parts.push(`owes ${counts.openRequestsIncoming}`);
+  if (counts.openRequestsOutgoing > 0) parts.push(`awaits ${counts.openRequestsOutgoing}`);
+  if (counts.pendingOperatorMessages > 0) parts.push(`operator ${counts.pendingOperatorMessages}`);
+  if (counts.unseenBulletins > 0) parts.push(`bulletins ${counts.unseenBulletins}`);
+  return parts.join(" · ");
+};
+
 const renderStatusAgent = (
   agent: StatusAgent,
   prefix: string,
@@ -325,7 +372,9 @@ const renderStatusAgent = (
   isLast: boolean,
 ): ReadonlyArray<string> => {
   const waitSuffix = agent.waitTargets.length === 0 ? "" : `  → ${agent.waitTargets.join(", ")}`;
-  const line = `${prefix}${connector}${agent.path}  ${agent.state}  ${formatDuration(agent.durationMillis)}${waitSuffix}`;
+  const coordinationSuffix =
+    agent.coordination === undefined ? "" : `  [${formatCoordination(agent.coordination)}]`;
+  const line = `${prefix}${connector}${agent.path}  ${agent.state}  ${formatDuration(agent.durationMillis)}${waitSuffix}${coordinationSuffix}`;
   const childPrefix = connector === "" ? prefix : `${prefix}${isLast ? "   " : "│  "}`;
   return [
     line,
@@ -367,6 +416,9 @@ export const formatAgentDetail = (detail: AgentDetail): string => {
   ];
   if (detail.parentPath !== undefined) lines.push(`Parent ${detail.parentPath}`);
   if (detail.activity !== undefined) lines.push(`Activity ${detail.activity}`);
+  if (detail.coordination !== undefined) {
+    lines.push(`Comms ${formatCoordination(detail.coordination)}`);
+  }
   if (detail.terminalAt !== undefined) lines.push(`Finished ${formatTimestamp(detail.terminalAt)}`);
   if (detail.waitTargets.length > 0) lines.push(`Waiting on ${detail.waitTargets.join(", ")}`);
   if (detail.children.length > 0) lines.push(`Children ${detail.children.join(", ")}`);

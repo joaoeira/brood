@@ -161,6 +161,7 @@ export interface AgentSnapshot extends RegisteredAgent {
   readonly updatedAt: number;
   readonly terminalAt: number | undefined;
   readonly activity: AgentActivity | undefined;
+  readonly coordination: AgentCoordinationCounts;
 }
 
 export interface RegistrySnapshot {
@@ -179,6 +180,45 @@ export interface BulletinView {
   readonly sequence: number;
   readonly author: AgentPath;
   readonly body: string;
+}
+
+export type TrafficKind = "message" | "request" | "reply" | "operator";
+export type TrafficStatus =
+  | "unread"
+  | "read"
+  | "answered"
+  | "void"
+  | "pending"
+  | "delivered"
+  | "sent";
+
+/**
+ * One communication record in the operator-only traffic log. Bodies appear
+ * here and nowhere else outside agent transcripts: never in status, never in
+ * events, never re-rendered into any agent's prompt. `from` is "operator" for
+ * operator messages and a canonical path otherwise.
+ */
+export interface TrafficView {
+  readonly sequence: number;
+  readonly at: number;
+  readonly kind: TrafficKind;
+  readonly from: string;
+  readonly to: AgentPath;
+  readonly body: string;
+  readonly urgent: boolean;
+  readonly status: TrafficStatus;
+  readonly statusAt?: number;
+  readonly requestId?: RequestId;
+}
+
+/** Advisory communication counts for one agent, computed from live state. */
+export interface AgentCoordinationCounts {
+  readonly unreadMessages: number;
+  readonly unreadUrgent: number;
+  readonly openRequestsIncoming: number;
+  readonly openRequestsOutgoing: number;
+  readonly pendingOperatorMessages: number;
+  readonly unseenBulletins: number;
 }
 
 /** Operator-surface rejection for a direct operator message; never crosses the Pi boundary. */
@@ -300,16 +340,73 @@ interface AgentEntry extends RegisteredAgent {
   readonly terminalAt: number | undefined;
 }
 
+/** Internal traffic record; correlation keys never leave the registry. */
+interface TrafficRecord {
+  readonly sequence: number;
+  readonly at: number;
+  readonly kind: TrafficKind;
+  readonly fromPath: string;
+  readonly toPath: AgentPath;
+  readonly body: string;
+  readonly urgent: boolean;
+  readonly status: TrafficStatus;
+  readonly statusAt: number | undefined;
+  readonly recipientId: AgentId | undefined;
+  readonly inboxSequence: number | undefined;
+  readonly requestId: RequestId | undefined;
+  readonly operatorMessageId: OperatorMessageId | undefined;
+}
+
 interface RegistryState {
   readonly agents: ReadonlyMap<AgentId, AgentEntry>;
   readonly agentsByPath: ReadonlyMap<AgentPath, AgentId>;
   readonly requests: ReadonlyMap<RequestId, RequestRecord>;
   readonly bulletins: ReadonlyArray<BulletinRecord>;
   readonly nextBulletinSequence: number;
+  readonly traffic: ReadonlyArray<TrafficRecord>;
+  readonly nextTrafficSequence: number;
   readonly rootId: AgentId | undefined;
   readonly accepting: boolean;
   readonly nonterminalCount: number;
 }
+
+/** Ring bound for the operator traffic log; oldest records fall off first. */
+const MAX_TRAFFIC_RECORDS = 512;
+
+const appendTraffic = (
+  state: RegistryState,
+  at: number,
+  record: Omit<TrafficRecord, "sequence" | "at" | "statusAt">,
+): RegistryState => {
+  const sequence = state.nextTrafficSequence + 1;
+  if (!Number.isSafeInteger(sequence)) {
+    throw new RegistryInvariantDefect("Traffic sequence exhausted its safe integer range");
+  }
+  const appended = [...state.traffic, { ...record, sequence, at, statusAt: undefined }];
+  return {
+    ...state,
+    traffic:
+      appended.length > MAX_TRAFFIC_RECORDS
+        ? appended.slice(appended.length - MAX_TRAFFIC_RECORDS)
+        : appended,
+    nextTrafficSequence: sequence,
+  };
+};
+
+const updateTraffic = (
+  state: RegistryState,
+  at: number,
+  status: TrafficStatus,
+  match: (record: TrafficRecord) => boolean,
+): RegistryState => {
+  let changed = false;
+  const traffic = state.traffic.map((record) => {
+    if (!match(record)) return record;
+    changed = true;
+    return { ...record, status, statusAt: at };
+  });
+  return changed ? { ...state, traffic } : state;
+};
 
 type PostCommitAction = Data.TaggedEnum<{
   Complete: {
@@ -498,6 +595,9 @@ export interface AgentRegistry {
   /** Full retained bulletin board in global sequence order, for operator
    * surfaces only. Never rendered into agent-facing prompts or events. */
   readonly bulletinBoard: Effect.Effect<ReadonlyArray<BulletinView>>;
+  /** Bounded operator-only communication log with bodies and read state.
+   * Never rendered into agent-facing prompts, status, or events. */
+  readonly trafficLog: Effect.Effect<ReadonlyArray<TrafficView>>;
   /** Operator-only direct delivery. Unlike peer sends this wakes a parked
    * recipient: the operator is steering the run, not leaving passive mail.
    * The message is retained only until a delivery commits — a steer confirmed
@@ -567,6 +667,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     requests: new Map(),
     bulletins: [],
     nextBulletinSequence: 0,
+    traffic: [],
+    nextTrafficSequence: 0,
     rootId: undefined,
     accepting: true,
     nonterminalCount: 0,
@@ -1113,7 +1215,18 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         updatedAt: deliveredAt,
       });
       return {
-        next: { ...state, agents },
+        next: appendTraffic({ ...state, agents }, deliveredAt, {
+          kind: "message",
+          fromPath: caller.path,
+          toPath: recipient.path,
+          body: input.message,
+          urgent,
+          status: "unread",
+          recipientId,
+          inboxSequence: sequence,
+          requestId: undefined,
+          operatorMessageId: undefined,
+        }),
         // An urgent send wakes a parked recipient exactly like a question
         // does; ordinary mail stays passive and waits for a natural boundary.
         actions: urgent ? [PostCommitAction.Open({ latch: recipient.mailbox })] : [],
@@ -1157,11 +1270,26 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             );
           }
           return {
-            next: replaceAgent(state, {
-              ...recipient,
-              operatorMessages: [...recipient.operatorMessages, { id: messageId, body }],
-              updatedAt: deliveredAt,
-            }),
+            next: appendTraffic(
+              replaceAgent(state, {
+                ...recipient,
+                operatorMessages: [...recipient.operatorMessages, { id: messageId, body }],
+                updatedAt: deliveredAt,
+              }),
+              deliveredAt,
+              {
+                kind: "operator",
+                fromPath: "operator",
+                toPath: recipient.path,
+                body,
+                urgent: true,
+                status: "pending",
+                recipientId: id,
+                inboxSequence: undefined,
+                requestId: undefined,
+                operatorMessageId: messageId,
+              },
+            ),
             actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
             result: Result.succeed({
               to: recipient.path,
@@ -1294,7 +1422,18 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         updatedAt: requestedAt,
       });
       return {
-        next: { ...state, agents, requests },
+        next: appendTraffic({ ...state, agents, requests }, requestedAt, {
+          kind: "request",
+          fromPath: caller.path,
+          toPath: recipient.path,
+          body: input.question,
+          urgent: false,
+          status: "unread",
+          recipientId,
+          inboxSequence: sequence,
+          requestId,
+          operatorMessageId: undefined,
+        }),
         actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
         result: Result.succeed({
           version: 1,
@@ -1406,8 +1545,29 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           omittedFromPage: ordered.length - selected.length,
         },
       };
+      // Consumed messages and first-time-presented questions become "read" in
+      // the operator traffic log inside this same transaction.
+      const withReceipts = selected.reduce(
+        (current, { source }) =>
+          updateTraffic(
+            current,
+            readAt,
+            "read",
+            source._tag === "Message"
+              ? (record) =>
+                  record.kind === "message" &&
+                  record.recipientId === callerId &&
+                  record.inboxSequence === source.sequence &&
+                  record.status === "unread"
+              : (record) =>
+                  record.kind === "request" &&
+                  record.requestId === source.requestId &&
+                  record.status === "unread",
+          ),
+        state,
+      );
       return {
-        next: replaceAgent(state, { ...claimed.success, inbox, updatedAt: readAt }),
+        next: replaceAgent(withReceipts, { ...claimed.success, inbox, updatedAt: readAt }),
         actions: [],
         result: Result.succeed(result),
       };
@@ -1493,6 +1653,24 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         updatedAt: repliedAt,
       });
       let next: RegistryState = { ...state, agents, requests };
+      next = updateTraffic(
+        next,
+        repliedAt,
+        "answered",
+        (record) => record.kind === "request" && record.requestId === request.id,
+      );
+      next = appendTraffic(next, repliedAt, {
+        kind: "reply",
+        fromPath: caller.path,
+        toPath: requester.path,
+        body: input.message,
+        urgent: false,
+        status: "sent",
+        recipientId: requester.id,
+        inboxSequence: undefined,
+        requestId: request.id,
+        operatorMessageId: undefined,
+      });
       const actions: Array<PostCommitAction> = [];
       const currentRequester = next.agents.get(requester.id);
       if (
@@ -2007,6 +2185,12 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         if (pendingOperator !== undefined) {
           command = { ...command, operatorMessage: pendingOperator.body };
           nextEntry = { ...nextEntry, operatorMessages: remainingOperator };
+          nextState = updateTraffic(
+            nextState,
+            beganAt,
+            "delivered",
+            (record) => record.operatorMessageId === pendingOperator.id,
+          );
         }
         const runningCommand: RunningCommand = {
           token,
@@ -2088,9 +2272,11 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           recipientTerminalState = "interrupted";
           break;
       }
+      const voidedRequestIds = new Set<RequestId>();
       for (const request of state.requests.values()) {
         if (request.requesterId === id) {
           requests.delete(request.id);
+          if (request.state._tag === "Open") voidedRequestIds.add(request.id);
           const recipient = agents.get(request.recipientId);
           if (recipient !== undefined && recipient.outcome === undefined) {
             agents.set(recipient.id, {
@@ -2104,6 +2290,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           continue;
         }
         if (request.recipientId === id && request.state._tag === "Open") {
+          voidedRequestIds.add(request.id);
           requests.set(request.id, {
             ...request,
             state: { _tag: "Unavailable", recipientState: recipientTerminalState },
@@ -2111,6 +2298,18 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         }
       }
       let next: RegistryState = { ...state, agents, requests };
+      const voidedOperatorIds = new Set(entry.operatorMessages.map(({ id: opId }) => opId));
+      next = updateTraffic(
+        next,
+        settledAt,
+        "void",
+        (record) =>
+          (record.requestId !== undefined &&
+            record.kind === "request" &&
+            voidedRequestIds.has(record.requestId)) ||
+          (record.operatorMessageId !== undefined &&
+            voidedOperatorIds.has(record.operatorMessageId)),
+      );
       for (const candidate of agents.values()) {
         if (
           candidate.status === "Waiting" &&
@@ -2240,7 +2439,13 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             : entry.operatorMessages.filter(({ id }) => !deliveredOperator.has(id)),
         updatedAt: finishedAt,
       };
-      const reconciledState = replaceAgent(state, reconciled);
+      const reconciledState = updateTraffic(
+        replaceAgent(state, reconciled),
+        finishedAt,
+        "delivered",
+        (record) =>
+          record.operatorMessageId !== undefined && deliveredOperator.has(record.operatorMessageId),
+      );
       if (entry.interruptRequested !== undefined) {
         const settled = settleTransition(
           reconciledState,
@@ -2437,6 +2642,23 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     ),
   );
 
+  const trafficLog = Ref.get(stateRef).pipe(
+    Effect.map((state): ReadonlyArray<TrafficView> =>
+      state.traffic.map((record) => ({
+        sequence: record.sequence,
+        at: record.at,
+        kind: record.kind,
+        from: record.fromPath,
+        to: record.toPath,
+        body: record.body,
+        urgent: record.urgent,
+        status: record.status,
+        ...(record.statusAt === undefined ? {} : { statusAt: record.statusAt }),
+        ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
+      })),
+    ),
+  );
+
   const snapshot = Ref.get(stateRef).pipe(
     Effect.map((state): RegistrySnapshot => {
       const agents = Array.from(state.agents.values(), (entry): AgentSnapshot => {
@@ -2458,6 +2680,19 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           }
           return request.state._tag === "Open" ? [request.recipientId] : [];
         });
+        const coordination: AgentCoordinationCounts = {
+          unreadMessages: entry.inbox.filter((item) => item._tag === "Message").length,
+          unreadUrgent: entry.inbox.filter(
+            (item) => item._tag === "Message" && item.wakeGeneration !== undefined,
+          ).length,
+          openRequestsIncoming: openIncomingRequests(state, entry).length,
+          openRequestsOutgoing: Array.from(state.requests.values()).filter(
+            (request) => request.requesterId === entry.id && request.state._tag === "Open",
+          ).length,
+          pendingOperatorMessages: entry.operatorMessages.length,
+          unseenBulletins: state.bulletins.filter(({ sequence }) => sequence > entry.bulletinCursor)
+            .length,
+        };
         return {
           id: entry.id,
           name: entry.name,
@@ -2479,6 +2714,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           updatedAt: entry.updatedAt,
           terminalAt: entry.terminalAt,
           activity: entry.activity,
+          coordination,
         };
       });
       return {
@@ -2520,6 +2756,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     awaitQuiescence,
     snapshot,
     bulletinBoard,
+    trafficLog,
     deliverOperatorMessage,
   } satisfies AgentRegistry;
 });

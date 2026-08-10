@@ -37,8 +37,20 @@ const AgentRow = ({ row, selected, width, spinner }: AgentRowProps) => {
     agent.state === "waiting" && agent.waitTargets.length > 0
       ? ` ${glyphs.waiting}${agent.waitTargets.length}`
       : "";
+  const coordination = agent.coordination;
+  const mailBadge =
+    coordination !== undefined && coordination.unreadMessages > 0
+      ? ` ${glyphs.mail}${coordination.unreadMessages}`
+      : "";
+  const mailColor =
+    coordination !== undefined && coordination.unreadUrgent > 0 ? theme.amber : theme.muted;
+  const owesBadge =
+    coordination !== undefined && coordination.openRequestsIncoming > 0
+      ? ` ?${coordination.openRequestsIncoming}`
+      : "";
   const tail = agent.activity ?? agent.state;
-  const tailWidth = width - head.length - waitSuffix.length - 2;
+  const tailWidth =
+    width - head.length - waitSuffix.length - mailBadge.length - owesBadge.length - 2;
 
   return (
     <box flexDirection="row" height={1} backgroundColor={selected ? theme.selection : theme.panel}>
@@ -48,6 +60,8 @@ const AgentRow = ({ row, selected, width, spinner }: AgentRowProps) => {
         <span fg={stateColor(agent.state)}>{glyph}</span>
         <span fg={selected ? theme.amber : theme.text}>{` ${agent.name}`}</span>
         {waitSuffix === "" ? null : <span fg={theme.blue}>{waitSuffix}</span>}
+        {mailBadge === "" ? null : <span fg={mailColor}>{mailBadge}</span>}
+        {owesBadge === "" ? null : <span fg={theme.blue}>{owesBadge}</span>}
         {tailWidth > 2 ? <span fg={theme.muted}>{`  ${truncate(tail, tailWidth)}`}</span> : null}
       </text>
     </box>

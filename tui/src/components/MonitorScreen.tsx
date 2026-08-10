@@ -83,7 +83,7 @@ export const MonitorScreen = ({
 
       <box height={1} backgroundColor={theme.bg} paddingLeft={1}>
         <text fg={theme.faint}>
-          <span>{"j/k select · ⏎ transcript · b bulletins"}</span>
+          <span>{"j/k select · ⏎ transcript · c comms · b bulletins"}</span>
           {unseen === 0 ? null : <span fg={theme.amber}>{` ●${unseen}`}</span>}
           <span>{" · i interrupt · q quit"}</span>
         </text>

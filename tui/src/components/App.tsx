@@ -14,6 +14,7 @@ import type { BridgeHandle } from "../bridge/types";
 import { flattenAgents, store, useAppState } from "../store";
 import { theme } from "../theme";
 import { BulletinOverlay } from "./BulletinOverlay";
+import { CommsScreen } from "./CommsScreen";
 import { ComposeOverlay } from "./ComposeOverlay";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LaunchScreen, type LaunchField } from "./LaunchScreen";
@@ -40,6 +41,12 @@ export const App = ({ bridge }: AppProps) => {
     const timer = setInterval(() => void bridge.refreshStatus(), STATUS_POLL_MILLIS);
     return () => clearInterval(timer);
   }, [bridge, phase]);
+
+  useEffect(() => {
+    if (overlay !== "comms") return;
+    const timer = setInterval(() => void bridge.fetchTraffic(), STATUS_POLL_MILLIS);
+    return () => clearInterval(timer);
+  }, [bridge, overlay]);
 
   // Keep a selection pinned to something that still exists: the first agent on
   // arrival, and the root again if the selected path disappears from the tree.
@@ -140,6 +147,12 @@ export const App = ({ bridge }: AppProps) => {
       return;
     }
 
+    if (overlay === "comms") {
+      // CommsScreen owns j/k/g/G/f while mounted; only escape closes it here.
+      if (key.name === "escape") store.setOverlay("none");
+      return;
+    }
+
     if (overlay === "transcript") {
       if (key.name === "escape") store.setOverlay("none");
       return;
@@ -173,6 +186,10 @@ export const App = ({ bridge }: AppProps) => {
         store.setOverlay("bulletins");
         void bridge.fetchBulletins();
         break;
+      case "c":
+        store.setOverlay("comms");
+        void bridge.fetchTraffic();
+        break;
       case "m":
         if (selection !== undefined) store.setOverlay("compose");
         break;
@@ -203,6 +220,12 @@ export const App = ({ bridge }: AppProps) => {
           width={width}
         />
       </box>
+    );
+  }
+
+  if (overlay === "comms") {
+    return (
+      <CommsScreen traffic={state.traffic} focusPath={selection} width={width} height={height} />
     );
   }
 

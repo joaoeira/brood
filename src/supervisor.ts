@@ -75,6 +75,7 @@ import {
   type AgentSnapshot as RegistryAgentSnapshot,
   type BulletinView,
   type OperatorMessageDelivery,
+  type TrafficView,
   type CommittedSettlement,
   type CommittedInterruptRequest,
   type CommandInterrupted,
@@ -171,6 +172,12 @@ export type SupervisorLifecycleEvent =
     }
   | { readonly type: "BulletinPosted"; readonly authorId: AgentId }
   | { readonly type: "OperatorMessageAccepted"; readonly toId: AgentId }
+  | {
+      readonly type: "InboxRead";
+      readonly readerId: AgentId;
+      readonly messages: number;
+      readonly requests: number;
+    }
   | { readonly type: "DrainStarted" }
   | {
       readonly type: "DrainTimedOut";
@@ -199,6 +206,7 @@ export interface AgentSupervisor {
   readonly drain: Effect.Effect<DrainReport>;
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
   readonly bulletins: Effect.Effect<ReadonlyArray<BulletinView>>;
+  readonly traffic: Effect.Effect<ReadonlyArray<TrafficView>>;
   readonly sendOperatorMessage: (
     reference: string,
     body: string,
@@ -327,6 +335,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     status: agent.status,
     waitTargets: agent.waitTargets,
     ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+    coordination: agent.coordination,
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
     ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
@@ -672,7 +681,16 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           }),
         ),
       ),
-    readMessages: registry.readMessages,
+    readMessages: (callerId, invocationId, input) =>
+      registry.readMessages(callerId, invocationId, input).pipe(
+        Effect.tap((result) => {
+          const messages = result.items.filter(({ kind }) => kind === "message").length;
+          const requests = result.items.length - messages;
+          return result.items.length === 0
+            ? Effect.void
+            : publishLifecycle({ type: "InboxRead", readerId: callerId, messages, requests });
+        }),
+      ),
     replyToRequest: (callerId, invocationId, input) =>
       registry.replyToRequest(callerId, invocationId, input).pipe(
         Effect.tap((result) =>
@@ -900,6 +918,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     drain,
     events: PubSub.subscribe(eventBus),
     bulletins: registry.bulletinBoard,
+    traffic: registry.trafficLog,
     sendOperatorMessage,
     toolPort,
   } satisfies AgentSupervisor;

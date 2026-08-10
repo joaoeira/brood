@@ -12,6 +12,19 @@ import { useSpinnerFrame } from "./Spinner";
 const OUTCOME_LINES = 12;
 const RECENT_TOOLS = 10;
 
+const formatCoordination = (counts: NonNullable<AgentDetail["coordination"]>): string => {
+  const parts: Array<string> = [];
+  if (counts.unreadMessages > 0) {
+    const urgent = counts.unreadUrgent > 0 ? ` (${counts.unreadUrgent} urgent)` : "";
+    parts.push(`mail ${counts.unreadMessages}${urgent}`);
+  }
+  if (counts.openRequestsIncoming > 0) parts.push(`owes ${counts.openRequestsIncoming} replies`);
+  if (counts.openRequestsOutgoing > 0) parts.push(`awaits ${counts.openRequestsOutgoing}`);
+  if (counts.pendingOperatorMessages > 0) parts.push(`operator ${counts.pendingOperatorMessages}`);
+  if (counts.unseenBulletins > 0) parts.push(`bulletins ${counts.unseenBulletins} unseen`);
+  return parts.join(" · ");
+};
+
 export interface DetailPaneProps {
   readonly detail: AgentDetail | undefined;
   readonly tools: ReadonlyArray<ToolEvent>;
@@ -138,6 +151,15 @@ export const DetailPane = ({ detail, tools, selection, width, height }: DetailPa
         <box flexDirection="column" marginTop={1}>
           <SectionHeader label="WAITING ON" width={contentWidth} />
           <text fg={theme.blue}>{truncate(detail.waitTargets.join(", "), contentWidth)}</text>
+        </box>
+      )}
+
+      {detail.coordination === undefined ? null : (
+        <box flexDirection="column" marginTop={1}>
+          <SectionHeader label="COMMS" width={contentWidth} />
+          <text fg={theme.muted}>
+            {truncate(formatCoordination(detail.coordination), contentWidth)}
+          </text>
         </box>
       )}
 

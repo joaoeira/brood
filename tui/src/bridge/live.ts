@@ -182,6 +182,14 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
 
     fetchBulletins,
 
+    fetchTraffic: async () => {
+      try {
+        store.setTraffic(await Effect.runPromise(quiet(application.controller.traffic)));
+      } catch (cause: unknown) {
+        store.note(`traffic unavailable: ${messageOf(cause)}`, "warn");
+      }
+    },
+
     sendOperatorMessage: async (reference, body) => {
       try {
         const delivery = await Effect.runPromise(

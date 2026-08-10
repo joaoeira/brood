@@ -26,6 +26,7 @@ export interface BridgeHandle {
   refreshStatus(): Promise<void>;
   fetchDetail(reference: string): Promise<void>;
   fetchBulletins(): Promise<void>;
+  fetchTraffic(): Promise<void>;
   /** Resolves to undefined on success, or a display-ready rejection message. */
   sendOperatorMessage(reference: string, body: string): Promise<string | undefined>;
   interrupt(reference: string): Promise<void>;

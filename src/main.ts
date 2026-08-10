@@ -31,7 +31,12 @@ import {
   type BroodRuntime,
 } from "./runtime.js";
 import { makeSupervisor, type SupervisorEvent } from "./supervisor.js";
-import type { BulletinView, OperatorMessageDelivery, OperatorMessageRejected } from "./registry.js";
+import type {
+  BulletinView,
+  OperatorMessageDelivery,
+  OperatorMessageRejected,
+  TrafficView,
+} from "./registry.js";
 import type { AgentDetail, SwarmStatus } from "./status.js";
 
 export interface BroodController {
@@ -44,6 +49,8 @@ export interface BroodController {
   readonly events: Effect.Effect<PubSub.Subscription<SupervisorEvent>, never, Scope.Scope>;
   /** Operator view of the retained bulletin board, in global sequence order. */
   readonly bulletins: Effect.Effect<ReadonlyArray<BulletinView>>;
+  /** Operator-only communication log: bodies, read state, correlation. */
+  readonly traffic: Effect.Effect<ReadonlyArray<TrafficView>>;
   /** Deliver a direct operator message; wakes a parked recipient. */
   readonly sendOperatorMessage: (
     reference: string,
@@ -156,6 +163,7 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
       supervisor.interrupt(reference, source),
     events: supervisor.events,
     bulletins: supervisor.bulletins,
+    traffic: supervisor.traffic,
     sendOperatorMessage: supervisor.sendOperatorMessage,
   };
   return { controller, run } satisfies BroodApplication;

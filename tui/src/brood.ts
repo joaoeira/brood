@@ -21,6 +21,7 @@ export type {
   StatusAgent,
   SupervisorEvent,
   SwarmStatus,
+  TrafficView,
 } from "../../src/index.js";
 
 import type { StatusAgent, SupervisorEvent } from "../../src/index.js";

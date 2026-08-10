@@ -517,6 +517,12 @@ it.effect("publishes metadata-only communication events and an operator bulletin
 
       const board = yield* supervisor.bulletins;
       expect(board).toEqual([{ sequence: 1, author: "root/peer", body: bulletinBody }]);
+      // Bodies belong to the operator traffic log and to nowhere else.
+      const trafficLog = yield* supervisor.traffic;
+      const serializedTraffic = JSON.stringify(trafficLog);
+      expect(serializedTraffic).toContain(messageBody);
+      expect(serializedTraffic).toContain(questionBody);
+      expect(serializedTraffic).toContain(replyBody);
 
       yield* fake.suspend(peer.id, [
         {
@@ -555,6 +561,9 @@ it.effect("publishes metadata-only communication events and an operator bulletin
       );
       expect(events).toContainEqual(
         expect.objectContaining({ type: "BulletinPosted", authorId: peer.id }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "InboxRead", readerId: rootId, messages: 1, requests: 1 }),
       );
       const serialized = JSON.stringify(events);
       expect(serialized).not.toContain(messageBody);

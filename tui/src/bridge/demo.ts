@@ -8,7 +8,7 @@
  * fails a tool and then fails outright, an ask/reply pair, two bulletins, and a
  * compaction marker inside one of the synthetic transcripts.
  */
-import type { AgentDetail, StatusAgent, SupervisorEvent, SwarmStatus } from "../brood";
+import type { AgentDetail, StatusAgent, SupervisorEvent, SwarmStatus, TrafficView } from "../brood";
 import { store } from "../store";
 import { makeMemoryTranscriptReader } from "../transcript/watch";
 import type { BridgeHandle, ConfigSummary } from "./types";
@@ -38,6 +38,20 @@ interface DemoAgent {
   terminalAt?: number | undefined;
   readonly profile: Profile;
   outcome?: Outcome | undefined;
+  coordination?: StatusAgent["coordination"] | undefined;
+}
+
+interface DemoTrafficRecord {
+  readonly sequence: number;
+  readonly at: number;
+  readonly kind: TrafficView["kind"];
+  readonly from: string;
+  readonly to: string;
+  readonly body: string;
+  readonly urgent: boolean;
+  status: TrafficView["status"];
+  statusAt?: number;
+  readonly requestId?: string;
 }
 
 const profile = (
@@ -242,6 +256,7 @@ export const createDemoBridge = (): BridgeHandle => {
   const agents = new Map<string, DemoAgent>();
   const transcripts = buildTranscripts();
   const bulletins: Array<{ sequence: number; author: string; body: string }> = [];
+  const traffic: Array<DemoTrafficRecord> = [];
 
   let sequence = 0;
   let startedAt: number | undefined;
@@ -338,6 +353,7 @@ export const createDemoBridge = (): BridgeHandle => {
     state: agent.state,
     durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
     ...(agent.activity === undefined ? {} : { activity: agent.activity }),
+    ...(agent.coordination === undefined ? {} : { coordination: agent.coordination }),
     waitTargets: agent.waitTargets.map(pathOf),
     children: children.map((child) => statusAgent(child, childrenOf(child.id))),
   });
@@ -376,6 +392,41 @@ export const createDemoBridge = (): BridgeHandle => {
   };
 
   const publishStatus = (): void => store.setStatus(buildStatus());
+
+  const publishTraffic = (): void =>
+    store.setTraffic(
+      traffic.map((record) => ({
+        sequence: record.sequence,
+        at: record.at,
+        kind: record.kind,
+        from: record.from,
+        to: brand(record.to),
+        body: record.body,
+        urgent: record.urgent,
+        status: record.status,
+        ...(record.statusAt === undefined ? {} : { statusAt: record.statusAt }),
+        ...(record.requestId === undefined ? {} : { requestId: brand(record.requestId) }),
+      })),
+    );
+
+  const pushTraffic = (record: Omit<DemoTrafficRecord, "sequence" | "at">): DemoTrafficRecord => {
+    const stored: DemoTrafficRecord = { ...record, sequence: traffic.length + 1, at: now() };
+    traffic.push(stored);
+    publishTraffic();
+    return stored;
+  };
+
+  const markTraffic = (
+    predicate: (record: DemoTrafficRecord) => boolean,
+    status: TrafficView["status"],
+  ): void => {
+    for (const record of traffic) {
+      if (!predicate(record)) continue;
+      record.status = status;
+      record.statusAt = now();
+    }
+    publishTraffic();
+  };
 
   const publishBulletins = (): void =>
     store.setBulletins(
@@ -477,23 +528,73 @@ export const createDemoBridge = (): BridgeHandle => {
     },
     {
       at: 5_000,
-      run: () =>
+      run: () => {
         emit({
           type: "RequestOpened",
           requestId: brand("req_1"),
           fromId: brand("agt_peer"),
           toPath: brand("root/api"),
-        }),
+        });
+        pushTraffic({
+          kind: "request",
+          from: "root/api/peer",
+          to: "root/api",
+          body: "Opaque cursor or numeric offset?",
+          urgent: false,
+          status: "unread",
+          requestId: "req_1",
+        });
+      },
     },
     {
       at: 5_600,
-      run: () =>
+      run: () => {
         emit({
           type: "RequestReplied",
           requestId: brand("req_1"),
           byId: brand("agt_api"),
-          toPath: brand("root/peer"),
-        }),
+          toPath: brand("root/api/peer"),
+        });
+        markTraffic((record) => record.requestId === "req_1", "answered");
+        pushTraffic({
+          kind: "reply",
+          from: "root/api",
+          to: "root/api/peer",
+          body: "Opaque cursor. Use the shared helper in src/routes/pagination.ts.",
+          urgent: false,
+          status: "sent",
+          requestId: "req_1",
+        });
+      },
+    },
+    {
+      at: 9_200,
+      run: () => {
+        emit({
+          type: "MessageAccepted",
+          fromId: brand("agt_schema"),
+          toPath: brand("root"),
+          urgent: true,
+        });
+        pushTraffic({
+          kind: "message",
+          from: "root/schema",
+          to: "root",
+          body: "Fixture validation is failing on the cursor field; the wire format needs a decision before anything else ships.",
+          urgent: true,
+          status: "unread",
+        });
+        update("agt_root", {
+          coordination: {
+            unreadMessages: 1,
+            unreadUrgent: 1,
+            openRequestsIncoming: 0,
+            openRequestsOutgoing: 0,
+            pendingOperatorMessages: 0,
+            unseenBulletins: 0,
+          },
+        });
+      },
     },
     {
       at: 6_100,
@@ -583,7 +684,14 @@ export const createDemoBridge = (): BridgeHandle => {
       at: 14_000,
       run: () => {
         emit({ type: "AgentResumed", agentId: brand("agt_root"), waitId: brand("wait_1") });
-        update("agt_root", { state: "running", waitTargets: [], activity: "synthesizing results" });
+        emit({ type: "InboxRead", readerId: brand("agt_root"), messages: 1, requests: 0 });
+        markTraffic((record) => record.kind === "message" && record.to === "root", "read");
+        update("agt_root", {
+          state: "running",
+          waitTargets: [],
+          activity: "synthesizing results",
+          coordination: undefined,
+        });
       },
     },
     {
@@ -697,6 +805,10 @@ export const createDemoBridge = (): BridgeHandle => {
       publishBulletins();
     },
 
+    fetchTraffic: async () => {
+      publishTraffic();
+    },
+
     sendOperatorMessage: async (reference, body) => {
       const agent = [...agents.values()].find(
         (candidate) => candidate.id === reference || pathOf(candidate.id) === reference,
@@ -707,6 +819,17 @@ export const createDemoBridge = (): BridgeHandle => {
       }
       if (body.trim() === "") return "Operator messages must be nonblank.";
       emit({ type: "OperatorMessageAccepted", toId: brand(agent.id) });
+      const record = pushTraffic({
+        kind: "operator",
+        from: "operator",
+        to: pathOf(agent.id),
+        body,
+        urgent: true,
+        status: "pending",
+      });
+      setTimeout(() => {
+        markTraffic((candidate) => candidate.sequence === record.sequence, "delivered");
+      }, 700);
       store.note(`operator → ${pathOf(agent.id)}  message delivered`, "info");
       return undefined;
     },
