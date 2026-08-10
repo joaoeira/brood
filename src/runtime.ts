@@ -194,6 +194,7 @@ export const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknow
 export const decodeBroodConfig = (raw: BroodConfigEncoded) => decodeBroodConfigUnknown(raw);
 
 const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (config: BroodConfig) {
+  const configuredSharedDirectory = resolve(config.workspacePath, ".brood", "shared");
   const paths = [
     config.workspacePath,
     config.stateDirectory,
@@ -201,17 +202,19 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
     config.sessionDirectory,
   ] as const;
   yield* Effect.tryPromise({
-    try: () =>
-      Promise.all([
+    try: async () => {
+      await Promise.all([
         mkdir(config.workspacePath, { recursive: true }),
         ...paths.slice(1).map((path) => mkdir(path, { recursive: true, mode: 0o700 })),
-      ]),
+      ]);
+      await mkdir(configuredSharedDirectory, { recursive: true });
+    },
     catch: (cause) =>
       configError(
         `Unable to prepare Brood directories: ${cause instanceof Error ? cause.message : String(cause)}`,
       ),
   });
-  const [workspacePath, stateDirectory, piAgentDirectory, sessionDirectory] =
+  const [workspacePath, stateDirectory, piAgentDirectory, sessionDirectory, sharedDirectory] =
     yield* Effect.tryPromise({
       try: () =>
         Promise.all([
@@ -219,6 +222,7 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
           realpath(config.stateDirectory),
           realpath(config.piAgentDirectory),
           realpath(config.sessionDirectory),
+          realpath(configuredSharedDirectory),
         ] as const),
       catch: (cause) =>
         configError(
@@ -230,12 +234,18 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
     isWithin(stateDirectory, workspacePath) ||
     !isWithin(stateDirectory, piAgentDirectory) ||
     !isWithin(stateDirectory, sessionDirectory) ||
-    piAgentDirectory === sessionDirectory
+    piAgentDirectory === sessionDirectory ||
+    sharedDirectory === workspacePath ||
+    !isWithin(workspacePath, sharedDirectory) ||
+    isWithin(stateDirectory, sharedDirectory) ||
+    isWithin(sharedDirectory, stateDirectory)
   ) {
     return yield* Effect.fail(
       configError(
-        "Resolved workspace, state, Pi-agent, and session directories violate separation rules",
-        "stateDirectory",
+        "Resolved workspace, shared, state, Pi-agent, and session directories violate separation rules",
+        !isWithin(workspacePath, sharedDirectory) || sharedDirectory === workspacePath
+          ? "workspacePath"
+          : "stateDirectory",
       ),
     );
   }

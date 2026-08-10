@@ -1,7 +1,7 @@
 // Plain Vitest is intentional: these tests exercise real filesystem and ModelRuntime boundaries.
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, mkdir, realpath, rm, stat, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Duration, Effect } from "effect";
 import { minimumResumePromptChars } from "../src/render.js";
@@ -119,6 +119,32 @@ describe("Brood runtime configuration", () => {
     ]) {
       expect((await stat(path)).mode & 0o777).toBe(0o700);
     }
+  });
+
+  it("creates the optional shared directory without replacing existing material", async () => {
+    const shared = join(base, "workspace", ".brood", "shared");
+    await mkdir(shared, { recursive: true });
+    await writeFile(join(shared, "finding.md"), "keep this\n", "utf8");
+
+    const runtime = await Effect.runPromise(buildBroodRuntime(validConfig()));
+
+    expect(await realpath(shared)).toBe(join(runtime.config.workspacePath, ".brood", "shared"));
+    expect(await readFile(join(shared, "finding.md"), "utf8")).toBe("keep this\n");
+  });
+
+  it("rejects a shared-directory symlink that escapes the workspace", async () => {
+    const workspace = join(base, "workspace");
+    const outside = join(base, "outside");
+    await mkdir(join(workspace, ".brood"), { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(workspace, ".brood", "shared"), "dir");
+
+    await expect(Effect.runPromise(buildBroodRuntime(validConfig()))).rejects.toMatchObject({
+      _tag: "BroodConfigError",
+      reason: "InvalidField",
+      path: "workspacePath",
+      message: expect.stringContaining("shared"),
+    });
   });
 
   it("reports exact-model failures through the single config error family", async () => {
