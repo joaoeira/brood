@@ -199,11 +199,15 @@ const controllerOutcome = (exit: ExitType<AgentOutcome, ControllerError>): Agent
 };
 
 const systemPromptFor = (
+  registration: RegisteredAgent,
   profile: ResolvedModelProfile,
   runInstructions: string | undefined,
-): string =>
-  [
+): string => {
+  const separator = registration.path.lastIndexOf("/");
+  const parentPath = separator === -1 ? "none" : registration.path.slice(0, separator);
+  return [
     "You are one agent in a Brood run. The workspace is shared with concurrent agents.",
+    `Canonical agent path: ${registration.path}; parent: ${parentPath}.`,
     "Use delegate for bounded parallel work and wait_for_agents to await direct children from earlier turns.",
     "A suspending tool takes effect after every tool call in the current assistant turn has finished.",
     "All agents have the same tools and workspace access. `.brood/shared/` is the persistent run-shared directory for optional notes, findings, and artifacts that peers or later runs may discover. Writing there is optional; no per-agent file or prescribed layout is required.",
@@ -224,6 +228,7 @@ const systemPromptFor = (
           renderRunInstructions(runInstructions),
         ]),
   ].join("\n");
+};
 
 const terminalStatus = (
   outcome: AgentOutcome,
@@ -406,7 +411,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
                 agentId: registration.id,
                 profile,
                 tools: toolFactory.forCaller(registration.id, toolPort),
-                systemPrompt: systemPromptFor(profile, instructions),
+                systemPrompt: systemPromptFor(registration, profile, instructions),
               };
               const agent = yield* options.piAdapter.open(request);
               yield* agent.events.pipe(Stream.runForEach(publishPiEvent), Effect.forkScoped);

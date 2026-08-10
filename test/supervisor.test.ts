@@ -57,6 +57,8 @@ it.effect("runs the root with its configured profile and settles its normalized 
       expect(opened.systemPrompt).toContain("ask_agent only when your progress requires a reply");
       expect(opened.systemPrompt).toContain("bulletin board");
       expect(opened.systemPrompt).toContain("set_activity");
+      expect(opened.systemPrompt).toContain("Canonical agent path: root; parent: none.");
+      expect(opened.systemPrompt).not.toContain(rootId);
       expect(run.prompt).toContain('<agent_admissions limit="8" used="1" remaining="7" />');
       expect(run.prompt).toContain("never replenish");
       expect(run.prompt.endsWith("coordinate the work")).toBe(true);
