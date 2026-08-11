@@ -8,7 +8,7 @@
  * error is a much worse experience than a line on stderr.
  */
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { createDemoBridge } from "./bridge/demo";
@@ -72,12 +72,13 @@ const summarize = (configPath: string, raw: unknown): ConfigSummary => {
   const profiles = asRecord(config["profiles"]);
   return {
     configPath,
-    workspacePath: asText(config["workspacePath"], "(unknown workspace)"),
+    workspacePath: asText(config["workspacePath"], dirname(configPath)),
     sessionDirectory: asText(config["sessionDirectory"], ""),
-    maxConcurrency: asCount(config["maxConcurrency"], 0),
+    maxConcurrency: asCount(config["maxConcurrency"], 4),
     maxAgentAdmissions: asCount(config["maxAgentAdmissions"], 128),
     defaultProfile: asText(config["defaultProfile"], "(none)"),
     profileNames: Object.keys(profiles),
+    authLabel: "resolving…",
   };
 };
 
@@ -106,6 +107,7 @@ const buildBridge = async (parsed: Arguments): Promise<BridgeHandle> => {
   }
   return createLiveBridge({
     rawConfig,
+    baseDir: dirname(parsed.configPath),
     configSummary: summarize(parsed.configPath, rawConfig),
   });
 };

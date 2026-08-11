@@ -13,6 +13,7 @@ import { Cause, Effect, Exit, Option, References, Scope, Stream } from "effect";
 import type { BroodApplication, BroodResult, SupervisorEvent } from "../brood";
 import { makeBroodApplicationFromUnknown } from "../brood";
 import { store } from "../store";
+import { tildify } from "../theme";
 import { makeFileTranscriptReader } from "../transcript/watch";
 import type { BridgeHandle, ConfigSummary } from "./types";
 
@@ -29,6 +30,8 @@ const messageOf = (cause: unknown): string =>
 
 export interface LiveBridgeOptions {
   readonly rawConfig: unknown;
+  /** Anchors relative and defaulted config paths: the config file's directory. */
+  readonly baseDir: string;
   readonly configSummary: ConfigSummary;
 }
 
@@ -38,9 +41,22 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
     Effect.runPromise(quiet(Effect.provideService(effect, Scope.Scope, scope)));
 
   const application: BroodApplication = await inScope(
-    makeBroodApplicationFromUnknown(options.rawConfig),
+    makeBroodApplicationFromUnknown(options.rawConfig, options.baseDir),
   );
   const subscription = await inScope(application.controller.events);
+
+  // The launch screen shows what the run will actually use, not what the raw
+  // config happened to spell out — defaults included.
+  const resolved = application.resolved;
+  const configSummary: ConfigSummary = {
+    ...options.configSummary,
+    workspacePath: resolved.workspacePath,
+    sessionDirectory: resolved.sessionDirectory,
+    authLabel:
+      resolved.piAuth.kind === "pi-global"
+        ? `pi login · ${tildify(resolved.piAuth.authPath)}`
+        : `project · ${tildify(resolved.piAuth.authPath)}`,
+  };
 
   let statusInFlight = false;
   let statusPending = false;
@@ -146,8 +162,8 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
 
   return {
     mode: "live",
-    configSummary: options.configSummary,
-    transcript: makeFileTranscriptReader(options.configSummary.sessionDirectory),
+    configSummary,
+    transcript: makeFileTranscriptReader(resolved.sessionDirectory),
 
     start: (goal, instructions) => {
       if (runPromise !== undefined) return;

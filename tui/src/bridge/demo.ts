@@ -752,6 +752,7 @@ export const createDemoBridge = (): BridgeHandle => {
     maxAgentAdmissions: 128,
     defaultProfile: "worker",
     profileNames: ["coordinator", "worker"],
+    authLabel: "demo · no credentials needed",
   };
 
   return {

@@ -5,7 +5,7 @@
  * non-interactive callers. No supervisor internals are reachable from here.
  */
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Stream } from "effect";
@@ -315,7 +315,10 @@ export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown
       });
       const rawConfig = yield* loadConfig(parsed.configPath);
       const instructions = yield* loadInstructions(parsed.instructionsFile);
-      const application = yield* makeBroodApplicationFromUnknown(rawConfig);
+      const application = yield* makeBroodApplicationFromUnknown(
+        rawConfig,
+        dirname(parsed.configPath),
+      );
       return yield* runApplication(application, parsed, {
         goal: parsed.goal,
         ...(instructions === undefined ? {} : { instructions }),

@@ -89,13 +89,15 @@ pnpm install
 pnpm build
 ```
 
-1. Create a state directory (say `~/brood-state`) and put your Pi provider
-   credentials in `~/brood-state/pi-agent/auth.json` (an optional
-   `models.json` can define custom models). This directory holds credentials
-   and conversation transcripts, so Brood forces it to owner-only permissions.
-2. Copy [`brood.example.json`](./brood.example.json), point `workspacePath` at
-   the folder the agents should work in, point the state paths at your state
-   directory, and set real provider/model IDs in `profiles`.
+1. Log in to Pi once, if you haven't already: `pi /login`. Brood uses the same
+   credentials your `pi` CLI maintains (`~/.pi/agent/auth.json`) — there is
+   nothing to copy per project. To give Brood project-local credentials
+   instead, set `piAgentDirectory` to a directory containing an `auth.json`.
+2. Drop a `brood.json` in the project the agents should work on — copy
+   [`brood.example.json`](./brood.example.json) and set real provider/model
+   IDs in `profiles`. That file's directory becomes the workspace; sessions
+   and other state default to `~/.brood`, shared by every project and kept
+   owner-only.
 3. Run:
 
 ```sh
@@ -119,9 +121,11 @@ and closes every model session cleanly.
 
 | Field                            | Meaning                                                                                                                                              |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `workspacePath`                  | The shared folder all agents work in.                                                                                                                |
-| `stateDirectory`                 | Brood's own state (credentials, transcripts, sessions). Must be disjoint from the workspace so agents cannot read credentials.                       |
-| `maxConcurrency`                 | Maximum simultaneous model runs. Reusable slots.                                                                                                     |
+| `workspacePath`                  | The shared folder all agents work in. Optional; defaults to the config file's directory.                                                             |
+| `stateDirectory`                 | Brood's own state (sessions, Pi settings). Optional; defaults to `~/.brood`, shared by every project. Must stay disjoint from the workspace.         |
+| `piAgentDirectory`               | Optional. Set it to give Brood project-local Pi credentials (`auth.json`/`models.json` inside it); omitted, Brood uses your global `pi /login`.      |
+| `sessionDirectory`               | Optional; defaults to `<stateDirectory>/sessions`.                                                                                                   |
+| `maxConcurrency`                 | Maximum simultaneous model runs. Reusable slots. Default 4.                                                                                          |
 | `maxAgentAdmissions`             | Lifetime cap on agents created per run, root included. Never replenishes. Default 128.                                                               |
 | `profiles`                       | Named model configurations. Each agent runs one profile for its whole life.                                                                          |
 | `defaultProfile` / `rootProfile` | The root uses `rootProfile` (or the default). A delegated task without an explicit profile uses the **global default** — never its parent's profile. |

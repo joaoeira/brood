@@ -98,6 +98,7 @@ export const LaunchScreen = ({
       <text fg={theme.muted}>
         {`concurrency ${summary.maxConcurrency} · admissions ${summary.maxAgentAdmissions} · default ${summary.defaultProfile}`}
       </text>
+      <text fg={theme.muted}>{truncate(`auth ${summary.authLabel}`, contentWidth)}</text>
 
       <Field label="Goal" active={field === "goal"}>
         <textarea

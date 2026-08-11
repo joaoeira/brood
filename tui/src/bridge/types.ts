@@ -14,6 +14,8 @@ export interface ConfigSummary {
   readonly maxAgentAdmissions: number;
   readonly defaultProfile: string;
   readonly profileNames: ReadonlyArray<string>;
+  /** Where Pi credentials come from, preformatted for display. */
+  readonly authLabel: string;
 }
 
 export interface BridgeHandle {

@@ -29,6 +29,7 @@ import {
   buildBroodRuntimeUnknown,
   type BroodConfigEncoded,
   type BroodRuntime,
+  type PiAuthSource,
 } from "./runtime.js";
 import { makeSupervisor, type SupervisorEvent } from "./supervisor.js";
 import type {
@@ -58,8 +59,18 @@ export interface BroodController {
   ) => Effect.Effect<OperatorMessageDelivery, UnknownAgentReference | OperatorMessageRejected>;
 }
 
+/** The materialized locations a run will actually use, for operator display. */
+export interface BroodResolvedPaths {
+  readonly workspacePath: string;
+  readonly stateDirectory: string;
+  readonly piAgentDirectory: string;
+  readonly sessionDirectory: string;
+  readonly piAuth: PiAuthSource;
+}
+
 export interface BroodApplication {
   readonly controller: BroodController;
+  readonly resolved: BroodResolvedPaths;
   readonly run: (
     request: BroodRunRequestEncoded,
   ) => Effect.Effect<BroodResult, AgentFailed | RootInterrupted | RootStartError>;
@@ -166,20 +177,31 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
     traffic: supervisor.traffic,
     sendOperatorMessage: supervisor.sendOperatorMessage,
   };
-  return { controller, run } satisfies BroodApplication;
+  const resolved: BroodResolvedPaths = {
+    workspacePath: runtime.config.workspacePath,
+    stateDirectory: runtime.config.stateDirectory,
+    piAgentDirectory: runtime.config.piAgentDirectory,
+    sessionDirectory: runtime.config.sessionDirectory,
+    piAuth: runtime.authSource,
+  };
+  return { controller, resolved, run } satisfies BroodApplication;
 });
 
-export const makeBroodApplication = (input: BroodConfigEncoded) =>
-  buildBroodRuntime(input).pipe(Effect.flatMap(makeApplication));
+export const makeBroodApplication = (input: BroodConfigEncoded, baseDir?: string) =>
+  buildBroodRuntime(input, baseDir).pipe(Effect.flatMap(makeApplication));
 
-/** Unknown-input adapters such as the CLI file loader use the same decoder through this entry point. */
-export const makeBroodApplicationFromUnknown = (input: unknown) =>
-  buildBroodRuntimeUnknown(input).pipe(Effect.flatMap(makeApplication));
+/** Unknown-input adapters such as the CLI file loader use the same decoder through this entry point.
+ * `baseDir` anchors relative and defaulted paths — pass the config file's directory. */
+export const makeBroodApplicationFromUnknown = (input: unknown, baseDir?: string) =>
+  buildBroodRuntimeUnknown(input, baseDir).pipe(Effect.flatMap(makeApplication));
 
 export const runBrood = (
   request: BroodRunRequestEncoded,
   input: BroodConfigEncoded,
+  baseDir?: string,
 ): Effect.Effect<BroodResult, BroodConfigError | RootStartError | AgentFailed | RootInterrupted> =>
   Effect.scoped(
-    makeBroodApplication(input).pipe(Effect.flatMap((application) => application.run(request))),
+    makeBroodApplication(input, baseDir).pipe(
+      Effect.flatMap((application) => application.run(request)),
+    ),
   );

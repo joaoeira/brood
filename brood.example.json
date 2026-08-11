@@ -1,16 +1,4 @@
 {
-  "workspacePath": "/absolute/path/to/workspace",
-  "stateDirectory": "/absolute/path/to/brood-state",
-  "piAgentDirectory": "/absolute/path/to/brood-state/pi-agent",
-  "sessionDirectory": "/absolute/path/to/brood-state/sessions",
-  "maxConcurrency": 4,
-  "maxAgentAdmissions": 128,
-  "maxRunInstructionsChars": 4000,
-  "maxAgentResultChars": 12000,
-  "maxFailureMessageChars": 2000,
-  "maxProfileHelpChars": 4000,
-  "drainTimeout": "10 minutes",
-  "sessionCleanupTimeout": "30 seconds",
   "defaultProfile": "worker",
   "rootProfile": "coordinator",
   "profiles": {

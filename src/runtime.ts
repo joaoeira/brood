@@ -4,9 +4,11 @@
  * one-time profile-catalogue compilation. Every configuration failure is a
  * BroodConfigError; there is deliberately no second validation path.
  */
+import { existsSync } from "node:fs";
 import { chmod, mkdir, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { ModelRuntime, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Duration, Effect, Schema, SchemaIssue } from "effect";
 import { BroodConfigError, PositiveInt } from "./agent.js";
 import {
@@ -37,10 +39,14 @@ const isWithin = (parent: string, child: string): boolean => {
 
 const LEGACY_MAX_AGENTS = "`maxAgents` was renamed to `maxAgentAdmissions`; remove the old key";
 
+const OptionalPath = Schema.optionalKey(Schema.Trim.check(Schema.isMinLength(1)));
+
 const BroodConfigFields = Schema.Struct({
-  workspacePath: Schema.Trim.check(Schema.isMinLength(1)),
-  stateDirectory: Schema.Trim.check(Schema.isMinLength(1)),
-  maxConcurrency: PositiveInt,
+  /** Defaults to the directory the config was loaded from. */
+  workspacePath: OptionalPath,
+  /** Defaults to ~/.brood, shared by every project. */
+  stateDirectory: OptionalPath,
+  maxConcurrency: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(4))),
   maxAgentAdmissions: PositiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(128))),
   // Declared tombstone: the config cursor materializes only declared keys, so
   // this is the one mechanism that makes the legacy key a hard failure. A null
@@ -64,36 +70,18 @@ const BroodConfigFields = Schema.Struct({
   defaultProfile: Schema.String,
   rootProfile: Schema.optionalKey(Schema.String),
   profiles: Schema.Record(Schema.String, ModelProfile),
-  piAgentDirectory: Schema.Trim.check(Schema.isMinLength(1)),
-  sessionDirectory: Schema.Trim.check(Schema.isMinLength(1)),
+  /** Set explicitly to give Brood its own Pi credentials; omitted, Brood uses
+   * your existing `pi /login` (Pi's global agent directory) and keeps only
+   * settings under the state directory. */
+  piAgentDirectory: OptionalPath,
+  /** Defaults to <stateDirectory>/sessions. */
+  sessionDirectory: OptionalPath,
   logLevel: Schema.optionalKey(Config.LogLevel),
 });
 
 export const BroodConfigInput = BroodConfigFields.check(
   Schema.makeFilter((config) => {
     const issues: Array<Schema.FilterIssue> = [];
-    const workspacePath = resolve(config.workspacePath);
-    const stateDirectory = resolve(config.stateDirectory);
-    const piAgentDirectory = resolve(config.piAgentDirectory);
-    const sessionDirectory = resolve(config.sessionDirectory);
-    if (isWithin(workspacePath, stateDirectory) || isWithin(stateDirectory, workspacePath)) {
-      issues.push({
-        path: ["stateDirectory"],
-        issue: "workspacePath and stateDirectory must be disjoint",
-      });
-    }
-    if (!isWithin(stateDirectory, piAgentDirectory) || piAgentDirectory === stateDirectory) {
-      issues.push({
-        path: ["piAgentDirectory"],
-        issue: "piAgentDirectory must be a child of stateDirectory",
-      });
-    }
-    if (!isWithin(stateDirectory, sessionDirectory) || sessionDirectory === stateDirectory) {
-      issues.push({
-        path: ["sessionDirectory"],
-        issue: "sessionDirectory must be a child of stateDirectory",
-      });
-    }
     if (config.maxConcurrency > config.maxAgentAdmissions) {
       issues.push({ path: ["maxConcurrency"], issue: "cannot exceed maxAgentAdmissions" });
     }
@@ -110,12 +98,34 @@ export const BroodConfigInput = BroodConfigFields.check(
 
 export type BroodConfigEncoded = typeof BroodConfigInput.Encoded;
 type DecodedBroodConfig = typeof BroodConfigInput.Type;
-export type BroodConfig = DecodedBroodConfig;
+
+/** Shared default state root; one directory serves every project. */
+export const defaultStateDirectory = (): string => join(homedir(), ".brood");
+
+/** The decoded config with every path materialized and validated. */
+export interface BroodConfig extends Omit<
+  DecodedBroodConfig,
+  "workspacePath" | "stateDirectory" | "piAgentDirectory" | "sessionDirectory"
+> {
+  readonly workspacePath: string;
+  readonly stateDirectory: string;
+  readonly piAgentDirectory: string;
+  readonly sessionDirectory: string;
+  /** "local" when piAgentDirectory was configured explicitly; otherwise Brood
+   * borrows the credentials your `pi /login` maintains. */
+  readonly piCredentials: "local" | "pi-global";
+}
+
+export interface PiAuthSource {
+  readonly kind: "local" | "pi-global";
+  readonly authPath: string;
+}
 
 export interface BroodRuntime {
   readonly config: BroodConfig;
   readonly modelRuntime: ModelRuntime;
   readonly catalogue: ProfileCatalogue;
+  readonly authSource: PiAuthSource;
 }
 
 const ConfigRecipe = Config.schema(BroodConfigInput);
@@ -127,13 +137,40 @@ const configError = (message: string, path?: string): BroodConfigError =>
       : { stage: "decode", reason: "InvalidField", message, path },
   );
 
+const pathError = (path: string, message: string): Effect.Effect<never, BroodConfigError> =>
+  Effect.fail(new BroodConfigError({ stage: "decode", reason: "DecodeFailed", message, path }));
+
+/** Materializes defaults against the config file's own directory and enforces
+ * the one structural rule that matters: agents work in the workspace, so
+ * nothing Brood stores may live inside it. */
 const resolveConfigPaths = (
   decoded: DecodedBroodConfig,
+  baseDir: string,
 ): Effect.Effect<BroodConfig, BroodConfigError> => {
-  const workspacePath = resolve(decoded.workspacePath);
-  const stateDirectory = resolve(decoded.stateDirectory);
-  const piAgentDirectory = resolve(decoded.piAgentDirectory);
-  const sessionDirectory = resolve(decoded.sessionDirectory);
+  const workspacePath = resolve(baseDir, decoded.workspacePath ?? ".");
+  const stateDirectory = resolve(baseDir, decoded.stateDirectory ?? defaultStateDirectory());
+  const piCredentials = decoded.piAgentDirectory === undefined ? "pi-global" : "local";
+  const piAgentDirectory =
+    decoded.piAgentDirectory === undefined
+      ? join(stateDirectory, "pi-agent")
+      : resolve(baseDir, decoded.piAgentDirectory);
+  const sessionDirectory =
+    decoded.sessionDirectory === undefined
+      ? join(stateDirectory, "sessions")
+      : resolve(baseDir, decoded.sessionDirectory);
+
+  if (isWithin(workspacePath, stateDirectory) || isWithin(stateDirectory, workspacePath)) {
+    return pathError("stateDirectory", "workspacePath and stateDirectory must be disjoint");
+  }
+  if (isWithin(workspacePath, piAgentDirectory) || isWithin(piAgentDirectory, workspacePath)) {
+    return pathError("piAgentDirectory", "piAgentDirectory must be disjoint from workspacePath");
+  }
+  if (isWithin(workspacePath, sessionDirectory) || isWithin(sessionDirectory, workspacePath)) {
+    return pathError("sessionDirectory", "sessionDirectory must be disjoint from workspacePath");
+  }
+  if (piAgentDirectory === sessionDirectory) {
+    return pathError("sessionDirectory", "piAgentDirectory and sessionDirectory must differ");
+  }
 
   return Effect.succeed(
     Object.freeze({
@@ -142,6 +179,7 @@ const resolveConfigPaths = (
       stateDirectory,
       piAgentDirectory,
       sessionDirectory,
+      piCredentials,
       profiles: Object.freeze({ ...decoded.profiles }),
     }),
   );
@@ -180,7 +218,7 @@ const configErrorPath = (error: Config.ConfigError): string | undefined => {
 };
 
 export const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")(
-  (raw: unknown) =>
+  (raw: unknown, baseDir: string = process.cwd()) =>
     ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
       Effect.mapError((error) => {
         const path = configErrorPath(error);
@@ -190,11 +228,12 @@ export const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknow
             : { stage: "decode", reason: "DecodeFailed", message: error.message, path },
         );
       }),
-      Effect.flatMap(resolveConfigPaths),
+      Effect.flatMap((decoded) => resolveConfigPaths(decoded, baseDir)),
     ),
 );
 
-export const decodeBroodConfig = (raw: BroodConfigEncoded) => decodeBroodConfigUnknown(raw);
+export const decodeBroodConfig = (raw: BroodConfigEncoded, baseDir?: string) =>
+  decodeBroodConfigUnknown(raw, baseDir);
 
 const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (config: BroodConfig) {
   const configuredBroodDirectory = resolve(config.workspacePath, ".brood");
@@ -233,8 +272,8 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
   if (
     isWithin(workspacePath, stateDirectory) ||
     isWithin(stateDirectory, workspacePath) ||
-    !isWithin(stateDirectory, piAgentDirectory) ||
-    !isWithin(stateDirectory, sessionDirectory) ||
+    isWithin(workspacePath, piAgentDirectory) ||
+    isWithin(workspacePath, sessionDirectory) ||
     piAgentDirectory === sessionDirectory
   ) {
     return yield* Effect.fail(
@@ -301,30 +340,67 @@ const prepareDirectories = Effect.fn("Brood.prepareDirectories")(function* (conf
   }) satisfies BroodConfig;
 });
 
-const createModelRuntime = Effect.fn("Brood.createModelRuntime")((config: BroodConfig) =>
-  Effect.tryPromise({
-    try: (signal) =>
-      ModelRuntime.create({
-        authPath: resolve(config.piAgentDirectory, "auth.json"),
-        modelsPath: resolve(config.piAgentDirectory, "models.json"),
-        allowModelNetwork: false,
-        signal,
-      }),
-    catch: (cause) =>
+interface CreatedModelRuntime {
+  readonly modelRuntime: ModelRuntime;
+  readonly authSource: PiAuthSource;
+}
+
+/**
+ * With an explicitly configured piAgentDirectory, Brood keeps project-local
+ * credentials there, exactly as before. Otherwise it omits the paths so Pi
+ * resolves its own global agent directory — the same auth.json that
+ * `pi /login` maintains and that Pi serializes across processes with a file
+ * lock — and one login covers every Brood project.
+ */
+const createModelRuntime = Effect.fn("Brood.createModelRuntime")(function* (config: BroodConfig) {
+  const runtimeError = (cause: unknown): BroodConfigError =>
+    new BroodConfigError({
+      stage: "compile",
+      reason: "ModelRuntimeInitializationFailed",
+      message: cause instanceof Error ? cause.message : String(cause),
+    });
+
+  if (config.piCredentials === "local") {
+    const authPath = resolve(config.piAgentDirectory, "auth.json");
+    const modelRuntime = yield* Effect.tryPromise({
+      try: (signal) =>
+        ModelRuntime.create({
+          authPath,
+          modelsPath: resolve(config.piAgentDirectory, "models.json"),
+          allowModelNetwork: false,
+          signal,
+        }),
+      catch: runtimeError,
+    });
+    return { modelRuntime, authSource: { kind: "local", authPath } } satisfies CreatedModelRuntime;
+  }
+
+  const authPath = join(getAgentDir(), "auth.json");
+  if (!existsSync(authPath)) {
+    return yield* Effect.fail(
       new BroodConfigError({
         stage: "compile",
         reason: "ModelRuntimeInitializationFailed",
-        message: cause instanceof Error ? cause.message : String(cause),
+        message: `No Pi credentials found at ${authPath}. Run \`pi /login\` once to share your Pi login with every Brood project, or set piAgentDirectory to a directory containing auth.json.`,
       }),
-  }),
-);
+    );
+  }
+  const modelRuntime = yield* Effect.tryPromise({
+    try: (signal) => ModelRuntime.create({ allowModelNetwork: false, signal }),
+    catch: runtimeError,
+  });
+  return {
+    modelRuntime,
+    authSource: { kind: "pi-global", authPath },
+  } satisfies CreatedModelRuntime;
+});
 
 export const buildBroodRuntimeUnknown = Effect.fn("Brood.buildBroodRuntimeUnknown")(
-  (raw: unknown) =>
+  (raw: unknown, baseDir?: string) =>
     Effect.gen(function* () {
-      const decoded = yield* decodeBroodConfigUnknown(raw);
+      const decoded = yield* decodeBroodConfigUnknown(raw, baseDir);
       const config = yield* prepareDirectories(decoded);
-      const modelRuntime = yield* createModelRuntime(config);
+      const { modelRuntime, authSource } = yield* createModelRuntime(config);
       const profileInput: ProfilesConfigInput = {
         defaultProfile: config.defaultProfile,
         profiles: config.profiles,
@@ -337,8 +413,9 @@ export const buildBroodRuntimeUnknown = Effect.fn("Brood.buildBroodRuntimeUnknow
         },
         config.maxProfileHelpChars,
       );
-      return Object.freeze({ config, modelRuntime, catalogue }) satisfies BroodRuntime;
+      return Object.freeze({ config, modelRuntime, catalogue, authSource }) satisfies BroodRuntime;
     }),
 );
 
-export const buildBroodRuntime = (raw: BroodConfigEncoded) => buildBroodRuntimeUnknown(raw);
+export const buildBroodRuntime = (raw: BroodConfigEncoded, baseDir?: string) =>
+  buildBroodRuntimeUnknown(raw, baseDir);

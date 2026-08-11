@@ -1,5 +1,5 @@
 // Plain Vitest is intentional: these tests exercise real filesystem and ModelRuntime boundaries.
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -76,6 +76,78 @@ describe("Brood runtime configuration", () => {
       path: "maxConcurrency",
       message: expect.stringContaining("maxAgentAdmissions"),
     });
+  });
+
+  it("defaults workspace, state, sessions, and credentials when omitted", async () => {
+    const config = await Effect.runPromise(
+      decodeBroodConfigUnknown(
+        { defaultProfile: "worker", profiles: validConfig().profiles },
+        join(base, "project"),
+      ),
+    );
+    expect(config.workspacePath).toBe(join(base, "project"));
+    expect(config.stateDirectory).toBe(join(homedir(), ".brood"));
+    expect(config.piAgentDirectory).toBe(join(homedir(), ".brood", "pi-agent"));
+    expect(config.sessionDirectory).toBe(join(homedir(), ".brood", "sessions"));
+    expect(config.piCredentials).toBe("pi-global");
+    expect(config.maxConcurrency).toBe(4);
+  });
+
+  it("pins project-local credentials when piAgentDirectory is explicit", async () => {
+    const config = await Effect.runPromise(decodeBroodConfig(validConfig()));
+    expect(config.piCredentials).toBe("local");
+  });
+
+  it("fails fast with login guidance when no global Pi credentials exist", async () => {
+    process.env["PI_CODING_AGENT_DIR"] = join(base, "pi-home");
+    try {
+      await expect(
+        Effect.runPromise(
+          buildBroodRuntime(
+            {
+              workspacePath: join(base, "workspace"),
+              stateDirectory: join(base, "state"),
+              defaultProfile: "worker",
+              profiles: validConfig().profiles,
+            },
+            base,
+          ),
+        ),
+      ).rejects.toMatchObject({
+        _tag: "BroodConfigError",
+        reason: "ModelRuntimeInitializationFailed",
+        message: expect.stringContaining("pi /login"),
+      });
+    } finally {
+      delete process.env["PI_CODING_AGENT_DIR"];
+    }
+  });
+
+  it("borrows the global Pi login in place when it exists", async () => {
+    const piHome = join(base, "pi-home");
+    process.env["PI_CODING_AGENT_DIR"] = piHome;
+    try {
+      await mkdir(piHome, { recursive: true });
+      await writeFile(join(piHome, "auth.json"), "{}");
+      const runtime = await Effect.runPromise(
+        buildBroodRuntime(
+          {
+            workspacePath: join(base, "workspace"),
+            stateDirectory: join(base, "state"),
+            defaultProfile: "worker",
+            profiles: validConfig().profiles,
+          },
+          base,
+        ),
+      );
+      expect(runtime.authSource).toEqual({
+        kind: "pi-global",
+        authPath: join(piHome, "auth.json"),
+      });
+      expect(runtime.config.piCredentials).toBe("pi-global");
+    } finally {
+      delete process.env["PI_CODING_AGENT_DIR"];
+    }
   });
 
   it("derives the resume-prompt minimum from maxAgentAdmissions behaviorally", async () => {

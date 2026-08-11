@@ -27,6 +27,7 @@ export {
   runBrood,
   type BroodApplication,
   type BroodController,
+  type BroodResolvedPaths,
 } from "./main.js";
 export {
   OperatorMessageRejected,
@@ -36,6 +37,11 @@ export {
   type TrafficStatus,
   type TrafficView,
 } from "./registry.js";
-export { BroodConfigInput, type BroodConfigEncoded } from "./runtime.js";
+export {
+  BroodConfigInput,
+  defaultStateDirectory,
+  type BroodConfigEncoded,
+  type PiAuthSource,
+} from "./runtime.js";
 export { AgentDetail, SwarmStatus, type StatusAgent } from "./status.js";
 export type { SupervisorEvent } from "./supervisor.js";
