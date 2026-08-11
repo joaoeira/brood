@@ -9,6 +9,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useKeyboard } from "@opentui/react";
 import type { TrafficView } from "../brood";
 import { formatTimeOfDay, glyphs, rule, theme, truncate, wrap } from "../theme";
+import { wheelRows, type WheelEventLike } from "./wheel";
 
 export type CommsFilter = "all" | "agent" | "unread";
 
@@ -121,6 +122,16 @@ export const CommsScreen = ({ traffic, focusPath, width, height }: CommsScreenPr
     setFromEnd((current) => Math.min(current, Math.max(0, filtered.length - 1)));
   }, [filtered.length]);
 
+  // The wheel drives the selection cursor, exactly like j/k: up moves to
+  // older records, down toward the live end.
+  const onWheel = (event: WheelEventLike): void => {
+    const delta = wheelRows(event);
+    if (delta === undefined) return;
+    setFromEnd((current) =>
+      Math.max(0, Math.min(Math.max(0, filtered.length - 1), current - delta)),
+    );
+  };
+
   const contentWidth = Math.max(20, width - 2);
   const unread = traffic.filter(({ status }) => status === "unread" || status === "pending").length;
   const feedHeight = Math.max(3, height - 3 - DETAIL_HEIGHT);
@@ -132,7 +143,13 @@ export const CommsScreen = ({ traffic, focusPath, width, height }: CommsScreenPr
   const header = ` COMMS ▓▒░ TRAFFIC ${traffic.length} · UNREAD ${unread} `;
 
   return (
-    <box flexDirection="column" width={width} height={height} backgroundColor={theme.bg}>
+    <box
+      flexDirection="column"
+      width={width}
+      height={height}
+      backgroundColor={theme.bg}
+      onMouseScroll={onWheel}
+    >
       <box flexDirection="row" height={1} backgroundColor={theme.panel} paddingLeft={1}>
         <text>
           <b fg={theme.amber}>{header}</b>

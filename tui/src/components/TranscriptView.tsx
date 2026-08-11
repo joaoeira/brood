@@ -11,6 +11,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { glyphs, rule, theme, truncate, wrap } from "../theme";
 import type { TranscriptEntry } from "../transcript/parse";
 import { useTranscript, type TranscriptReader } from "../transcript/watch";
+import { wheelRows, type WheelEventLike } from "./wheel";
 
 const COMMAND_PREVIEW_LINES = 3;
 const ASSISTANT_PREVIEW_LINES = 12;
@@ -111,15 +112,21 @@ export const TranscriptView = ({
   const [follow, setFollow] = useState(true);
   const boxRef = useRef<ScrollBoxRenderable>(null);
 
+  const step = (delta: number): void => {
+    setFollow(false);
+    setScrollTop((current) => {
+      const next = Math.max(0, Math.min(maxScroll, current + delta));
+      if (delta > 0 && next >= maxScroll) setFollow(true);
+      return next;
+    });
+  };
+
+  const onWheel = (event: WheelEventLike): void => {
+    const delta = wheelRows(event);
+    if (delta !== undefined) step(delta);
+  };
+
   useKeyboard((key) => {
-    const step = (delta: number): void => {
-      setFollow(false);
-      setScrollTop((current) => {
-        const next = Math.max(0, Math.min(maxScroll, current + delta));
-        if (delta > 0 && next >= maxScroll) setFollow(true);
-        return next;
-      });
-    };
     if (key.name === "j" || key.name === "down") step(1);
     else if (key.name === "k" || key.name === "up") step(-1);
     else if (key.name === "d" && key.ctrl) step(Math.floor(viewportRows / 2));
@@ -154,6 +161,7 @@ export const TranscriptView = ({
       backgroundColor={theme.bg}
       paddingLeft={1}
       paddingRight={1}
+      onMouseScroll={onWheel}
     >
       <text>
         <span fg={theme.amber}>{truncate(header, contentWidth)}</span>

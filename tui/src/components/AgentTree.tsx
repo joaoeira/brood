@@ -2,10 +2,12 @@
  * The swarm as a tree. Rows are pre-flattened by the store, so this component
  * only decides colour, truncation, and which slice of the list is on screen.
  */
+import { useEffect, useState } from "react";
 import type { FlatAgent } from "../store";
 import { glyphs, stateColor, stateGlyph, theme, truncate } from "../theme";
 import { SectionHeader } from "./Section";
 import { Spinner, useSpinnerFrame } from "./Spinner";
+import { wheelRows, type WheelEventLike } from "./wheel";
 
 export interface AgentTreeProps {
   readonly rows: ReadonlyArray<FlatAgent>;
@@ -70,14 +72,31 @@ const AgentRow = ({ row, selected, width, spinner }: AgentRowProps) => {
 
 export const AgentTree = ({ rows, selection, hasStatus, width, height }: AgentTreeProps) => {
   const spinner = useSpinnerFrame();
+  // The wheel detaches the viewport from the selection; any keyboard
+  // selection change snaps it back to the centred-cursor window.
+  const [wheelStart, setWheelStart] = useState<number | undefined>(undefined);
   const contentWidth = width - 2;
   const listHeight = Math.max(1, height - 1);
   const selectedIndex = Math.max(
     0,
     rows.findIndex((row) => row.agent.path === selection),
   );
-  const start = windowStart(selectedIndex, listHeight, rows.length);
+  const maxStart = Math.max(0, rows.length - listHeight);
+  const start = Math.min(
+    wheelStart ?? windowStart(selectedIndex, listHeight, rows.length),
+    maxStart,
+  );
   const visible = rows.slice(start, start + listHeight);
+
+  useEffect(() => {
+    setWheelStart(undefined);
+  }, [selection]);
+
+  const onWheel = (event: WheelEventLike): void => {
+    const delta = wheelRows(event);
+    if (delta === undefined) return;
+    setWheelStart(Math.max(0, Math.min(maxStart, start + delta)));
+  };
 
   return (
     <box
@@ -87,6 +106,7 @@ export const AgentTree = ({ rows, selection, hasStatus, width, height }: AgentTr
       backgroundColor={theme.panel}
       paddingLeft={1}
       paddingRight={1}
+      onMouseScroll={onWheel}
     >
       <SectionHeader label="AGENTS" width={contentWidth} />
       {rows.length === 0 ? (

@@ -8,6 +8,7 @@ import { useKeyboard } from "@opentui/react";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import type { BulletinView } from "../brood";
 import { glyphs, theme, wrap } from "../theme";
+import { wheelRows, type WheelEventLike } from "./wheel";
 
 export interface BulletinOverlayProps {
   readonly bulletins: ReadonlyArray<BulletinView>;
@@ -39,27 +40,39 @@ export const BulletinOverlay = ({ bulletins, width, height }: BulletinOverlayPro
   }, [bulletins, contentWidth]);
 
   const maxScroll = Math.max(0, lines.length - viewportRows);
-  const [scrollTop, setScrollTop] = useState(0);
+  // undefined means pinned to the bottom: the board opens on the newest posts
+  // and stays there as new ones arrive, until the operator scrolls up.
+  const [scrollTop, setScrollTop] = useState<number | undefined>(undefined);
+  const effectiveScroll = Math.min(scrollTop ?? maxScroll, maxScroll);
   const boxRef = useRef<ScrollBoxRenderable>(null);
 
+  const step = (delta: number): void =>
+    setScrollTop((current) => {
+      const next = Math.max(0, Math.min(maxScroll, (current ?? maxScroll) + delta));
+      return next >= maxScroll ? undefined : next;
+    });
+
   useKeyboard((key) => {
-    const step = (delta: number): void =>
-      setScrollTop((current) => Math.max(0, Math.min(maxScroll, current + delta)));
     if (key.name === "j" || key.name === "down") step(1);
     else if (key.name === "k" || key.name === "up") step(-1);
     else if (key.name === "d" && key.ctrl) step(Math.floor(viewportRows / 2));
     else if (key.name === "u" && key.ctrl) step(-Math.floor(viewportRows / 2));
-    else if (key.name === "g") setScrollTop(0);
-    else if (key.name === "G" || (key.name === "g" && key.shift)) setScrollTop(maxScroll);
+    else if (key.name === "g" && !key.shift) setScrollTop(0);
+    else if (key.name === "G" || (key.name === "g" && key.shift)) setScrollTop(undefined);
   });
 
   useEffect(() => {
-    setScrollTop((current) => Math.min(current, maxScroll));
+    setScrollTop((current) => (current === undefined ? undefined : Math.min(current, maxScroll)));
   }, [maxScroll]);
 
   useEffect(() => {
-    if (boxRef.current !== null) boxRef.current.scrollTop = scrollTop;
-  }, [scrollTop, lines]);
+    if (boxRef.current !== null) boxRef.current.scrollTop = effectiveScroll;
+  }, [effectiveScroll, lines]);
+
+  const onWheel = (event: WheelEventLike): void => {
+    const delta = wheelRows(event);
+    if (delta !== undefined) step(delta);
+  };
 
   return (
     <box
@@ -74,6 +87,7 @@ export const BulletinOverlay = ({ bulletins, width, height }: BulletinOverlayPro
       titleColor={theme.amber}
       paddingLeft={1}
       paddingRight={1}
+      onMouseScroll={onWheel}
     >
       {lines.length === 0 ? (
         <box flexGrow={1} alignItems="center" justifyContent="center">
