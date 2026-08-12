@@ -2,8 +2,8 @@
  * The swarm as a tree. Rows are pre-flattened by the store, so this component
  * only decides colour, truncation, and which slice of the list is on screen.
  */
-import { useEffect, useState } from "react";
-import type { FlatAgent } from "../store";
+import { useEffect, useRef, useState } from "react";
+import { store, type FlatAgent } from "../store";
 import { glyphs, stateColor, stateGlyph, theme, truncate } from "../theme";
 import { SectionHeader } from "./Section";
 import { Spinner, useSpinnerFrame } from "./Spinner";
@@ -29,9 +29,10 @@ interface AgentRowProps {
   readonly selected: boolean;
   readonly width: number;
   readonly spinner: string;
+  readonly onSelect: () => void;
 }
 
-const AgentRow = ({ row, selected, width, spinner }: AgentRowProps) => {
+const AgentRow = ({ row, selected, width, spinner, onSelect }: AgentRowProps) => {
   const { agent } = row;
   const glyph = stateGlyph(agent.state) ?? spinner;
   const head = `${row.prefix}${glyph} ${agent.name}`;
@@ -55,7 +56,12 @@ const AgentRow = ({ row, selected, width, spinner }: AgentRowProps) => {
     width - head.length - waitSuffix.length - mailBadge.length - owesBadge.length - 2;
 
   return (
-    <box flexDirection="row" height={1} backgroundColor={selected ? theme.selection : theme.panel}>
+    <box
+      flexDirection="row"
+      height={1}
+      backgroundColor={selected ? theme.selection : theme.panel}
+      onMouseDown={onSelect}
+    >
       <text fg={theme.amber}>{selected ? glyphs.selected : " "}</text>
       <text>
         <span fg={theme.faint}>{row.prefix}</span>
@@ -88,7 +94,14 @@ export const AgentTree = ({ rows, selection, hasStatus, width, height }: AgentTr
   );
   const visible = rows.slice(start, start + listHeight);
 
+  // Clicking a row selects it without recentring the view — the row is already
+  // on screen; only keyboard navigation snaps the window back to the cursor.
+  const clickPinned = useRef(false);
   useEffect(() => {
+    if (clickPinned.current) {
+      clickPinned.current = false;
+      return;
+    }
     setWheelStart(undefined);
   }, [selection]);
 
@@ -125,6 +138,11 @@ export const AgentTree = ({ rows, selection, hasStatus, width, height }: AgentTr
             selected={row.agent.path === selection}
             width={contentWidth - 1}
             spinner={spinner}
+            onSelect={() => {
+              clickPinned.current = true;
+              setWheelStart(start);
+              store.setSelection(row.agent.path);
+            }}
           />
         ))
       )}

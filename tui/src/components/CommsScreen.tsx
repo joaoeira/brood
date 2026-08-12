@@ -50,9 +50,10 @@ interface FeedRowProps {
   readonly record: TrafficView;
   readonly selected: boolean;
   readonly width: number;
+  readonly onSelect: () => void;
 }
 
-const FeedRow = ({ record, selected, width }: FeedRowProps) => {
+const FeedRow = ({ record, selected, width, onSelect }: FeedRowProps) => {
   const clock = formatTimeOfDay(record.at);
   const glyph = record.urgent && record.kind === "message" ? "⚡" : KIND_GLYPHS[record.kind];
   const route = truncate(
@@ -63,7 +64,12 @@ const FeedRow = ({ record, selected, width }: FeedRowProps) => {
   const used = clock.length + glyph.length + route.length + status.length + 7;
   const preview = truncate(record.body, Math.max(0, width - used));
   return (
-    <box flexDirection="row" height={1} backgroundColor={selected ? theme.selection : theme.bg}>
+    <box
+      flexDirection="row"
+      height={1}
+      backgroundColor={selected ? theme.selection : theme.bg}
+      onMouseDown={onSelect}
+    >
       <text fg={theme.amber}>{selected ? glyphs.selected : " "}</text>
       <text>
         <span fg={theme.faint}>{clock}</span>
@@ -168,12 +174,13 @@ export const CommsScreen = ({ traffic, focusPath, width, height }: CommsScreenPr
             </text>
           </box>
         ) : (
-          visible.map((record) => (
+          visible.map((record, visibleIndex) => (
             <FeedRow
               key={record.sequence}
               record={record}
               selected={record.sequence === selected?.sequence}
               width={contentWidth - 1}
+              onSelect={() => setFromEnd(Math.max(0, filtered.length - 1 - (start + visibleIndex)))}
             />
           ))
         )}
