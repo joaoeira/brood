@@ -11,6 +11,7 @@ import {
 import {
   MAX_ENCODED_REPLY_CHARS,
   MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS,
+  MAX_REVIVAL_ENVELOPE_CHARS,
   MAX_REQUEST_OUTCOME_HEADER_CHARS,
   MAX_RUNTIME_ENVELOPE_CHARS,
   TRUNCATION_SENTINEL,
@@ -358,6 +359,52 @@ it("derives the request header allowance from the actual maximum render", () => 
       8 * 320 +
       MAX_RUNTIME_ENVELOPE_CHARS +
       MAX_REQUEST_TARGETS_PER_WAIT * (MAX_ENCODED_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS) +
-      MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS,
+      MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS +
+      MAX_REVIVAL_ENVELOPE_CHARS,
   );
+});
+
+it("renders the revival preamble first on every command variant that carries it", () => {
+  const wake = renderAgentCommand(
+    {
+      _tag: "CoordinationWake",
+      notice: { unreadMessages: 1, openRequests: 0, unseenBulletins: 0 },
+      waitingFor: { agentCompletions: 0, replies: 0 },
+      operatorMessage: "come back",
+      revival: "completed",
+    },
+    6_000,
+  );
+  expect(wake).toContain('<brood_revival version="1">');
+  expect(wake).toContain("previously finished this work");
+  expect(wake.indexOf("<brood_revival")).toBeLessThan(wake.indexOf("<brood_operator_message"));
+
+  const initial = renderAgentCommand(
+    { _tag: "InitialGoal", goal: "Build the parser.", revival: "interrupted" },
+    6_000,
+  );
+  expect(initial).toContain("interrupted before it finished");
+  expect(initial.indexOf("<brood_revival")).toBeLessThan(initial.indexOf("Build the parser."));
+
+  const resumed = renderAgentCommand(
+    {
+      _tag: "WaitSatisfied",
+      waitId: makeWaitId("wait_revival"),
+      dependencies: [],
+      requests: [],
+      revival: "completed",
+    },
+    6_000,
+  );
+  expect(resumed).toContain('<brood_revival version="1">');
+
+  const plain = renderAgentCommand(
+    {
+      _tag: "CoordinationWake",
+      notice: { unreadMessages: 1, openRequests: 0, unseenBulletins: 0 },
+      waitingFor: { agentCompletions: 0, replies: 0 },
+    },
+    6_000,
+  );
+  expect(plain).not.toContain("<brood_revival");
 });

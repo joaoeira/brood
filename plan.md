@@ -52,7 +52,7 @@ The addressable states are:
 type AddressableAgentState = "queued" | "starting" | "running" | "waiting";
 ```
 
-Completed, failed, and interrupted agents are terminal and cannot receive new messages or questions. A concurrency-limited agent is `queued`, not killed, and remains addressable.
+Completed, failed, and interrupted agents are terminal, but terminal no longer means unreachable (see [docs/proposals/revival.md](./docs/proposals/revival.md)): passive mail queues in a terminal agent's inbox, and an urgent message, a question, or an operator message revives a completed or interrupted agent onto its existing session. Only failed agents reject wake-capable traffic. A concurrency-limited agent is `queued`, not killed, and remains addressable.
 
 ### 2.2 Messages are passive; questions interrupt
 
@@ -1100,7 +1100,7 @@ If wait satisfaction and a question wake coexist, one `WaitSatisfied` command ca
 - Reply commits first: the requester outcome is `Replied`, even if requester termination follows immediately.
 - Requester settlement commits first: cleanup deletes the request, so a later reply fails as `UnknownOrClosedRequest`.
 - Recipient settlement with open requests atomically records every outcome as `Unavailable`, removes recipient inbox references, and wakes requesters whose full waits became satisfied.
-- Recipient settlement deletes its unread passive messages because terminal mailboxes are not retained.
+- Recipient settlement retains unread passive messages (revival may read them later) and drops only inbox request references, whose records are voided.
 - Requester settlement deletes its outbound request records and the corresponding recipient inbox references.
 - A reply before requester marker activation settles planned state without waking the still-running requester.
 - A read selects and deletes returned passive messages in one transition; concurrent delivery linearizes wholly before or after that page.

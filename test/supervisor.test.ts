@@ -1546,3 +1546,128 @@ it.effect("omits the charter section and scheduler telemetry when no instruction
     }),
   ),
 );
+
+it.effect("an operator message revives a completed root and drain closes the revival gate", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig({ profiles: { worker: testProfile() } }),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        ...testSupervisorConfig(),
+      });
+
+      const rootId = yield* supervisor.startRoot({ goal: "answer the question" });
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      yield* fake.complete(rootId, "first answer");
+      const firstOutcome = yield* supervisor.awaitOutcome(rootId);
+      expect(firstOutcome).toMatchObject({
+        _tag: "Completed",
+        result: { summary: "first answer" },
+      });
+      // The first controller is fully torn down (session disposed) before the
+      // operator's follow-up arrives — revival must reopen, not reuse.
+      const firstCleanup = yield* fake.nextCleanup;
+      expect(firstCleanup).toBe(rootId);
+
+      const delivery = yield* supervisor.sendOperatorMessage("root", "now also document it");
+      expect(delivery).toEqual({ to: "root", recipientState: "queued", revived: true });
+
+      const reopened = yield* fake.nextOpen;
+      expect(reopened.agentId).toBe(rootId);
+      const revivalRun = yield* fake.nextRun;
+      expect(revivalRun.prompt).toContain("<brood_revival");
+      expect(revivalRun.prompt).toContain("previously finished this work");
+      expect(revivalRun.prompt).toContain("<brood_operator_message");
+      expect(revivalRun.prompt).toContain("now also document it");
+
+      yield* fake.complete(rootId, "second answer");
+      const secondCleanup = yield* fake.nextCleanup;
+      expect(secondCleanup).toBe(rootId);
+      const resolution = yield* supervisor.latestOutcome(rootId);
+      expect(resolution.outcome).toMatchObject({
+        _tag: "Completed",
+        result: { summary: "second answer" },
+      });
+      expect(resolution.lastCompletedResult?.summary).toBe("second answer");
+
+      const drain = yield* supervisor.drain;
+      expect(drain).toEqual({ timedOut: false, interruptedAgentIds: [], terminalAgentCount: 1 });
+      const late = yield* Effect.flip(supervisor.sendOperatorMessage("root", "too late"));
+      expect(late).toMatchObject({ _tag: "OperatorMessageRejected", reason: "RecipientTerminal" });
+    }),
+  ),
+);
+
+it.effect("a peer's urgent message revives a completed sibling through the tool port", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const catalogue = yield* compileProfileCatalogue(
+        testProfilesConfig({ profiles: { worker: testProfile() } }),
+        testModelLookup(),
+        4_000,
+      );
+      const fake = yield* makeFakePiAdapter();
+      const supervisor = yield* makeSupervisor({
+        catalogue,
+        piAdapter: fake,
+        // The root keeps its permit for the whole scenario; the worker's first
+        // life and its revival each need one of their own.
+        ...testSupervisorConfig({ maxConcurrency: 2 }),
+      });
+
+      const rootId = yield* supervisor.startRoot({ goal: "coordinate" });
+      yield* fake.nextOpen;
+      yield* fake.nextRun;
+      yield* supervisor.toolPort.delegate(
+        rootId,
+        makeToolInvocationId("delegate-worker"),
+        [{ name: makeAgentName("worker"), goal: "build it" }],
+        "none",
+      );
+      const workerOpen = yield* fake.nextOpen;
+      const workerId = workerOpen.agentId;
+      yield* fake.nextRun;
+      yield* fake.complete(workerId, "built");
+      const workerOutcome = yield* supervisor.awaitOutcome(workerId);
+      expect(workerOutcome._tag).toBe("Completed");
+      const workerCleanup = yield* fake.nextCleanup;
+      expect(workerCleanup).toBe(workerId);
+
+      const sent = yield* supervisor.toolPort.sendMessage(
+        rootId,
+        makeToolInvocationId("revive-worker"),
+        { to: makeAgentPath("root/worker"), message: "the spec changed", urgent: true },
+      );
+      expect(sent).toEqual({ to: "root/worker", recipientState: "queued", revived: true });
+
+      const reopened = yield* fake.nextOpen;
+      expect(reopened.agentId).toBe(workerId);
+      const revivalRun = yield* fake.nextRun;
+      expect(revivalRun.prompt).toContain("<brood_revival");
+      expect(revivalRun.prompt).toContain('unread_messages="1"');
+
+      const detail = yield* supervisor.show("root/worker");
+      expect(detail.revivals).toBe(1);
+      expect(detail.state).toBe("running");
+
+      yield* fake.complete(workerId, "rebuilt to the new spec");
+      yield* fake.complete(rootId, "coordinated");
+      const rootOutcome = yield* supervisor.awaitOutcome(rootId);
+      expect(rootOutcome._tag).toBe("Completed");
+      const drain = yield* supervisor.drain;
+      expect(drain).toEqual({ timedOut: false, interruptedAgentIds: [], terminalAgentCount: 2 });
+      const worker = yield* supervisor.latestOutcome(workerId);
+      expect(worker.outcome).toMatchObject({
+        _tag: "Completed",
+        result: { summary: "rebuilt to the new spec" },
+      });
+    }),
+  ),
+);

@@ -44,6 +44,7 @@ export const glyphs = {
   operator: "⌁",
   mail: "✉",
   bolt: "⚡",
+  revived: "↻",
 } as const;
 
 export const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -84,6 +85,8 @@ export const swarmStateColor = (state: string): string => {
   switch (state) {
     case "running":
       return theme.amber;
+    case "settled":
+      return theme.violet;
     case "draining":
       return theme.violet;
     case "completed":

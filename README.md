@@ -7,6 +7,9 @@ recruit more agents to split the work — and those agents can recruit more. The
 work concurrently in the shared folder, wait on each other's results, and the
 run ends when the root agent delivers its final answer and stragglers drain. You
 watch the whole swarm live from your terminal and can interrupt any part of it.
+In session mode (the TUI's default), the run instead idles after the root
+finishes: the settled swarm stays revivable — message any finished agent to
+bring it back, follow up with the root — until you close it.
 
 Under the hood, each agent is a real coding agent (built on the
 [Pi coding-agent SDK](https://pi.dev)) with file, edit, and shell tools — plus
@@ -212,6 +215,17 @@ Passive messages and bulletins never create work by themselves and may remain
 unread when an agent terminates. Communication targets use canonical paths such
 as `root/api/audit`, never raw UUIDs.
 
+**Finished agents are dormant, not gone.** Passive mail to a completed or
+interrupted agent queues in its inbox; an urgent message, a question, or an
+operator message _revives_ it — a fresh controller reopens the agent's own
+session from disk, so it returns with its full working context and answers
+from what it actually did. Revived agents are full citizens (they can even
+delegate, under the same never-replenishing admission budget), second
+completions are latest-wins, and parents who already consumed a result are
+never re-notified. Only failed agents stay beyond reach, and nothing can be
+revived once the run starts draining. The design record is
+[docs/proposals/revival.md](./docs/proposals/revival.md).
+
 The bulletin feed is run-scoped and retention is bounded. `.brood/shared/` is
 the cross-run mechanism: agents may organize it however the work demands, and
 may point peers to a file simply by including its path in ordinary text. There
@@ -273,5 +287,5 @@ Architecture, protocol invariants, and the full test contract are documented in
 [`docs/phase-0-pi-compatibility.md`](./docs/phase-0-pi-compatibility.md).
 Design records for shipped and pending changes live under
 [`docs/proposals/`](./docs/proposals/), most recently
-[admission awareness and inherited run instructions](./docs/proposals/admission-awareness.md)
+[revival — terminal agents are dormant, not gone](./docs/proposals/revival.md)
 (implemented).

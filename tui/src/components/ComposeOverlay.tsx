@@ -59,7 +59,7 @@ export const ComposeOverlay = ({ to, onSend, onClose, width }: ComposeOverlayPro
       title={` MESSAGE ${to} `}
     >
       <text fg={theme.muted}>
-        {"Delivered with run-charter authority; wakes the agent if it is parked."}
+        {"Delivered with run-charter authority; wakes a parked agent and revives a finished one."}
       </text>
       <box marginTop={1}>
         <textarea

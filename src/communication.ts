@@ -255,9 +255,27 @@ export const SendMessageInput = Schema.Struct({
 });
 export interface SendMessageInput extends Schema.Schema.Type<typeof SendMessageInput> {}
 
+/** Recipient state in a send result. Terminal states are reachable: passive
+ * mail to a finished agent is accepted and queued rather than rejected. */
+export const RecipientAgentState = Schema.Literals([
+  "queued",
+  "starting",
+  "running",
+  "waiting",
+  "completed",
+  "failed",
+  "interrupted",
+]);
+export type RecipientAgentState = typeof RecipientAgentState.Type;
+
 export const SendMessageResult = Schema.Struct({
   to: AgentPath,
-  recipientState: AddressableAgentState,
+  recipientState: RecipientAgentState,
+  /** The recipient had finished; the message is retained in its inbox and will
+   * be read only if the agent is later revived. */
+  queuedForRevival: Schema.optionalKey(Schema.Boolean),
+  /** This send revived a finished agent: it is being brought back to read it. */
+  revived: Schema.optionalKey(Schema.Boolean),
 });
 export interface SendMessageResult extends Schema.Schema.Type<typeof SendMessageResult> {}
 
@@ -272,6 +290,8 @@ export const AskAgentToolDetails = Schema.Struct({
   request: RequestId,
   to: AgentPath,
   recipientState: AddressableAgentState,
+  /** This question revived a finished agent to answer it. */
+  revived: Schema.optionalKey(Schema.Boolean),
   broodControl: BroodControl,
 });
 export interface AskAgentToolDetails extends Schema.Schema.Type<typeof AskAgentToolDetails> {}

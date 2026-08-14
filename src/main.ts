@@ -3,7 +3,7 @@
  * a scoped BroodApplication, and interprets the root's value-level outcome
  * into BroodResult | AgentFailed | RootInterrupted after draining orphans.
  */
-import { Duration, Effect, References, type PubSub, type Scope } from "effect";
+import { Duration, Effect, Latch, References, type PubSub, type Scope } from "effect";
 import {
   AgentFailed,
   RootInterrupted,
@@ -52,11 +52,16 @@ export interface BroodController {
   readonly bulletins: Effect.Effect<ReadonlyArray<BulletinView>>;
   /** Operator-only communication log: bodies, read state, correlation. */
   readonly traffic: Effect.Effect<ReadonlyArray<TrafficView>>;
-  /** Deliver a direct operator message; wakes a parked recipient. */
+  /** Deliver a direct operator message; wakes a parked recipient — and
+   * revives a finished one. */
   readonly sendOperatorMessage: (
     reference: string,
     body: string,
   ) => Effect.Effect<OperatorMessageDelivery, UnknownAgentReference | OperatorMessageRejected>;
+  /** Session mode only: end the run. Revivals close, stragglers drain, and
+   * `run` resolves with the root's latest delivered result. Idempotent; a
+   * no-op for runs not started in session mode. */
+  readonly close: Effect.Effect<void>;
 }
 
 /** The materialized locations a run will actually use, for operator display. */
@@ -68,11 +73,22 @@ export interface BroodResolvedPaths {
   readonly piAuth: PiAuthSource;
 }
 
+export interface BroodRunOptions {
+  /**
+   * Session mode: the run does not end when the root completes. The swarm
+   * idles settled — every agent revivable by operator message, urgent mail,
+   * or a peer question — until `controller.close` ends it. The default (off)
+   * keeps the classic contract: root settles, stragglers drain, run returns.
+   */
+  readonly session?: boolean;
+}
+
 export interface BroodApplication {
   readonly controller: BroodController;
   readonly resolved: BroodResolvedPaths;
   readonly run: (
     request: BroodRunRequestEncoded,
+    options?: BroodRunOptions,
   ) => Effect.Effect<BroodResult, AgentFailed | RootInterrupted | RootStartError>;
 }
 
@@ -151,13 +167,38 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
     drainTimeoutMillis: Duration.toMillis(runtime.config.drainTimeout),
   });
 
-  const run = Effect.fn("Brood.run")((request: BroodRunRequestEncoded) => {
+  const closeSession = yield* Latch.make(false);
+
+  const run = Effect.fn("Brood.run")((
+    request: BroodRunRequestEncoded,
+    options?: BroodRunOptions,
+  ) => {
     const operation = Effect.gen(function* () {
       const normalized = yield* normalizeRunRequest(
         request,
         runtime.config.maxRunInstructionsChars,
       );
       const rootId = yield* supervisor.startRoot(normalized);
+      if (options?.session === true) {
+        // Session mode: the swarm idles settled after the root finishes —
+        // revivable, delegable, and addressable — until the operator closes.
+        yield* Latch.await(closeSession);
+        const drain = yield* supervisor.drain;
+        const resolution = yield* supervisor.latestOutcome(rootId).pipe(Effect.orDie);
+        // A close-time interruption never erases delivered work: the latest
+        // completed root result wins whenever one exists; the drain report
+        // still records what was interrupted.
+        const effective: AgentOutcome | undefined =
+          resolution.lastCompletedResult === undefined
+            ? resolution.outcome
+            : { _tag: "Completed", result: resolution.lastCompletedResult };
+        if (effective === undefined) {
+          return yield* Effect.die(
+            new Error("Session close reached a root with no outcome after drain"),
+          );
+        }
+        return yield* interpretRootOutcome(effective, drain, runtime.config.maxFailureMessageChars);
+      }
       const rootOutcome = yield* supervisor.awaitOutcome(rootId).pipe(Effect.orDie);
       const drain = yield* supervisor.drain;
       return yield* interpretRootOutcome(rootOutcome, drain, runtime.config.maxFailureMessageChars);
@@ -176,6 +217,7 @@ const makeApplication = Effect.fn("Brood.makeApplication")(function* (runtime: B
     bulletins: supervisor.bulletins,
     traffic: supervisor.traffic,
     sendOperatorMessage: supervisor.sendOperatorMessage,
+    close: Latch.open(closeSession).pipe(Effect.asVoid),
   };
   const resolved: BroodResolvedPaths = {
     workspacePath: runtime.config.workspacePath,

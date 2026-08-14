@@ -4,7 +4,8 @@
  * cleanup, classifies run settlement from live session events, and turns
  * control-tool markers into typed suspension via shouldStopAfterTurn.
  */
-import { chmod, mkdir } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { AssistantMessage, StopReason, ToolResultMessage } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
@@ -406,6 +407,122 @@ const secureDirectory = (path: string, agentId: AgentId): Effect.Effect<void, Pi
     catch: (cause) => piOpenError(agentId, cause),
   }).pipe(Effect.asVoid);
 
+// ── Session resume ──────────────────────────────────────────────────────────
+//
+// A revived agent reopens the conversation it already had: the newest .jsonl
+// in its per-agent session directory, selected by mtime exactly like Pi's own
+// findMostRecentSession. A file may not exist at all when the agent never
+// produced an assistant reply — Pi defers the first write until then — in
+// which case the agent starts a fresh session and the registry re-issues its
+// goal.
+
+export const findLatestSessionFile = async (directory: string): Promise<string | undefined> => {
+  const names = await readdir(directory);
+  const candidates = await Promise.all(
+    names
+      .filter((name) => name.endsWith(".jsonl"))
+      .map(async (name) => {
+        const path = join(directory, name);
+        const info = await stat(path);
+        return { path, mtimeMs: info.mtimeMs };
+      }),
+  );
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  return candidates[0]?.path;
+};
+
+/**
+ * Repair a session interrupted mid-tool-batch before reopening it. An abort
+ * between tool executions persists the assistant's toolCall blocks but never
+ * writes results for the calls the loop had not reached; Pi has no repair
+ * path of its own and would replay the malformed transcript verbatim, which
+ * providers reject ("tool_use without tool_result"). Synthetic aborted
+ * results are appended in call order, chained onto the entry tree exactly as
+ * Pi would append them. Returns how many results were synthesized.
+ */
+export const repairDanglingToolCalls = async (sessionFile: string): Promise<number> => {
+  const raw = await readFile(sessionFile, "utf8");
+  const entries: Array<Record<string, unknown>> = [];
+  for (const line of raw.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed === "object" && parsed !== null) {
+        entries.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Matches Pi's own reader: malformed lines are skipped, not fatal.
+    }
+  }
+
+  const calls = new Map<string, string>();
+  const answered = new Set<string>();
+  const usedIds = new Set<string>();
+  let leafId: string | null = null;
+  for (const entry of entries) {
+    if (typeof entry.id === "string") usedIds.add(entry.id);
+    if (entry.type !== "session" && typeof entry.id === "string") leafId = entry.id;
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (typeof message !== "object" || message === null) continue;
+    const { role, content, toolCallId } = message as {
+      role?: unknown;
+      content?: unknown;
+      toolCallId?: unknown;
+    };
+    if (role === "assistant" && Array.isArray(content)) {
+      for (const block of content as ReadonlyArray<Record<string, unknown>>) {
+        if (block.type === "toolCall" && typeof block.id === "string") {
+          calls.set(block.id, typeof block.name === "string" ? block.name : "unknown");
+        }
+      }
+    } else if (role === "toolResult" && typeof toolCallId === "string") {
+      answered.add(toolCallId);
+    }
+  }
+
+  const dangling = Array.from(calls).filter(([callId]) => !answered.has(callId));
+  if (dangling.length === 0) return 0;
+
+  const freshEntryId = (): string => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const candidate = randomUUID().slice(0, 8);
+      if (!usedIds.has(candidate)) {
+        usedIds.add(candidate);
+        return candidate;
+      }
+    }
+    return randomUUID();
+  };
+
+  const lines = dangling.map(([toolCallId, toolName]) => {
+    const id = freshEntryId();
+    const entry = {
+      type: "message",
+      id,
+      parentId: leafId,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName,
+        content: [
+          {
+            type: "text",
+            text: "Operation aborted: this tool call was interrupted before it could run and produced no result.",
+          },
+        ],
+        isError: true,
+        timestamp: Date.now(),
+      },
+    };
+    leafId = id;
+    return `${JSON.stringify(entry)}\n`;
+  });
+  await appendFile(sessionFile, lines.join(""));
+  return dangling.length;
+};
+
 export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
   open: Effect.fn("Brood.PiAdapter.open")(function* (request) {
     const builtInToolNames = createCodingTools(options.workspacePath).map(({ name }) => name);
@@ -435,7 +552,28 @@ export const makePiAdapter = (options: PiAdapterOptions): PiAdapter => ({
       options.piAgentDirectory,
       { projectTrusted: false },
     );
-    const sessionManager = SessionManager.create(options.workspacePath, agentSessionDirectory);
+    // A first open finds no file and creates a fresh session; a revival finds
+    // the agent's previous conversation and reopens it in place — repaired
+    // first if an interrupt left tool calls without results.
+    const existingSessionFile = yield* Effect.tryPromise({
+      try: () => findLatestSessionFile(agentSessionDirectory),
+      catch: (cause) => piOpenError(request.agentId, cause),
+    });
+    if (existingSessionFile !== undefined) {
+      const repaired = yield* Effect.tryPromise({
+        try: () => repairDanglingToolCalls(existingSessionFile),
+        catch: (cause) => piOpenError(request.agentId, cause),
+      });
+      if (repaired > 0) {
+        yield* Effect.logInfo("Repaired dangling tool calls before session resume").pipe(
+          Effect.annotateLogs({ agentId: request.agentId, repaired }),
+        );
+      }
+    }
+    const sessionManager =
+      existingSessionFile === undefined
+        ? SessionManager.create(options.workspacePath, agentSessionDirectory)
+        : SessionManager.open(existingSessionFile, agentSessionDirectory, options.workspacePath);
     const resourceLoader = new DefaultResourceLoader({
       cwd: options.workspacePath,
       agentDir: options.piAgentDirectory,

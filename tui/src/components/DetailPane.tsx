@@ -135,6 +135,9 @@ export const DetailPane = ({ detail, tools, selection, width, height }: DetailPa
       <text>
         <span fg={stateColor(detail.state)}>{detail.state}</span>
         <span fg={theme.faint}>{`  ${formatShortDuration(detail.durationMillis)}`}</span>
+        {detail.revivals === undefined || detail.revivals === 0 ? null : (
+          <span fg={theme.violet}>{`  revived ×${detail.revivals}`}</span>
+        )}
       </text>
       <text fg={theme.muted}>
         {truncate(

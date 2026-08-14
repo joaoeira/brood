@@ -115,8 +115,11 @@ export const App = ({ bridge }: AppProps) => {
       if (selection !== undefined) await bridge.interrupt(selection);
       return;
     }
+    // Closing is the session's ending: revivals shut, stragglers drain, and the
+    // run resolves. The dialog stays up with its spinner for the whole wait,
+    // and ctrl+c is still the escape hatch out of a drain that will not end.
     store.setQuitting(true);
-    await bridge.quit();
+    await bridge.close();
     await exitCleanly();
   }, [bridge, exitCleanly, overlay, selection]);
 
@@ -245,14 +248,14 @@ export const App = ({ bridge }: AppProps) => {
   const dialog =
     typeof overlay === "object" ? (
       <ConfirmDialog
-        title={overlay.kind === "confirm-quit" ? " QUIT " : " INTERRUPT "}
+        title={overlay.kind === "confirm-quit" ? " CLOSE " : " INTERRUPT "}
         question={
           overlay.kind === "confirm-quit"
-            ? "Quit and drain the swarm?"
+            ? "Close the session and drain the swarm?"
             : `Interrupt ${selection ?? "this agent"}?`
         }
         busy={state.quitting}
-        busyLabel="draining…"
+        busyLabel="CLOSING — draining swarm…"
       />
     ) : null;
 

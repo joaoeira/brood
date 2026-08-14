@@ -32,7 +32,10 @@ export interface BridgeHandle {
   /** Resolves to undefined on success, or a display-ready rejection message. */
   sendOperatorMessage(reference: string, body: string): Promise<string | undefined>;
   interrupt(reference: string): Promise<void>;
-  /** Requests an orderly stop and resolves once the swarm has drained. */
-  quit(): Promise<void>;
+  /**
+   * Ends the session: revivals close, stragglers drain, and this resolves once
+   * the run itself has settled. Idle until a run has started.
+   */
+  close(): Promise<void>;
   dispose(): Promise<void>;
 }

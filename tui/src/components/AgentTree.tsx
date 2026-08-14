@@ -51,9 +51,17 @@ const AgentRow = ({ row, selected, width, spinner, onSelect }: AgentRowProps) =>
     coordination !== undefined && coordination.openRequestsIncoming > 0
       ? ` ?${coordination.openRequestsIncoming}`
       : "";
+  const revivalBadge =
+    agent.revivals !== undefined && agent.revivals > 0 ? ` ${glyphs.revived}${agent.revivals}` : "";
   const tail = agent.activity ?? agent.state;
   const tailWidth =
-    width - head.length - waitSuffix.length - mailBadge.length - owesBadge.length - 2;
+    width -
+    head.length -
+    waitSuffix.length -
+    mailBadge.length -
+    owesBadge.length -
+    revivalBadge.length -
+    2;
 
   return (
     <box
@@ -70,6 +78,7 @@ const AgentRow = ({ row, selected, width, spinner, onSelect }: AgentRowProps) =>
         {waitSuffix === "" ? null : <span fg={theme.blue}>{waitSuffix}</span>}
         {mailBadge === "" ? null : <span fg={mailColor}>{mailBadge}</span>}
         {owesBadge === "" ? null : <span fg={theme.blue}>{owesBadge}</span>}
+        {revivalBadge === "" ? null : <span fg={theme.violet}>{revivalBadge}</span>}
         {tailWidth > 2 ? <span fg={theme.muted}>{`  ${truncate(tail, tailWidth)}`}</span> : null}
       </text>
     </box>

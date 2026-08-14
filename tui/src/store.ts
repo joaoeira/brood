@@ -137,6 +137,8 @@ const describeLifecycle = (
       };
     case "AgentInterruptRequested":
       return { text: `${pathOf(event.agentId)}  interrupt requested`, tone: "warn" };
+    case "AgentRevived":
+      return { text: `${pathOf(event.agentId)}  revived ×${event.revivals}`, tone: "info" };
     case "AgentStatusChanged":
       return undefined;
     case "BatchAdmitted":
@@ -286,6 +288,22 @@ export const useAppState = (): AppState => useSyncExternalStore(store.subscribe,
 
 export const unseenBulletins = (current: AppState): number =>
   current.bulletins.filter((post) => post.sequence > current.seenBulletinSequence).length;
+
+/** The root of the swarm — by path when the tree is populated, else nothing. */
+export const rootAgent = (status: SwarmStatus | undefined): StatusAgent | undefined =>
+  status === undefined
+    ? undefined
+    : (status.agents.find((agent) => agent.path === "root") ?? status.agents[0]);
+
+/**
+ * Session mode's idle state: the root has delivered, but the run is still open,
+ * so the swarm is dormant rather than over — every agent still revivable by an
+ * operator message until the operator closes.
+ */
+export const isSettled = (current: AppState): boolean =>
+  current.runOutcome === undefined &&
+  current.status?.state === "running" &&
+  rootAgent(current.status)?.state === "completed";
 
 export interface FlatAgent {
   readonly agent: StatusAgent;

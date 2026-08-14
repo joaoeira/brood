@@ -26,7 +26,7 @@ import {
   type RequestId,
 } from "../src/communication.js";
 import type { PublicModelProfile } from "../src/profiles.js";
-import { makeRegistry } from "../src/registry.js";
+import { makeRegistry, type AgentRegistry } from "../src/registry.js";
 
 const profile: PublicModelProfile = {
   name: makeProfileName("worker"),
@@ -1349,7 +1349,15 @@ it.effect(
       const worker = children[0]!;
       const doomed = children[1]!;
 
-      yield* registry.settle(doomed.id, completed(doomed.id));
+      // A failed agent is the one terminal state an operator message cannot
+      // revive; completed and interrupted agents now revive instead.
+      yield* registry.settle(doomed.id, {
+        _tag: "Failed",
+        failure: {
+          _tag: "AgentRunFailed",
+          error: new PiRunError({ agentId: doomed.id, message: "boom" }),
+        },
+      });
       const terminal = yield* Effect.flip(
         registry.deliverOperatorMessage(doomed.id, makeOperatorMessageId("opmsg_late"), "too late"),
       );
@@ -2769,5 +2777,560 @@ it.effect("advances the bulletin cursor only through whole output-limited posts"
     expect(first.posts.length).toBeLessThan(MAX_BULLETINS_PER_AUTHOR);
     expect(first.bulletin.remaining).toBe(MAX_BULLETINS_PER_AUTHOR - first.posts.length);
     expect(second.posts).toHaveLength(MAX_BULLETINS_PER_AUTHOR - first.posts.length);
+  }),
+);
+
+// ── Revival ─────────────────────────────────────────────────────────────────
+
+const runInitialTurnToCompletion = (registry: AgentRegistry, id: AgentId, summary = "done") =>
+  Effect.gen(function* () {
+    const claim = yield* registry.takePendingCommand(id);
+    yield* registry.beginRun(id, claim.token);
+    return yield* registry.finishTurn({
+      agentId: id,
+      commandToken: claim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: summary, finalMessageId: `${id}-final`, stopReason: "stop" },
+      },
+      completedResult: result(id, summary),
+    });
+  });
+
+it.effect("queues passive mail to a finished agent and delivers it after a revival", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* runInitialTurnToCompletion(registry, worker.id);
+
+    const queued = yield* registry.sendMessage(root.id, makeToolInvocationId("mail-corpse"), {
+      to: worker.path,
+      message: "for your archives",
+    });
+    const afterQueue = yield* registry.snapshot;
+    const still = afterQueue.agents.find(({ id }) => id === worker.id)!;
+
+    expect(queued).toEqual({
+      to: worker.path,
+      recipientState: "completed",
+      queuedForRevival: true,
+    });
+    expect(still.outcome?._tag).toBe("Completed");
+    expect(still.coordination.unreadMessages).toBe(1);
+    expect(afterQueue.nonterminalCount).toBe(1);
+
+    const delivery = yield* registry.deliverOperatorMessage(
+      worker.id,
+      makeOperatorMessageId("opmsg_revive"),
+      "come back",
+    );
+    const workerClaim = yield* registry.takePendingCommand(worker.id);
+    const began = yield* registry.beginRun(worker.id, workerClaim.token);
+    const read = yield* registry.readMessages(worker.id, makeToolInvocationId("read-mail"), {});
+
+    expect(delivery).toEqual({ to: worker.path, recipientState: "queued", revived: true });
+    expect(began).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "CoordinationWake",
+        revival: "completed",
+        operatorMessage: "come back",
+      },
+    });
+    expect(read.items).toEqual([
+      { kind: "message", from: root.path, message: "for your archives" },
+    ]);
+  }),
+);
+
+it.effect("urgent mail revives a completed agent for a revival-marked coordination turn", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* runInitialTurnToCompletion(registry, worker.id, "v1");
+    const firstOutcome = yield* registry.awaitOutcome(worker.id);
+
+    const sent = yield* registry.sendMessage(root.id, makeToolInvocationId("urgent-revive"), {
+      to: worker.path,
+      message: "the API changed under you",
+      urgent: true,
+    });
+    const revivedSnapshot = yield* registry.snapshot;
+    const revivedEntry = revivedSnapshot.agents.find(({ id }) => id === worker.id)!;
+
+    expect(sent).toEqual({ to: worker.path, recipientState: "queued", revived: true });
+    expect(revivedEntry.outcome).toBeUndefined();
+    expect(revivedEntry.status).toBe("Queued");
+    expect(revivedEntry.revivals).toBe(1);
+    expect(revivedSnapshot.nonterminalCount).toBe(2);
+
+    const workerClaim = yield* registry.takePendingCommand(worker.id);
+    const began = yield* registry.beginRun(worker.id, workerClaim.token);
+    expect(began).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "CoordinationWake",
+        revival: "completed",
+        notice: { unreadMessages: 1, openRequests: 0, unseenBulletins: 0 },
+      },
+    });
+
+    yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: workerClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "v2", finalMessageId: "worker-2", stopReason: "stop" },
+      },
+      completedResult: result(worker.id, "v2"),
+    });
+    const finalSnapshot = yield* registry.snapshot;
+    const finalEntry = finalSnapshot.agents.find(({ id }) => id === worker.id)!;
+
+    // Latest wins in the registry; the one-shot completion deferred keeps the
+    // outcome the first waiters actually consumed.
+    expect(finalEntry.outcome).toMatchObject({
+      _tag: "Completed",
+      result: { summary: "v2" },
+    });
+    expect(finalEntry.lastCompletedResult?.summary).toBe("v2");
+    expect(firstOutcome).toMatchObject({ _tag: "Completed", result: { summary: "v1" } });
+    expect(yield* registry.awaitOutcome(worker.id)).toMatchObject({
+      _tag: "Completed",
+      result: { summary: "v1" },
+    });
+  }),
+);
+
+it.effect("ask_agent revives a completed recipient and the reply settles the asker's wait", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* runInitialTurnToCompletion(registry, worker.id);
+
+    const details = yield* registry.askAgent(root.id, makeToolInvocationId("ask-corpse"), {
+      to: worker.path,
+      question: "where did you leave the schema?",
+    });
+    expect(details).toMatchObject({ to: worker.path, recipientState: "queued", revived: true });
+
+    const parked = yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: rootClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "RequestWait" as const,
+            tool: "ask_agent" as const,
+            invocationId: makeToolInvocationId("ask-corpse"),
+            request: details.request,
+          },
+        ],
+      },
+    });
+    expect(parked._tag).toBe("Park");
+
+    const workerClaim = yield* registry.takePendingCommand(worker.id);
+    const began = yield* registry.beginRun(worker.id, workerClaim.token);
+    expect(began).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "CoordinationWake",
+        revival: "completed",
+        notice: { openRequests: 1 },
+      },
+    });
+    yield* registry.replyToRequest(worker.id, makeToolInvocationId("reply-from-grave"), {
+      request: details.request,
+      message: "under .brood/shared/schema.md",
+    });
+
+    const resumeClaim = yield* registry.takePendingCommand(root.id);
+    const resumed = yield* registry.beginRun(root.id, resumeClaim.token);
+    expect(resumed).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "WaitSatisfied",
+        requests: [
+          {
+            _tag: "Replied",
+            request: details.request,
+            to: worker.path,
+            reply: "under .brood/shared/schema.md",
+          },
+        ],
+      },
+    });
+  }),
+);
+
+it.effect("failed agents accept queued mail but can never be revived", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* registry.settle(worker.id, {
+      _tag: "Failed",
+      failure: {
+        _tag: "AgentRunFailed",
+        error: new PiRunError({ agentId: worker.id, message: "boom" }),
+      },
+    });
+
+    const urgent = yield* Effect.flip(
+      registry.sendMessage(root.id, makeToolInvocationId("urgent-failed"), {
+        to: worker.path,
+        message: "wake up",
+        urgent: true,
+      }),
+    );
+    const asked = yield* Effect.flip(
+      registry.askAgent(root.id, makeToolInvocationId("ask-failed"), {
+        to: worker.path,
+        question: "anything?",
+      }),
+    );
+    const operator = yield* Effect.flip(
+      registry.deliverOperatorMessage(worker.id, makeOperatorMessageId("opmsg_failed"), "rise"),
+    );
+    const passive = yield* registry.sendMessage(root.id, makeToolInvocationId("mail-failed"), {
+      to: worker.path,
+      message: "post-mortem notes",
+    });
+
+    expect(urgent).toMatchObject({ _tag: "SendMessageRejected", reason: "RecipientTerminal" });
+    expect(asked).toMatchObject({ _tag: "AskAgentRejected", reason: "RecipientTerminal" });
+    expect(operator).toMatchObject({
+      _tag: "OperatorMessageRejected",
+      reason: "RecipientTerminal",
+    });
+    expect(passive).toEqual({
+      to: worker.path,
+      recipientState: "failed",
+      queuedForRevival: true,
+    });
+  }),
+);
+
+it.effect("closing revivals rejects wakes to the finished while passive mail still queues", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* runInitialTurnToCompletion(registry, worker.id);
+
+    yield* registry.closeRevivals;
+
+    const urgent = yield* Effect.flip(
+      registry.sendMessage(root.id, makeToolInvocationId("urgent-late"), {
+        to: worker.path,
+        message: "too late",
+        urgent: true,
+      }),
+    );
+    const operator = yield* Effect.flip(
+      registry.deliverOperatorMessage(worker.id, makeOperatorMessageId("opmsg_late2"), "rise"),
+    );
+    const passive = yield* registry.sendMessage(root.id, makeToolInvocationId("mail-late"), {
+      to: worker.path,
+      message: "for the record",
+    });
+
+    expect(urgent).toMatchObject({ _tag: "SendMessageRejected", reason: "RecipientTerminal" });
+    expect(urgent.message).toContain("closing");
+    expect(operator).toMatchObject({
+      _tag: "OperatorMessageRejected",
+      reason: "RecipientTerminal",
+    });
+    expect(passive).toMatchObject({ queuedForRevival: true });
+  }),
+);
+
+it.effect("stale-generation settles are fenced off a revived entry", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "work", profile }],
+      wait: "none",
+    })).children[0]!;
+    yield* runInitialTurnToCompletion(registry, worker.id);
+    yield* registry.sendMessage(root.id, makeToolInvocationId("urgent-revive"), {
+      to: worker.path,
+      message: "come back",
+      urgent: true,
+    });
+
+    // The old controller's teardown settle carries generation 0; the revived
+    // entry is on generation 1 and must be untouched.
+    const stale = yield* registry.settle(worker.id, completed(worker.id, "stale"), 0);
+    const afterStale = yield* registry.snapshot;
+    expect(Option.isNone(stale)).toBe(true);
+    expect(afterStale.agents.find(({ id }) => id === worker.id)?.outcome).toBeUndefined();
+
+    const current = yield* registry.settle(worker.id, completed(worker.id, "fresh"), 1);
+    expect(Option.isSome(current)).toBe(true);
+    const afterCurrent = yield* registry.snapshot;
+    expect(afterCurrent.agents.find(({ id }) => id === worker.id)?.outcome).toMatchObject({
+      _tag: "Completed",
+      result: { summary: "fresh" },
+    });
+  }),
+);
+
+it.effect("an interrupt during the initial turn reinstates the goal for revival", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 2, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const worker = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-worker"),
+      children: [{ name: makeAgentName("worker"), goal: "build the parser", profile }],
+      wait: "none",
+    })).children[0]!;
+
+    // The worker begins its initial turn (consuming the goal) and dies mid-run.
+    const workerClaim = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, workerClaim.token);
+    yield* registry.settle(worker.id, {
+      _tag: "Interrupted",
+      reason: { _tag: "OperatorRequested", source: "api" },
+    });
+
+    const sent = yield* registry.sendMessage(root.id, makeToolInvocationId("urgent-revive"), {
+      to: worker.path,
+      message: "priorities changed: parse TOML too",
+      urgent: true,
+    });
+    expect(sent).toMatchObject({ revived: true });
+
+    const revivedClaim = yield* registry.takePendingCommand(worker.id);
+    const began = yield* registry.beginRun(worker.id, revivedClaim.token);
+    expect(began).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "InitialGoal",
+        goal: "build the parser",
+        revival: "interrupted",
+        notice: { unreadMessages: 1 },
+      },
+    });
+  }),
+);
+
+it.effect("a fully settled swarm stays delegable: a revived root can recruit again", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 3, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    yield* runInitialTurnToCompletion(registry, root.id, "initial answer");
+    const quiescent = yield* registry.snapshot;
+    expect(quiescent.nonterminalCount).toBe(0);
+    expect(quiescent.accepting).toBe(true);
+    expect(quiescent.revivalsOpen).toBe(true);
+
+    const delivery = yield* registry.deliverOperatorMessage(
+      root.id,
+      makeOperatorMessageId("opmsg_followup"),
+      "now also document the API",
+    );
+    expect(delivery).toMatchObject({ revived: true });
+
+    const claim = yield* registry.takePendingCommand(root.id);
+    const began = yield* registry.beginRun(root.id, claim.token);
+    expect(began).toMatchObject({
+      _tag: "Ready",
+      command: {
+        _tag: "CoordinationWake",
+        revival: "completed",
+        operatorMessage: "now also document the API",
+      },
+    });
+
+    const admitted = yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-followup"),
+      children: [{ name: makeAgentName("docs"), goal: "document the API", profile }],
+      wait: "none",
+    });
+    expect(admitted.capacityAfterCommit).toEqual({ limit: 3, used: 2, remaining: 1 });
+  }),
+);
+
+it.effect("waits are one-shot: a revived child's second completion never re-notifies", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({ maxAgentAdmissions: 4, ...deterministicIds() });
+    const root = yield* registry.registerRoot({
+      name: makeAgentName("root"),
+      goal: "coordinate",
+      profile,
+    });
+    const rootClaim = yield* registry.takePendingCommand(root.id);
+    yield* registry.beginRun(root.id, rootClaim.token);
+    const children = (yield* registry.registerBatch({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("delegate-crew"),
+      children: [
+        { name: makeAgentName("worker"), goal: "work", profile },
+        { name: makeAgentName("helper"), goal: "help", profile },
+        { name: makeAgentName("courier"), goal: "carry", profile },
+      ],
+      wait: "none",
+    })).children;
+    const worker = children[0]!;
+    const courier = children[2]!;
+
+    // Root parks on the worker, consumes its result, then parks on the helper.
+    yield* registry.planWait({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("wait-worker"),
+      childNames: [makeAgentName("worker")],
+    });
+    yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: rootClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait" as const,
+            tool: "wait_for_agents" as const,
+            invocationId: makeToolInvocationId("wait-worker"),
+          },
+        ],
+      },
+    });
+    yield* runInitialTurnToCompletion(registry, worker.id, "v1");
+    const resumeClaim = yield* registry.takePendingCommand(root.id);
+    const resumed = yield* registry.beginRun(root.id, resumeClaim.token);
+    expect(resumed).toMatchObject({
+      _tag: "Ready",
+      command: { _tag: "WaitSatisfied", dependencies: [{ _tag: "Completed" }] },
+    });
+    yield* registry.planWait({
+      parentId: root.id,
+      invocationId: makeToolInvocationId("wait-helper"),
+      childNames: [makeAgentName("helper")],
+    });
+    yield* registry.finishTurn({
+      agentId: root.id,
+      commandToken: resumeClaim.token,
+      piOutcome: {
+        _tag: "Suspended",
+        markers: [
+          {
+            _tag: "AgentWait" as const,
+            tool: "wait_for_agents" as const,
+            invocationId: makeToolInvocationId("wait-helper"),
+          },
+        ],
+      },
+    });
+
+    // The courier revives the worker; its second completion must not wake the
+    // root, which is waiting on the helper alone.
+    const courierClaim = yield* registry.takePendingCommand(courier.id);
+    yield* registry.beginRun(courier.id, courierClaim.token);
+    yield* registry.sendMessage(courier.id, makeToolInvocationId("revive-worker"), {
+      to: worker.path,
+      message: "one more thing",
+      urgent: true,
+    });
+    const workerClaim = yield* registry.takePendingCommand(worker.id);
+    yield* registry.beginRun(worker.id, workerClaim.token);
+    yield* registry.finishTurn({
+      agentId: worker.id,
+      commandToken: workerClaim.token,
+      piOutcome: {
+        _tag: "Completed",
+        result: { finalText: "v2", finalMessageId: "worker-2", stopReason: "stop" },
+      },
+      completedResult: result(worker.id, "v2"),
+    });
+
+    const snapshot = yield* registry.snapshot;
+    const rootEntry = snapshot.agents.find(({ id }) => id === root.id)!;
+    expect(rootEntry.status).toBe("Waiting");
+    expect(rootEntry.hasPendingCommand).toBe(false);
+    expect(snapshot.agents.find(({ id }) => id === worker.id)?.outcome).toMatchObject({
+      _tag: "Completed",
+      result: { summary: "v2" },
+    });
   }),
 );

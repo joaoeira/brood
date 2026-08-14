@@ -1,10 +1,10 @@
 // Plain Vitest is intentional: these tests open real offline Pi sessions and session files.
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { defineTool, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { defineTool, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Cause, Effect, Exit, Fiber, Stream } from "effect";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -18,7 +18,13 @@ import {
 import { makeAgentPath, makeRequestId } from "../src/communication.js";
 import { makeCommunicationTools, type CommunicationToolPort } from "../src/communication-tools.js";
 import { compileProfileCatalogue, type ProfileCatalogue } from "../src/profiles.js";
-import { inspectControlToolResults, makePiAdapter, type PiAdapter } from "../src/pi-adapter.js";
+import {
+  findLatestSessionFile,
+  inspectControlToolResults,
+  makePiAdapter,
+  repairDanglingToolCalls,
+  type PiAdapter,
+} from "../src/pi-adapter.js";
 import { compileAgentToolFactory, type ControlToolPort } from "../src/tools.js";
 
 const agentId = makeAgentId("agent_adapter");
@@ -714,5 +720,176 @@ describe("Pi control-result inspection", () => {
         });
       },
     );
+  });
+});
+
+describe("Session resume and repair", () => {
+  it("reopens the same session file on a second open and replays the first life's context", async () => {
+    const faux = fauxProvider({
+      provider: "scripted-resume",
+      models: [{ id: "scripted-small" }],
+    });
+    let secondLifeContextMessages: number | undefined;
+    faux.setResponses([
+      () => fauxAssistantMessage("first life answer", { stopReason: "stop", responseId: "r1" }),
+      (context) => {
+        secondLifeContextMessages = context.messages.length;
+        return fauxAssistantMessage("second life answer", { stopReason: "stop", responseId: "r2" });
+      },
+    ]);
+    await withOfflinePiAdapter(
+      {
+        prefix: "brood-pi-resume-",
+        provider: faux,
+        providerName: "scripted-resume",
+        modelId: "scripted-small",
+        thinkingLevel: "off",
+      },
+      async ({ adapter, catalogue, directory }) => {
+        const openAndRun = (prompt: string) =>
+          Effect.runPromise(
+            Effect.scoped(
+              Effect.gen(function* () {
+                const agent = yield* adapter.open({
+                  agentId,
+                  profile: catalogue.defaultProfile,
+                  tools: compileAgentToolFactory(catalogue).forCaller(agentId, unusedPort),
+                  systemPrompt: "Brood resume test",
+                });
+                const outcome = yield* agent.run(prompt);
+                return { outcome, sessionId: agent.sessionId };
+              }),
+            ),
+          );
+
+        const sessionDirectory = join(directory, "state", "sessions", agentId);
+        const first = await openAndRun("do the work");
+        const afterFirst = await readdir(sessionDirectory);
+        const second = await openAndRun("you are revived");
+        const afterSecond = await readdir(sessionDirectory);
+
+        // One file, one identity, both lives on it.
+        expect(afterFirst.filter((name) => name.endsWith(".jsonl"))).toHaveLength(1);
+        expect(afterSecond).toEqual(afterFirst);
+        expect(second.sessionId).toBe(first.sessionId);
+        expect(first.outcome._tag).toBe("Completed");
+        expect(second.outcome._tag).toBe("Completed");
+        // The second life's model call saw the first conversation: first
+        // prompt, first answer, and the revival prompt at minimum.
+        expect(secondLifeContextMessages ?? 0).toBeGreaterThanOrEqual(3);
+        const raw = await readFile(join(sessionDirectory, afterFirst[0]!), "utf8");
+        expect(raw).toContain("first life answer");
+        expect(raw).toContain("second life answer");
+      },
+    );
+  });
+
+  it("appends synthetic aborted results for dangling tool calls, chained onto the entry tree", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "brood-shim-"));
+    try {
+      expect(await findLatestSessionFile(directory)).toBeUndefined();
+
+      const file = join(directory, "2026-08-14T00-00-00-000Z_shim.jsonl");
+      const usage = {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      };
+      const entries = [
+        {
+          type: "session",
+          version: 3,
+          id: "shimsess",
+          timestamp: "2026-08-14T00:00:00.000Z",
+          cwd: directory,
+        },
+        {
+          type: "message",
+          id: "aaaa0001",
+          parentId: null,
+          timestamp: "2026-08-14T00:00:01.000Z",
+          message: { role: "user", content: "go", timestamp: 1 },
+        },
+        {
+          type: "message",
+          id: "aaaa0002",
+          parentId: "aaaa0001",
+          timestamp: "2026-08-14T00:00:02.000Z",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "text", text: "running the batch" },
+              { type: "toolCall", id: "call_a", name: "read", arguments: {} },
+              { type: "toolCall", id: "call_b", name: "write", arguments: {} },
+              { type: "toolCall", id: "call_c", name: "bash", arguments: {} },
+            ],
+            api: "faux",
+            provider: "scripted",
+            model: "scripted-small",
+            usage,
+            stopReason: "toolUse",
+            timestamp: 2,
+          },
+        },
+        {
+          type: "message",
+          id: "aaaa0003",
+          parentId: "aaaa0002",
+          timestamp: "2026-08-14T00:00:03.000Z",
+          message: {
+            role: "toolResult",
+            toolCallId: "call_a",
+            toolName: "read",
+            content: [{ type: "text", text: "ok" }],
+            isError: false,
+            timestamp: 3,
+          },
+        },
+      ];
+      await writeFile(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+      expect(await findLatestSessionFile(directory)).toBe(file);
+      const repaired = await repairDanglingToolCalls(file);
+      expect(repaired).toBe(2);
+
+      const lines = (await readFile(file, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines).toHaveLength(6);
+      const [syntheticB, syntheticC] = lines.slice(4) as Array<{
+        id: string;
+        parentId: string;
+        message: Record<string, unknown>;
+      }>;
+      expect(syntheticB!.message).toMatchObject({
+        role: "toolResult",
+        toolCallId: "call_b",
+        toolName: "write",
+        isError: true,
+      });
+      expect(syntheticC!.message).toMatchObject({
+        role: "toolResult",
+        toolCallId: "call_c",
+        toolName: "bash",
+        isError: true,
+      });
+      expect(syntheticB!.parentId).toBe("aaaa0003");
+      expect(syntheticC!.parentId).toBe(syntheticB!.id);
+
+      // Idempotent: a second pass finds nothing dangling.
+      expect(await repairDanglingToolCalls(file)).toBe(0);
+
+      // And Pi itself can load the repaired file into a balanced context.
+      const manager = SessionManager.open(file, directory);
+      const context = manager.buildSessionContext();
+      const toolResults = context.messages.filter((message) => message.role === "toolResult");
+      expect(toolResults).toHaveLength(3);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

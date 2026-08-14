@@ -169,7 +169,10 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
       if (runPromise !== undefined) return;
       store.note(`run started — ${goal}`, "info");
       const request = instructions === undefined ? { goal } : { goal, instructions };
-      runPromise = Effect.runPromiseExit(quiet(application.run(request)))
+      // Session mode: the root finishing settles the swarm rather than ending
+      // the run, so the operator can still message — and so revive — agents
+      // until they close the session themselves.
+      runPromise = Effect.runPromiseExit(quiet(application.run(request, { session: true })))
         .then((exit) => {
           runSettled = true;
           reportFailure(exit);
@@ -226,12 +229,18 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
       }
     },
 
-    quit: async () => {
-      if (runPromise === undefined || runSettled) return;
-      try {
-        await Effect.runPromise(quiet(application.controller.interrupt("root", "api")));
-      } catch {
-        // Root may already be terminal; draining still has to be awaited.
+    close: async () => {
+      if (runPromise === undefined) return;
+      if (!runSettled) {
+        try {
+          // A root still working is stopped rather than waited out: the drain
+          // that follows the close would otherwise sit on its full timeout.
+          // Settled roots already hold an outcome, so this is a no-op for them.
+          await Effect.runPromise(quiet(application.controller.interrupt("root", "api")));
+        } catch {
+          // An unknown root is not a reason to skip the close below.
+        }
+        await Effect.runPromise(quiet(application.controller.close));
       }
       await runPromise;
     },

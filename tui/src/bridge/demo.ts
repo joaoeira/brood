@@ -15,6 +15,7 @@ import type { BridgeHandle, ConfigSummary } from "./types";
 
 const TICK_MILLIS = 200;
 const DRAIN_MILLIS = 900;
+const REVIVAL_MILLIS = 2_600;
 
 /**
  * Brood's ids, names, and profile names are branded at the schema boundary.
@@ -39,6 +40,7 @@ interface DemoAgent {
   readonly profile: Profile;
   outcome?: Outcome | undefined;
   coordination?: StatusAgent["coordination"] | undefined;
+  revivals?: number | undefined;
 }
 
 interface DemoTrafficRecord {
@@ -334,6 +336,35 @@ export const createDemoBridge = (): BridgeHandle => {
     emit({ type: "AgentSettled", agentId: brand(id), status });
   };
 
+  /**
+   * An operator message to a finished agent brings it back: the demo mirrors
+   * the real thing by clearing the outcome, counting the revival, and letting
+   * the agent work for a beat before it settles again.
+   */
+  const revive = (id: string): void => {
+    const agent = agents.get(id);
+    if (agent === undefined) return;
+    const revivals = (agent.revivals ?? 0) + 1;
+    update(id, {
+      state: "running",
+      revivals,
+      terminalAt: undefined,
+      outcome: undefined,
+      activity: "reading the operator message",
+    });
+    emit({ type: "AgentRevived", agentId: brand(id), revivals });
+    publishStatus();
+    setTimeout(() => {
+      if (agents.get(id)?.state !== "running") return;
+      settle(
+        id,
+        "Completed",
+        completed(id, `Picked the thread back up on the operator's steer (revival ${revivals}).`),
+      );
+      publishStatus();
+    }, REVIVAL_MILLIS);
+  };
+
   const completed = (id: string, summary: string): Outcome => ({
     _tag: "Completed",
     agentId: brand(id),
@@ -354,6 +385,7 @@ export const createDemoBridge = (): BridgeHandle => {
     durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
     ...(agent.activity === undefined ? {} : { activity: agent.activity }),
     ...(agent.coordination === undefined ? {} : { coordination: agent.coordination }),
+    ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
     waitTargets: agent.waitTargets.map(pathOf),
     children: children.map((child) => statusAgent(child, childrenOf(child.id))),
   });
@@ -705,23 +737,9 @@ export const createDemoBridge = (): BridgeHandle => {
             "The read API ships; the schema track does not.\nGET /changelog and GET /changelog/:id are implemented and tested.\nThe schema agent failed on a wire-format disagreement about the cursor field, which needs an operator decision before a second attempt.",
           ),
         );
-        lifecycle = "draining";
-        emit({ type: "DrainStarted" });
-      },
-    },
-    {
-      at: 16_600,
-      run: () => {
-        emit({
-          type: "DrainCompleted",
-          report: { timedOut: false, interruptedAgentIds: [], terminalAgentCount: agents.size },
-        });
-        lifecycle = "completed";
-        finishedAt = now();
-        store.setRunOutcome({
-          kind: "completed",
-          text: "The read API ships; the schema track needs a wire-format decision first.",
-        });
+        // Session mode: a finished root settles the swarm instead of ending
+        // the run. Nothing drains until the operator closes, and every
+        // completed agent stays revivable by an operator message.
         stopTimeline();
       },
     },
@@ -799,6 +817,9 @@ export const createDemoBridge = (): BridgeHandle => {
         updatedAt: now(),
         ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
         ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
+        ...(agent.revivals === undefined || agent.revivals === 0
+          ? {}
+          : { revivals: agent.revivals }),
       });
     },
 
@@ -815,11 +836,15 @@ export const createDemoBridge = (): BridgeHandle => {
         (candidate) => candidate.id === reference || pathOf(candidate.id) === reference,
       );
       if (agent === undefined) return `No agent is known at ${reference}.`;
-      if (agent.terminalAt !== undefined) {
-        return `${pathOf(agent.id)} is terminal and cannot read new messages.`;
+      if (agent.state === "failed") {
+        return `${pathOf(agent.id)} failed and cannot be revived.`;
+      }
+      if (lifecycle !== "running") {
+        return `The swarm is ${lifecycle === "not_started" ? "not running" : "closing"}.`;
       }
       if (body.trim() === "") return "Operator messages must be nonblank.";
       emit({ type: "OperatorMessageAccepted", toId: brand(agent.id) });
+      if (agent.terminalAt !== undefined) revive(agent.id);
       const record = pushTraffic({
         kind: "operator",
         from: "operator",
@@ -854,7 +879,7 @@ export const createDemoBridge = (): BridgeHandle => {
       publishStatus();
     },
 
-    quit: async () => {
+    close: async () => {
       stopTimeline();
       if (startedAt === undefined || lifecycle === "completed") return;
       lifecycle = "draining";
@@ -876,6 +901,14 @@ export const createDemoBridge = (): BridgeHandle => {
         type: "DrainCompleted",
         report: { timedOut: false, interruptedAgentIds: [], terminalAgentCount: agents.size },
       });
+      // The run resolves with the root's latest delivered result, exactly as
+      // session mode does when the operator closes a live swarm.
+      const root = agents.get("agt_root");
+      store.setRunOutcome(
+        root?.outcome?._tag === "Completed"
+          ? { kind: "completed", text: root.outcome.result.summary.split("\n")[0] ?? "" }
+          : { kind: "interrupted", text: "the session was closed before the root finished" },
+      );
       publishStatus();
     },
 

@@ -9,11 +9,15 @@ export interface StatusBarProps {
   readonly status: SwarmStatus | undefined;
   readonly workspacePath: string;
   readonly mode: "live" | "demo";
+  /** Session mode idling: the run is still open, but nothing is working. */
+  readonly settled: boolean;
   readonly width: number;
 }
 
-export const StatusBar = ({ status, workspacePath, mode, width }: StatusBarProps) => {
-  const state = status?.state ?? "not_started";
+export const StatusBar = ({ status, workspacePath, mode, settled, width }: StatusBarProps) => {
+  // A settled swarm is still "running" to the supervisor — the run has not
+  // ended — but reading that as work in progress would be a lie on screen.
+  const state = settled ? "settled" : (status?.state ?? "not_started");
   const capacity =
     status === undefined
       ? "runs 0/0 · admissions 0/0"

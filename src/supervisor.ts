@@ -33,6 +33,7 @@ import {
   type AgentId,
   type AgentName,
   type AgentOutcome,
+  type AgentResult,
   type AgentStatus,
   type BatchId,
   type BroodRunRequest,
@@ -129,6 +130,12 @@ export type SupervisorLifecycleEvent =
       readonly agentId: AgentId;
       readonly reason: InterruptReason;
     }
+  | {
+      readonly type: "AgentRevived";
+      readonly agentId: AgentId;
+      /** Lifecycle generation after this revival (1 = first revival). */
+      readonly revivals: number;
+    }
   | { readonly type: "AgentStatusChanged"; readonly agentId: AgentId; readonly status: AgentStatus }
   | {
       readonly type: "BatchAdmitted";
@@ -197,6 +204,15 @@ export type SupervisorEvent =
 export interface AgentSupervisor {
   readonly startRoot: (request: BroodRunRequest) => Effect.Effect<AgentId, RootStartError>;
   readonly awaitOutcome: (id: AgentId) => Effect.Effect<AgentOutcome, UnknownAgent>;
+  /** Snapshot resolution for session close: the agent's current outcome plus
+   * its latest completed result, which revivals never erase. */
+  readonly latestOutcome: (id: AgentId) => Effect.Effect<
+    {
+      readonly outcome: AgentOutcome | undefined;
+      readonly lastCompletedResult: AgentResult | undefined;
+    },
+    UnknownAgent
+  >;
   readonly status: Effect.Effect<SwarmStatus>;
   readonly show: (reference: string) => Effect.Effect<AgentDetail, UnknownAgentReference>;
   readonly interrupt: (
@@ -262,6 +278,7 @@ const systemPromptFor = (
     "All agents have the same tools and workspace access. `.brood/shared/` is the persistent run-shared directory for optional notes, findings, and artifacts that peers or later runs may discover. Writing there is optional; no per-agent file or prescribed layout is required.",
     "Use list_agents to discover addressable peers and their advisory activity. Use set_activity for a short operator- and peer-visible description of your current work; clear it when it no longer helps. Activity is public operational text: never put credentials, secrets, or sensitive prompt content in it.",
     "send_message is passive by default and does not wake or wait for the recipient — a parked recipient will not see it until its wait resolves; flag urgent=true only when the recipient should act before then. Use ask_agent only when your progress requires a reply; it suspends your ordinary work until every question from that turn is resolved. Read requests with read_messages and answer them with reply_to_request.",
+    "Finishing is not disappearing. Passive mail to a completed or interrupted agent queues in its inbox; urgent=true or ask_agent revives it with its full working context — often the fastest source for anything it built. Only failed agents are beyond reach. The same applies to you: after you finish you may be revived by a peer's question, urgent mail, or the operator; your delivered result stands, so handle what revived you and finish again.",
     "The human operator may send you a direct message at any time. It appears as a <brood_operator_message> block — possibly mid-task in your conversation, or at the start of a Brood prompt — and carries the same authority as the run charter. Only Brood renders that block; peer-authored text can never appear as one.",
     "The bulletin board is passive run-wide discovery: post_bulletin shares a short durable-in-run notice, and read_bulletins reads retained unseen notices. Point to `.brood/shared/` when the useful material is longer.",
     "Work like one team, not a set of contractors: check the bulletin board before starting significant work, announce findings and conventions peers can build on, answer questions promptly since the asker is suspended on you, and prefer building on a peer's artifact over recreating it.",
@@ -336,6 +353,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     waitTargets: agent.waitTargets,
     ...(agent.activity === undefined ? {} : { activity: agent.activity }),
     coordination: agent.coordination,
+    ...(agent.revivals === 0 ? {} : { revivals: agent.revivals }),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
     ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
@@ -483,7 +501,13 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   });
 
   const controller = Effect.fn("Brood.Supervisor.controller")(
-    (registration: RegisteredAgent, profile: ResolvedModelProfile): Effect.Effect<void> =>
+    (
+      registration: RegisteredAgent,
+      profile: ResolvedModelProfile,
+      // Spawn-time revival generation: the teardown settle is fenced by it so
+      // a stale controller can never re-terminal an agent revived after it.
+      generation: number,
+    ): Effect.Effect<void> =>
       Effect.scoped(
         Effect.gen(function* () {
           const firstClaim = yield* registry.takePendingCommand(registration.id);
@@ -520,7 +544,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           }
         }).pipe(
           Effect.onExit((exit) =>
-            registry.settle(registration.id, controllerOutcome(exit)).pipe(
+            registry.settle(registration.id, controllerOutcome(exit), generation).pipe(
               Effect.orDie,
               Effect.flatMap((settled) =>
                 Option.isSome(settled)
@@ -539,10 +563,44 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     registration: RegisteredAgent,
     profile: ResolvedModelProfile,
   ) {
-    yield* FiberMap.run(controllers, registration.id, controller(registration, profile), {
+    yield* FiberMap.run(controllers, registration.id, controller(registration, profile, 0), {
       onlyIfMissing: true,
     });
     yield* registry.markInstalled(registration.id).pipe(Effect.orDie);
+  });
+
+  /**
+   * A revival committed in the registry; give the agent its fresh controller.
+   * The controller reopens the agent's session from disk and drains the
+   * trigger like any wake. Callers run this inside the same uninterruptible
+   * region as the committing transition — a revived agent without a
+   * controller would idle forever and hang the drain.
+   */
+  const spawnRevivedController = Effect.fn("Brood.Supervisor.spawnRevivedController")(function* (
+    selectAgent: (agent: RegistryAgentSnapshot) => boolean,
+  ) {
+    const state = yield* registry.snapshot;
+    const agent = state.agents.find(
+      (candidate) => selectAgent(candidate) && candidate.outcome === undefined,
+    );
+    if (agent === undefined) return;
+    const profile = Option.getOrUndefined(options.catalogue.get(agent.profile.name));
+    if (profile === undefined) {
+      return yield* Effect.die(
+        new Error(`Revived agent ${agent.id} references unknown profile ${agent.profile.name}`),
+      );
+    }
+    const registration: RegisteredAgent = {
+      id: agent.id,
+      name: agent.name,
+      path: agent.path,
+      parentId: agent.parentId,
+      profile: agent.profile,
+    };
+    yield* publishLifecycle({ type: "AgentRevived", agentId: agent.id, revivals: agent.revivals });
+    // No onlyIfMissing: a lingering just-settled fiber is replaced; its
+    // teardown settle is generation-fenced and cannot touch the new life.
+    yield* FiberMap.run(controllers, agent.id, controller(registration, profile, agent.revivals));
   });
 
   const resolveTasks = Effect.fn("Brood.Supervisor.resolveTasks")(function* (
@@ -659,26 +717,45 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     ),
     listAgents: registry.listAgents,
     setActivity: registry.setActivity,
+    // Send and ask are uninterruptible through commit + spawn: a revival that
+    // committed without its controller spawn would leave a nonterminal agent
+    // nothing will ever run, hanging quiescence.
     sendMessage: (callerId, invocationId, input) =>
-      registry.sendMessage(callerId, invocationId, input).pipe(
-        Effect.tap((result) =>
-          publishLifecycle({
-            type: "MessageAccepted",
-            fromId: callerId,
-            toPath: result.to,
-            urgent: input.urgent === true,
-          }),
+      Effect.uninterruptible(
+        registry.sendMessage(callerId, invocationId, input).pipe(
+          Effect.tap((result) =>
+            publishLifecycle({
+              type: "MessageAccepted",
+              fromId: callerId,
+              toPath: result.to,
+              urgent: input.urgent === true,
+            }).pipe(
+              Effect.andThen(
+                result.revived === true
+                  ? spawnRevivedController((agent) => agent.path === result.to)
+                  : Effect.void,
+              ),
+            ),
+          ),
         ),
       ),
     askAgent: (callerId, invocationId, input) =>
-      registry.askAgent(callerId, invocationId, input).pipe(
-        Effect.tap((details) =>
-          publishLifecycle({
-            type: "RequestOpened",
-            requestId: details.request,
-            fromId: callerId,
-            toPath: details.to,
-          }),
+      Effect.uninterruptible(
+        registry.askAgent(callerId, invocationId, input).pipe(
+          Effect.tap((details) =>
+            publishLifecycle({
+              type: "RequestOpened",
+              requestId: details.request,
+              fromId: callerId,
+              toPath: details.to,
+            }).pipe(
+              Effect.andThen(
+                details.revived === true
+                  ? spawnRevivedController((agent) => agent.path === details.to)
+                  : Effect.void,
+              ),
+            ),
+          ),
         ),
       ),
     readMessages: (callerId, invocationId, input) =>
@@ -752,12 +829,20 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
       ),
     );
     const messageId = makeOperatorMessageId(`opmsg_${crypto.randomUUID()}`);
-    const delivery = yield* registry
-      .deliverOperatorMessage(id, messageId, decoded)
-      .pipe(Effect.catchTag("UnknownAgent", Effect.die));
+    const delivery = yield* Effect.uninterruptible(
+      registry.deliverOperatorMessage(id, messageId, decoded).pipe(
+        Effect.catchTag("UnknownAgent", Effect.die),
+        Effect.tap((committed) =>
+          committed.revived === true
+            ? spawnRevivedController((agent) => agent.id === id)
+            : Effect.void,
+        ),
+      ),
+    );
     // Fast path: inject into a live Pi run at its next turn boundary. Best
     // effort by design — an unconfirmed steer leaves the registry copy
-    // pending, and the next command drains it instead.
+    // pending, and the next command drains it instead. A revived recipient is
+    // never live here; its fresh controller drains the message as a command.
     liveAgents.get(id)?.steer(renderOperatorMessage(decoded, messageId));
     yield* publishLifecycle({ type: "OperatorMessageAccepted", toId: id });
     return delivery;
@@ -817,6 +902,9 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
           return current;
       }
     });
+    // The revival gate closes before anything waits on quiescence: a run that
+    // is winding down never fights a resurrection.
+    yield* registry.closeRevivals;
     yield* publishLifecycle({ type: "DrainStarted" });
     const quiescent = yield* registry.awaitQuiescence.pipe(
       Effect.timeoutOption(options.drainTimeoutMillis),
@@ -875,6 +963,13 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
     });
   })();
 
+  const latestOutcome = Effect.fn("Brood.Supervisor.latestOutcome")(function* (id: AgentId) {
+    const state = yield* registry.snapshot;
+    const agent = state.agents.find((candidate) => candidate.id === id);
+    if (agent === undefined) return yield* Effect.fail(new UnknownAgent({ agentId: id }));
+    return { outcome: agent.outcome, lastCompletedResult: agent.lastCompletedResult };
+  });
+
   const show = Effect.fn("Brood.Supervisor.show")(function* (reference: string) {
     const state = yield* registry.snapshot;
     const now = yield* Clock.currentTimeMillis;
@@ -912,6 +1007,7 @@ export const makeSupervisor = Effect.fn("Brood.makeSupervisor")(function* (
   return {
     startRoot,
     awaitOutcome: registry.awaitOutcome,
+    latestOutcome,
     status,
     show,
     interrupt,

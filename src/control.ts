@@ -48,6 +48,12 @@ export const CoordinationNotice = Schema.Struct({
 });
 export interface CoordinationNotice extends Schema.Schema.Type<typeof CoordinationNotice> {}
 
+/** Present on the first command after a revival: the terminal state the agent
+ * was brought back from. The renderer uses it to explain why a conversation
+ * that already ended is receiving another prompt. */
+export const RevivalContext = Schema.Literals(["completed", "interrupted"]);
+export type RevivalContext = typeof RevivalContext.Type;
+
 // `operatorMessage` is one normalized operator-authored body drained from the
 // registry: at most one per command, so the resume budget can always reserve
 // space for it whole. Remaining pending messages trigger further commands.
@@ -56,6 +62,7 @@ export const AgentCommand = Schema.TaggedUnion({
     goal: Schema.String,
     operatorMessage: Schema.optionalKey(Schema.String),
     notice: Schema.optionalKey(CoordinationNotice),
+    revival: Schema.optionalKey(RevivalContext),
   },
   WaitSatisfied: {
     waitId: WaitId,
@@ -63,11 +70,13 @@ export const AgentCommand = Schema.TaggedUnion({
     requests: Schema.Array(PeerRequestOutcome),
     operatorMessage: Schema.optionalKey(Schema.String),
     notice: Schema.optionalKey(CoordinationNotice),
+    revival: Schema.optionalKey(RevivalContext),
   },
   CoordinationWake: {
     notice: CoordinationNotice,
     waitingFor: AgentWaitCounts,
     operatorMessage: Schema.optionalKey(Schema.String),
+    revival: Schema.optionalKey(RevivalContext),
   },
 });
 export type AgentCommand = typeof AgentCommand.Type;

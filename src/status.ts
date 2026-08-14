@@ -47,6 +47,8 @@ export interface StatusAgent {
   readonly waitTargets: ReadonlyArray<string>;
   /** Present only when at least one count is nonzero. Counts, never bodies. */
   readonly coordination?: CoordinationCounts;
+  /** Present only when the agent has been revived at least once. */
+  readonly revivals?: number;
   readonly children: ReadonlyArray<StatusAgent>;
 }
 
@@ -58,6 +60,7 @@ export const StatusAgent = Schema.Struct({
   activity: Schema.optionalKey(AgentActivity),
   waitTargets: Schema.Array(Schema.String),
   coordination: Schema.optionalKey(CoordinationCounts),
+  revivals: Schema.optionalKey(Schema.Natural),
   children: Schema.Array(Schema.suspend((): Schema.Codec<StatusAgent> => StatusAgent)),
 });
 
@@ -104,6 +107,7 @@ export const AgentDetail = Schema.Struct({
   updatedAt: Schema.Number,
   terminalAt: Schema.optionalKey(Schema.Number),
   outcome: Schema.optionalKey(DependencyOutcome),
+  revivals: Schema.optionalKey(Schema.Natural),
 });
 export interface AgentDetail extends Schema.Schema.Type<typeof AgentDetail> {}
 
@@ -123,6 +127,7 @@ export interface StatusAgentSource {
   readonly activity?: AgentActivityType;
   readonly coordination?: CoordinationCounts;
   readonly outcome?: DependencyOutcome;
+  readonly revivals?: number;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly terminalAt?: number;
@@ -243,6 +248,7 @@ const statusTree = (
       durationMillis: Math.max(0, (agent.terminalAt ?? now) - agent.createdAt),
       ...(agent.activity === undefined ? {} : { activity: agent.activity }),
       ...(coordination === undefined ? {} : { coordination }),
+      ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
       waitTargets: agent.waitTargets.map((targetId) => {
         const target = indexed.get(targetId);
         if (target === undefined) {
@@ -331,6 +337,7 @@ export const buildAgentDetail = (
     updatedAt: agent.updatedAt,
     ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
     ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
+    ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
   };
 };
 
@@ -374,7 +381,8 @@ const renderStatusAgent = (
   const waitSuffix = agent.waitTargets.length === 0 ? "" : `  → ${agent.waitTargets.join(", ")}`;
   const coordinationSuffix =
     agent.coordination === undefined ? "" : `  [${formatCoordination(agent.coordination)}]`;
-  const line = `${prefix}${connector}${agent.path}  ${agent.state}  ${formatDuration(agent.durationMillis)}${waitSuffix}${coordinationSuffix}`;
+  const revivalSuffix = agent.revivals === undefined ? "" : `  ↻${agent.revivals}`;
+  const line = `${prefix}${connector}${agent.path}  ${agent.state}  ${formatDuration(agent.durationMillis)}${revivalSuffix}${waitSuffix}${coordinationSuffix}`;
   const childPrefix = connector === "" ? prefix : `${prefix}${isLast ? "   " : "│  "}`;
   return [
     line,
@@ -419,6 +427,7 @@ export const formatAgentDetail = (detail: AgentDetail): string => {
   if (detail.coordination !== undefined) {
     lines.push(`Comms ${formatCoordination(detail.coordination)}`);
   }
+  if (detail.revivals !== undefined) lines.push(`Revived ${detail.revivals}×`);
   if (detail.terminalAt !== undefined) lines.push(`Finished ${formatTimestamp(detail.terminalAt)}`);
   if (detail.waitTargets.length > 0) lines.push(`Waiting on ${detail.waitTargets.join(", ")}`);
   if (detail.children.length > 0) lines.push(`Children ${detail.children.join(", ")}`);

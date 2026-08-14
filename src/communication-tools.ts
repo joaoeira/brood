@@ -267,7 +267,7 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
     name: "send_message",
     label: "Send message",
     description:
-      "Hand a specific peer something that helps their work: a result they are building on, a warning that your findings change their assumptions, the path to an artifact you left under .brood/shared/. Ordinary delivery is passive — it never wakes the recipient, and a parked recipient will not see it until its wait resolves, possibly too late to act. Set urgent=true when the recipient should change course before then; it wakes them once without suspending you. Use ask_agent when your progress depends on a reply, and post_bulletin when the whole swarm should know.",
+      "Hand a specific peer something that helps their work: a result they are building on, a warning that your findings change their assumptions, the path to an artifact you left under .brood/shared/. Ordinary delivery is passive — it never wakes the recipient, and a parked recipient will not see it until its wait resolves, possibly too late to act. Set urgent=true when the recipient should change course before then; it wakes them once without suspending you. Finished agents still receive mail: passive mail queues in their inbox unread, while urgent=true revives a completed or interrupted agent to read it — reserve that for things worth bringing someone back for. Use ask_agent when your progress depends on a reply, and post_bulletin when the whole swarm should know.",
     parameters: SendMessageParameters,
     prepareArguments: (params) => prepareToolArguments(decodeSendMessageInput(params)),
     executionMode: "sequential",
@@ -279,9 +279,13 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
         const input = yield* decodeSendMessageInput(params);
         const result = yield* port.sendMessage(callerId, invocationId, input);
         return textResult(
-          input.urgent === true
-            ? `Accepted an urgent message for ${result.to}, currently ${result.recipientState}; a parked recipient is woken once to read it.`
-            : `Accepted a passive message for ${result.to}, currently ${result.recipientState}. It may not be read before that agent terminates.`,
+          result.revived === true
+            ? `Revived ${result.to}: it had finished, and your urgent message brings it back to read it.`
+            : result.queuedForRevival === true
+              ? `Queued a passive message for ${result.to}, which already finished (${result.recipientState}). It stays unread unless that agent is revived.`
+              : input.urgent === true
+                ? `Accepted an urgent message for ${result.to}, currently ${result.recipientState}; a parked recipient is woken once to read it.`
+                : `Accepted a passive message for ${result.to}, currently ${result.recipientState}. It may not be read before that agent terminates.`,
           result,
         );
       });
@@ -293,7 +297,7 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
     name: "ask_agent",
     label: "Ask agent",
     description:
-      "Ask a peer when you are blocked or about to guess at something they know better — a wrong assumption compounds across the swarm, while a question costs one pause. Make it specific and answerable, and say what you already tried or assumed. A successful call suspends you after every tool call in the current turn completes, and you resume only after every question from the turn is answered or its recipient terminates — so prefer one question at a time.",
+      "Ask a peer when you are blocked or about to guess at something they know better — a wrong assumption compounds across the swarm, while a question costs one pause. Make it specific and answerable, and say what you already tried or assumed. A successful call suspends you after every tool call in the current turn completes, and you resume only after every question from the turn is answered or its recipient terminates — so prefer one question at a time. A completed or interrupted agent is still askable: your question revives it to answer, with its full working context intact — often the fastest source for anything it built. Only failed agents are beyond reach.",
     parameters: AskAgentParameters,
     prepareArguments: (params) => prepareToolArguments(decodeAskAgentInput(params)),
     executionMode: "sequential",
@@ -305,7 +309,9 @@ export const makeCommunicationTools = (callerId: AgentId, port: CommunicationToo
         const input = yield* decodeAskAgentInput(params);
         const details = yield* port.askAgent(callerId, invocationId, input);
         return textResult(
-          `Question ${details.request} was accepted for ${details.to}, currently ${details.recipientState}. Brood will suspend this agent after every tool call in the current turn completes.`,
+          details.revived === true
+            ? `Question ${details.request} revived ${details.to}: it had finished and is being brought back to answer you. Brood will suspend this agent after every tool call in the current turn completes.`
+            : `Question ${details.request} was accepted for ${details.to}, currently ${details.recipientState}. Brood will suspend this agent after every tool call in the current turn completes.`,
           details,
         );
       });

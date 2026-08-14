@@ -1,6 +1,6 @@
 /**
  * The only two destructive actions in the UI get the same small centred panel.
- * Quitting keeps the dialog on screen while the swarm drains, because that wait
+ * Closing keeps the dialog on screen while the swarm drains, because that wait
  * is the part an operator most needs to see is deliberate.
  */
 import { theme } from "../theme";

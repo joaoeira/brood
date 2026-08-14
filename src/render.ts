@@ -26,7 +26,7 @@ import {
   makeRequestId,
   type PeerRequestOutcome,
 } from "./communication.js";
-import type { AgentCommand, CoordinationNotice } from "./control.js";
+import type { AgentCommand, CoordinationNotice, RevivalContext } from "./control.js";
 
 export const TRUNCATION_SENTINEL = "\n[truncated by Brood]";
 export const MIN_BOUNDED_TEXT_CHARS = Array.from(TRUNCATION_SENTINEL).length;
@@ -343,6 +343,29 @@ export const MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS = codePointLength(
   renderOperatorMessage("&".repeat(MAX_MESSAGE_CHARS), "o".repeat(MAX_OPERATOR_MESSAGE_ID_CHARS)),
 );
 
+/**
+ * The revival preamble: the first prompt after a terminal agent is brought
+ * back. The conversation on disk already ended — with a delivered final
+ * summary or mid-interruption — so the block explains why it is continuing
+ * and re-grounds the agent's standing before the trigger that revived it.
+ */
+export const renderRevival = (revival: RevivalContext): string =>
+  [
+    '<brood_revival version="1">',
+    revival === "completed"
+      ? "  You previously finished this work and delivered your final summary. It still stands, and anyone who was waiting on you has already received it — do not redo or re-deliver it."
+      : "  A previous turn of yours was interrupted before it finished. If the conversation above ends abruptly — or is empty — that is why; nothing after that point happened.",
+    "  You have been revived because something below needs you: read this prompt's notices and messages to see what. You are the same agent as before — same path, same workspace, same tools — and everything you wrote or delegated earlier still exists.",
+    "  Handle what revived you, then finish normally with a concise final response.",
+    "</brood_revival>",
+  ].join("\n");
+
+/** Worst-case rendered revival block, derived from the real renderer. */
+export const MAX_REVIVAL_ENVELOPE_CHARS = Math.max(
+  codePointLength(renderRevival("completed")),
+  codePointLength(renderRevival("interrupted")),
+);
+
 const BASE_RESUME_PROMPT_CHARS = 512;
 const PER_DEPENDENCY_RESUME_CHARS = 320;
 
@@ -353,7 +376,9 @@ export const minimumResumePromptChars = (maxAgentAdmissions: number): number =>
   MAX_REQUEST_TARGETS_PER_WAIT * (MAX_ENCODED_REPLY_CHARS + MAX_REQUEST_OUTCOME_HEADER_CHARS) +
   // Commands carry at most one drained operator message; reserve it whole so
   // an operator body can never squeeze out a dependency or request outcome.
-  MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS;
+  MAX_OPERATOR_MESSAGE_ENVELOPE_CHARS +
+  // The first command after a revival carries the fixed revival preamble.
+  MAX_REVIVAL_ENVELOPE_CHARS;
 
 export const DEFAULT_MAX_RESUME_PROMPT_CHARS = minimumResumePromptChars(128);
 
@@ -390,6 +415,9 @@ const renderWaitSatisfied = (
   const notice = renderNotice(command.notice);
   const rendered: string[] = [];
 
+  if (command.revival !== undefined) {
+    rendered.push(renderRevival(command.revival));
+  }
   if (command.operatorMessage !== undefined) {
     rendered.push(renderOperatorMessage(command.operatorMessage));
   }
@@ -443,6 +471,7 @@ const renderCoordinationWake = (
 ): string => {
   const hasPeerWork = command.notice.openRequests > 0 || command.notice.unreadMessages > 0;
   const rendered = [
+    command.revival === undefined ? undefined : renderRevival(command.revival),
     command.operatorMessage === undefined
       ? undefined
       : renderOperatorMessage(command.operatorMessage),
@@ -478,9 +507,13 @@ export const renderAgentCommand = (command: AgentCommand, maxResumePromptChars: 
   switch (command._tag) {
     case "InitialGoal": {
       const goal = appendNotice(normalizeText(command.goal), command.notice);
-      return command.operatorMessage === undefined
-        ? goal
-        : `${renderOperatorMessage(command.operatorMessage)}\n\n${goal}`;
+      const withOperator =
+        command.operatorMessage === undefined
+          ? goal
+          : `${renderOperatorMessage(command.operatorMessage)}\n\n${goal}`;
+      return command.revival === undefined
+        ? withOperator
+        : `${renderRevival(command.revival)}\n\n${withOperator}`;
     }
     case "WaitSatisfied":
       return renderWaitSatisfied(command, maxResumePromptChars);

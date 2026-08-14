@@ -30,7 +30,7 @@ import {
   type ToolInvocationId,
   type WaitId,
 } from "./agent.js";
-import { type AgentCommand, type PiRunOutcome } from "./control.js";
+import { type AgentCommand, type PiRunOutcome, type RevivalContext } from "./control.js";
 import type { PublicModelProfile } from "./profiles.js";
 import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, dependencyOutcomeFromAgent } from "./render.js";
 import {
@@ -157,6 +157,10 @@ export interface AgentSnapshot extends RegisteredAgent {
   readonly hasPendingCommand: boolean;
   readonly interruptRequested: InterruptReason | undefined;
   readonly outcome: AgentOutcome | undefined;
+  /** How many times this agent has been revived from a terminal state. */
+  readonly revivals: number;
+  /** Latest completed result, retained across revivals and later settlements. */
+  readonly lastCompletedResult: AgentResult | undefined;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly terminalAt: number | undefined;
@@ -168,6 +172,7 @@ export interface RegistrySnapshot {
   readonly agents: ReadonlyArray<AgentSnapshot>;
   readonly rootId: AgentId | undefined;
   readonly accepting: boolean;
+  readonly revivalsOpen: boolean;
   readonly nonterminalCount: number;
   readonly pendingInstallationCount: number;
   readonly admissionCapacity: AgentAdmissionCapacity;
@@ -233,6 +238,8 @@ export class OperatorMessageRejected extends Schema.TaggedError<OperatorMessageR
 export interface OperatorMessageDelivery {
   readonly to: AgentPath;
   readonly recipientState: "queued" | "starting" | "running" | "waiting";
+  /** The recipient had finished; this message revived it. */
+  readonly revived?: boolean;
 }
 
 interface WaitTargets {
@@ -261,6 +268,9 @@ interface ClaimedCommand {
 
 interface RunningCommand {
   readonly token: CommandToken;
+  /** Retained so settlement can tell an interrupted initial turn apart: the
+   * goal is reinstated for revival when the model may never have seen it. */
+  readonly trigger: CommandTrigger;
 }
 
 type InboxEntry =
@@ -315,6 +325,20 @@ interface AgentEntry extends RegisteredAgent {
   readonly status: AgentStatus;
   readonly installation: InstallationStatus;
   readonly initialGoal: string | undefined;
+  /** Immutable copy of the creation goal. Settlement uses it to reinstate
+   * `initialGoal` when an agent is interrupted during its initial turn, so a
+   * revival can re-issue a goal the model may never have seen. */
+  readonly goalText: string;
+  /** Lifecycle generation: incremented on every revival. Stale controller
+   * teardown settles are fenced by it so they cannot re-terminal a revived
+   * entry. */
+  readonly revivals: number;
+  /** Set by a revival, consumed by the next beginRun: tells the command what
+   * terminal state the agent came back from. */
+  readonly revivedPending: RevivalContext | undefined;
+  /** Latest completed result, never cleared. Session close prefers it when a
+   * revived agent was interrupted by the close itself. */
+  readonly lastCompletedResult: AgentResult | undefined;
   readonly claimedCommand: ClaimedCommand | undefined;
   readonly runningCommand: RunningCommand | undefined;
   readonly pendingCompletedResult: AgentResult | undefined;
@@ -367,6 +391,9 @@ interface RegistryState {
   readonly nextTrafficSequence: number;
   readonly rootId: AgentId | undefined;
   readonly accepting: boolean;
+  /** Closed once shutdown or drain begins: a run that is winding down never
+   * fights a resurrection. Passive mail still queues after close. */
+  readonly revivalsOpen: boolean;
   readonly nonterminalCount: number;
 }
 
@@ -565,6 +592,10 @@ export interface AgentRegistry {
   readonly settle: (
     id: AgentId,
     outcome: AgentOutcome,
+    /** Fence: settle only while the entry is still on this revival generation.
+     * Controller teardown passes its spawn-time generation so a stale backstop
+     * settle can never re-terminal an agent that was revived in between. */
+    onlyGeneration?: number,
   ) => Effect.Effect<Option.Option<AgentOutcome>, UnknownAgent>;
   readonly planWait: (
     input: PlanWaitInput,
@@ -587,6 +618,9 @@ export interface AgentRegistry {
     reason: InterruptReason,
   ) => Effect.Effect<boolean, UnknownAgent>;
   readonly beginShutdown: (reason: InterruptReason) => Effect.Effect<ShutdownResult>;
+  /** Idempotent: closes the revival gate ahead of drain. Passive mail still
+   * queues to finished agents; nothing can be brought back afterwards. */
+  readonly closeRevivals: Effect.Effect<void>;
   readonly settlePendingInstallations: (
     reason: InterruptReason,
   ) => Effect.Effect<ReadonlyArray<CommittedSettlement>>;
@@ -620,6 +654,10 @@ const makeEntry = (
   status: "Queued",
   installation: "Pending",
   initialGoal: goal,
+  goalText: goal,
+  revivals: 0,
+  revivedPending: undefined,
+  lastCompletedResult: undefined,
   claimedCommand: undefined,
   runningCommand: undefined,
   pendingCompletedResult: undefined,
@@ -671,6 +709,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     nextTrafficSequence: 0,
     rootId: undefined,
     accepting: true,
+    revivalsOpen: true,
     nonterminalCount: 0,
   });
 
@@ -1097,6 +1136,55 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     return caller;
   };
 
+  // ── Revival ──────────────────────────────────────────────────────────────
+
+  const terminalRecipientState = (
+    outcome: AgentOutcome,
+  ): "completed" | "failed" | "interrupted" => {
+    switch (outcome._tag) {
+      case "Completed":
+        return "completed";
+      case "Failed":
+        return "failed";
+      case "Interrupted":
+        return "interrupted";
+    }
+  };
+
+  /** Why a terminal entry cannot be brought back right now, if it cannot. */
+  const reviveRefusal = (
+    state: RegistryState,
+    entry: AgentEntry,
+  ): "Failed" | "RevivalsClosed" | undefined => {
+    if (entry.outcome === undefined) {
+      throw new RegistryInvariantDefect(`Agent ${entry.id} is not terminal`);
+    }
+    if (entry.outcome._tag === "Failed") return "Failed";
+    if (!state.revivalsOpen) return "RevivalsClosed";
+    return undefined;
+  };
+
+  /** Terminal -> Queued on the same entry: same identity, same session on
+   * disk, next lifecycle generation. Queued passive mail survives; the caller
+   * inserts the waking signal into the returned entry within the same
+   * transaction and accounts for `nonterminalCount`. */
+  const reviveEntry = (entry: AgentEntry, revivedAt: number): AgentEntry => {
+    const outcome = entry.outcome;
+    if (outcome === undefined || outcome._tag === "Failed") {
+      throw new RegistryInvariantDefect(`Agent ${entry.id} cannot be revived`);
+    }
+    return {
+      ...entry,
+      status: "Queued",
+      outcome: undefined,
+      interruptRequested: undefined,
+      terminalAt: undefined,
+      revivals: entry.revivals + 1,
+      revivedPending: outcome._tag === "Completed" ? "completed" : "interrupted",
+      updatedAt: revivedAt,
+    };
+  };
+
   const setActivity = Effect.fn("Brood.Registry.setActivity")(function* (
     callerId: AgentId,
     invocationId: ToolInvocationId,
@@ -1166,19 +1254,35 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       if (recipient === undefined) {
         throw new RegistryInvariantDefect(`Path index points to missing agent ${recipientId}`);
       }
+      const urgent = input.urgent === true;
+      // Terminal recipients no longer bounce mail. Passive mail queues in the
+      // finished agent's inbox — read only if it is ever revived. An urgent
+      // send extends the living wake contract to the grave: it revives.
+      let target = recipient;
+      let revived = false;
       if (recipient.outcome !== undefined) {
-        return noChange(
-          state,
-          Result.fail(
-            new SendMessageRejected({
-              reason: "RecipientTerminal",
-              recipient: input.to,
-              message: `${input.to} is terminal and cannot read new messages; choose an addressable agent or write durable context under .brood/shared/.`,
-            }),
-          ),
-        );
+        if (urgent) {
+          const refusal = reviveRefusal(state, recipient);
+          if (refusal !== undefined) {
+            return noChange(
+              state,
+              Result.fail(
+                new SendMessageRejected({
+                  reason: "RecipientTerminal",
+                  recipient: input.to,
+                  message:
+                    refusal === "Failed"
+                      ? `${input.to} failed and cannot be revived; choose an addressable agent or write durable context under .brood/shared/.`
+                      : `${input.to} is finished and the run is closing; nothing can be revived now.`,
+                }),
+              ),
+            );
+          }
+          target = reviveEntry(recipient, deliveredAt);
+          revived = true;
+        }
       }
-      const unreadMessages = recipient.inbox.filter((item) => item._tag === "Message").length;
+      const unreadMessages = target.inbox.filter((item) => item._tag === "Message").length;
       if (unreadMessages >= MAX_UNREAD_MESSAGES_PER_AGENT) {
         return noChange(
           state,
@@ -1191,17 +1295,16 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           ),
         );
       }
-      const sequence = nextSafeCounter(recipient.nextInboxSequence, "Inbox sequence");
-      const urgent = input.urgent === true;
+      const sequence = nextSafeCounter(target.nextInboxSequence, "Inbox sequence");
       const wakeGeneration = urgent
-        ? nextSafeCounter(recipient.urgentWakeGeneration, "Urgent wake generation")
+        ? nextSafeCounter(target.urgentWakeGeneration, "Urgent wake generation")
         : undefined;
       const agents = new Map(state.agents);
       agents.set(callerId, { ...claimed.success, updatedAt: deliveredAt });
       agents.set(recipientId, {
-        ...recipient,
+        ...target,
         inbox: [
-          ...recipient.inbox,
+          ...target.inbox,
           {
             _tag: "Message",
             sequence,
@@ -1214,26 +1317,41 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         ...(wakeGeneration === undefined ? {} : { urgentWakeGeneration: wakeGeneration }),
         updatedAt: deliveredAt,
       });
+      const result: SendMessageResult =
+        recipient.outcome === undefined
+          ? { to: recipient.path, recipientState: addressableState(recipient.status) }
+          : revived
+            ? { to: recipient.path, recipientState: "queued", revived: true }
+            : {
+                to: recipient.path,
+                recipientState: terminalRecipientState(recipient.outcome),
+                queuedForRevival: true,
+              };
       return {
-        next: appendTraffic({ ...state, agents }, deliveredAt, {
-          kind: "message",
-          fromPath: caller.path,
-          toPath: recipient.path,
-          body: input.message,
-          urgent,
-          status: "unread",
-          recipientId,
-          inboxSequence: sequence,
-          requestId: undefined,
-          operatorMessageId: undefined,
-        }),
+        next: appendTraffic(
+          {
+            ...state,
+            agents,
+            nonterminalCount: state.nonterminalCount + (revived ? 1 : 0),
+          },
+          deliveredAt,
+          {
+            kind: "message",
+            fromPath: caller.path,
+            toPath: recipient.path,
+            body: input.message,
+            urgent,
+            status: "unread",
+            recipientId,
+            inboxSequence: sequence,
+            requestId: undefined,
+            operatorMessageId: undefined,
+          },
+        ),
         // An urgent send wakes a parked recipient exactly like a question
         // does; ordinary mail stays passive and waits for a natural boundary.
         actions: urgent ? [PostCommitAction.Open({ latch: recipient.mailbox })] : [],
-        result: Result.succeed({
-          to: recipient.path,
-          recipientState: addressableState(recipient.status),
-        }),
+        result: Result.succeed(result),
       };
     });
   });
@@ -1247,18 +1365,30 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     return yield* transact(
       (state): Transition<OperatorMessageDelivery, UnknownAgent | OperatorMessageRejected> =>
         withAgent<OperatorMessageDelivery, OperatorMessageRejected>(state, id, (recipient) => {
+          // An operator message to a finished agent revives it: the operator
+          // is steering the run, and the deepest park is still a park.
+          let target = recipient;
+          let revived = false;
           if (recipient.outcome !== undefined) {
-            return noChange(
-              state,
-              Result.fail(
-                new OperatorMessageRejected({
-                  reason: "RecipientTerminal",
-                  message: `${recipient.path} is terminal and cannot read new messages.`,
-                }),
-              ),
-            );
+            const refusal = reviveRefusal(state, recipient);
+            if (refusal !== undefined) {
+              return noChange(
+                state,
+                Result.fail(
+                  new OperatorMessageRejected({
+                    reason: "RecipientTerminal",
+                    message:
+                      refusal === "Failed"
+                        ? `${recipient.path} failed and cannot be revived.`
+                        : `${recipient.path} is finished and the run is closing; nothing can be revived now.`,
+                  }),
+                ),
+              );
+            }
+            target = reviveEntry(recipient, deliveredAt);
+            revived = true;
           }
-          if (recipient.operatorMessages.length >= MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT) {
+          if (target.operatorMessages.length >= MAX_PENDING_OPERATOR_MESSAGES_PER_AGENT) {
             return noChange(
               state,
               Result.fail(
@@ -1271,11 +1401,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           }
           return {
             next: appendTraffic(
-              replaceAgent(state, {
-                ...recipient,
-                operatorMessages: [...recipient.operatorMessages, { id: messageId, body }],
-                updatedAt: deliveredAt,
-              }),
+              {
+                ...replaceAgent(state, {
+                  ...target,
+                  operatorMessages: [...target.operatorMessages, { id: messageId, body }],
+                  updatedAt: deliveredAt,
+                }),
+                nonterminalCount: state.nonterminalCount + (revived ? 1 : 0),
+              },
               deliveredAt,
               {
                 kind: "operator",
@@ -1293,7 +1426,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
             result: Result.succeed({
               to: recipient.path,
-              recipientState: addressableState(recipient.status),
+              recipientState: addressableState(target.status),
+              ...(revived ? { revived: true } : {}),
             }),
           };
         }),
@@ -1346,19 +1480,31 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       if (recipient === undefined) {
         throw new RegistryInvariantDefect(`Path index points to missing agent ${recipientId}`);
       }
+      // A correlated question revives a finished recipient: the asker needs
+      // an answer only that agent can give, and its session is still on disk.
+      let target = recipient;
+      let revived = false;
       if (recipient.outcome !== undefined) {
-        return noChange(
-          state,
-          Result.fail(
-            new AskAgentRejected({
-              reason: "RecipientTerminal",
-              recipient: input.to,
-              message: `${input.to} is terminal and cannot answer; choose an addressable agent or continue without the clarification.`,
-            }),
-          ),
-        );
+        const refusal = reviveRefusal(state, recipient);
+        if (refusal !== undefined) {
+          return noChange(
+            state,
+            Result.fail(
+              new AskAgentRejected({
+                reason: "RecipientTerminal",
+                recipient: input.to,
+                message:
+                  refusal === "Failed"
+                    ? `${input.to} failed and cannot be revived; choose an addressable agent or continue without the clarification.`
+                    : `${input.to} is finished and the run is closing; continue without the clarification.`,
+              }),
+            ),
+          );
+        }
+        target = reviveEntry(recipient, requestedAt);
+        revived = true;
       }
-      const incomingRequests = recipient.inbox.filter(
+      const incomingRequests = target.inbox.filter(
         (item) =>
           item._tag === "Request" && state.requests.get(item.requestId)?.state._tag === "Open",
       ).length;
@@ -1392,9 +1538,9 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       if (state.requests.has(requestId)) {
         throw new RegistryInvariantDefect(`Request ID generator reused ${requestId}`);
       }
-      const sequence = nextSafeCounter(recipient.nextInboxSequence, "Inbox sequence");
+      const sequence = nextSafeCounter(target.nextInboxSequence, "Inbox sequence");
       const wakeGeneration = nextSafeCounter(
-        recipient.requestWakeGeneration,
+        target.requestWakeGeneration,
         "Request wake generation",
       );
       const plannedWaits = new Map(claimed.success.plannedWaits);
@@ -1415,31 +1561,41 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       const agents = new Map(state.agents);
       agents.set(callerId, { ...claimed.success, plannedWaits, updatedAt: requestedAt });
       agents.set(recipientId, {
-        ...recipient,
-        inbox: [...recipient.inbox, { _tag: "Request", sequence, requestId, presented: false }],
+        ...target,
+        inbox: [...target.inbox, { _tag: "Request", sequence, requestId, presented: false }],
         nextInboxSequence: sequence,
         requestWakeGeneration: wakeGeneration,
         updatedAt: requestedAt,
       });
       return {
-        next: appendTraffic({ ...state, agents, requests }, requestedAt, {
-          kind: "request",
-          fromPath: caller.path,
-          toPath: recipient.path,
-          body: input.question,
-          urgent: false,
-          status: "unread",
-          recipientId,
-          inboxSequence: sequence,
-          requestId,
-          operatorMessageId: undefined,
-        }),
+        next: appendTraffic(
+          {
+            ...state,
+            agents,
+            requests,
+            nonterminalCount: state.nonterminalCount + (revived ? 1 : 0),
+          },
+          requestedAt,
+          {
+            kind: "request",
+            fromPath: caller.path,
+            toPath: recipient.path,
+            body: input.question,
+            urgent: false,
+            status: "unread",
+            recipientId,
+            inboxSequence: sequence,
+            requestId,
+            operatorMessageId: undefined,
+          },
+        ),
         actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
         result: Result.succeed({
           version: 1,
           request: requestId,
           to: recipient.path,
-          recipientState: addressableState(recipient.status),
+          recipientState: addressableState(target.status),
+          ...(revived ? { revived: true } : {}),
           broodControl: { version: 1, kind: "suspend", invocationId },
         }),
       };
@@ -2015,6 +2171,12 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
       const decision = yield* transact((state): Transition<TakeDecision, UnknownAgent> => {
         return withAgent<TakeDecision, never>(state, id, (entry) => {
+          // Checked before any trigger computation: a terminal entry may
+          // retain a reinstated goal or unread mail for a future revival, and
+          // neither may ever produce a claim while the agent stays terminal.
+          if (entry.outcome !== undefined) {
+            throw new RegistryInvariantDefect(`Terminal agent ${id} cannot take another command`);
+          }
           if (entry.interruptRequested !== undefined) {
             return noChange(
               state,
@@ -2046,9 +2208,6 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
               actions: [],
               result: Result.succeed(TakeDecision.Command({ claim })),
             };
-          }
-          if (entry.outcome !== undefined) {
-            throw new RegistryInvariantDefect(`Terminal agent ${id} cannot take another command`);
           }
           return noChange(state, Result.succeed(TakeDecision.Empty()));
         });
@@ -2178,6 +2337,13 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             result: Result.succeed({ _tag: "Stale", status: "Waiting" }),
           };
         }
+        // The first command after a revival says what the agent came back
+        // from, so a conversation that already delivered its final answer can
+        // make sense of being prompted again.
+        if (nextEntry.revivedPending !== undefined) {
+          command = { ...command, revival: nextEntry.revivedPending };
+          nextEntry = { ...nextEntry, revivedPending: undefined };
+        }
         // Every command drains the oldest pending operator message whole; the
         // resume budget reserves room for exactly one, and any remainder keeps
         // the coordination trigger armed for the next turn.
@@ -2194,6 +2360,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         }
         const runningCommand: RunningCommand = {
           token,
+          trigger: claim.trigger,
         };
         nextEntry = {
           ...nextEntry,
@@ -2224,10 +2391,16 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     requestedOutcome: AgentOutcome,
     settledAt: number,
     onlyIfPendingInstallation: boolean,
+    onlyGeneration?: number,
   ): Transition<Option.Option<AgentOutcome>, UnknownAgent> {
     return withAgent<Option.Option<AgentOutcome>, never>(state, id, (entry) => {
       if (entry.outcome !== undefined) return noChange(state, Result.succeed(Option.none()));
       if (onlyIfPendingInstallation && entry.installation !== "Pending") {
+        return noChange(state, Result.succeed(Option.none()));
+      }
+      // Generation fence: a teardown settle from a controller whose agent was
+      // revived in the meantime must not re-terminal the new lifecycle.
+      if (onlyGeneration !== undefined && entry.revivals !== onlyGeneration) {
         return noChange(state, Result.succeed(Option.none()));
       }
 
@@ -2235,11 +2408,20 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         entry.interruptRequested === undefined
           ? requestedOutcome
           : { _tag: "Interrupted", reason: entry.interruptRequested };
+      // An interrupted initial turn reinstates the goal: the model may never
+      // have seen it, and a revival must be able to re-issue it whole.
+      const initialTurnInterrupted =
+        outcome._tag === "Interrupted" &&
+        (entry.runningCommand?.trigger === "initial" ||
+          entry.claimedCommand?.trigger === "initial");
       const settled: AgentEntry = {
         ...entry,
         status: outcome._tag,
         installation: "Installed",
-        initialGoal: undefined,
+        initialGoal: entry.initialGoal ?? (initialTurnInterrupted ? entry.goalText : undefined),
+        revivedPending: undefined,
+        lastCompletedResult:
+          outcome._tag === "Completed" ? outcome.result : entry.lastCompletedResult,
         claimedCommand: undefined,
         runningCommand: undefined,
         pendingCompletedResult: undefined,
@@ -2247,7 +2429,10 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         plannedWaits: new Map(),
         activeWait: undefined,
         activity: undefined,
-        inbox: [],
+        // Unread passive mail survives settlement: the agent may be revived,
+        // and dropping accepted mail would make the queue-to-the-finished
+        // contract a lie. Requests are voided below and leave the inbox.
+        inbox: entry.inbox.filter((item) => item._tag === "Message"),
         operatorMessages: [],
         outcome,
         updatedAt: settledAt,
@@ -2324,12 +2509,14 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         }
       }
       const nonterminalCount = state.nonterminalCount - 1;
+      // Quiescence no longer closes admissions: while revivals are open, a
+      // fully settled swarm is dormant, not finished — a revived agent may
+      // delegate again under the same lifetime admission budget.
       const reachedQuiescence = nonterminalCount === 0;
       if (reachedQuiescence) actions.push(PostCommitAction.Open({ latch: quiescence }));
       return {
         next: {
           ...next,
-          accepting: reachedQuiescence ? false : next.accepting,
           nonterminalCount,
         },
         actions,
@@ -2338,9 +2525,15 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     });
   }
 
-  const settle = Effect.fn("Brood.Registry.settle")(function* (id: AgentId, outcome: AgentOutcome) {
+  const settle = Effect.fn("Brood.Registry.settle")(function* (
+    id: AgentId,
+    outcome: AgentOutcome,
+    onlyGeneration?: number,
+  ) {
     const settledAt = yield* Clock.currentTimeMillis;
-    return yield* transact((state) => settleTransition(state, id, outcome, settledAt, false));
+    return yield* transact((state) =>
+      settleTransition(state, id, outcome, settledAt, false, onlyGeneration),
+    );
   });
 
   const finishTurn = Effect.fn("Brood.Registry.finishTurn")(function* (input: FinishTurnInput) {
@@ -2586,12 +2779,18 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         actions.push(PostCommitAction.Open({ latch: quiescence }));
       }
       return {
-        next: { ...state, agents, accepting: false },
+        next: { ...state, agents, accepting: false, revivalsOpen: false },
         actions,
         result: Result.succeed({ activeIds, newlyRequested }),
       };
     });
   });
+
+  const closeRevivals = transact((state): Transition<void, never> => ({
+    next: state.revivalsOpen ? { ...state, revivalsOpen: false } : state,
+    actions: [],
+    result: Result.succeed(undefined),
+  }));
 
   const settlePendingInstallations = Effect.fn("Brood.Registry.settlePendingInstallations")(
     function* (reason: InterruptReason) {
@@ -2702,14 +2901,20 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           status: entry.status,
           installation: entry.installation,
           waitTargets: withTargets(dependencyIds, requestRecipientIds),
+          // Terminal entries may retain a reinstated goal or queued mail for a
+          // future revival; neither is a pending command while the agent
+          // stays terminal.
           hasPendingCommand:
-            entry.initialGoal !== undefined ||
-            entry.claimedCommand !== undefined ||
-            activeWaitSatisfied(state, entry) ||
-            hasCoordinationTrigger(state, entry) ||
-            entry.status === "Queued",
+            entry.outcome === undefined &&
+            (entry.initialGoal !== undefined ||
+              entry.claimedCommand !== undefined ||
+              activeWaitSatisfied(state, entry) ||
+              hasCoordinationTrigger(state, entry) ||
+              entry.status === "Queued"),
           interruptRequested: entry.interruptRequested,
           outcome: entry.outcome,
+          revivals: entry.revivals,
+          lastCompletedResult: entry.lastCompletedResult,
           createdAt: entry.createdAt,
           updatedAt: entry.updatedAt,
           terminalAt: entry.terminalAt,
@@ -2721,6 +2926,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         agents,
         rootId: state.rootId,
         accepting: state.accepting,
+        revivalsOpen: state.revivalsOpen,
         nonterminalCount: state.nonterminalCount,
         pendingInstallationCount: agents.filter(({ installation }) => installation === "Pending")
           .length,
@@ -2752,6 +2958,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
     awaitOutcome,
     requestInterrupt,
     beginShutdown,
+    closeRevivals,
     settlePendingInstallations,
     awaitQuiescence,
     snapshot,
