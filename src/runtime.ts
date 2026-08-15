@@ -23,6 +23,7 @@ import {
   MIN_BOUNDED_TEXT_CHARS,
   minimumResumePromptChars,
 } from "./render.js";
+import { assignOptional } from "./optional.js";
 
 const BoundedTextChars = PositiveInt.check(Schema.isGreaterThanOrEqualTo(MIN_BOUNDED_TEXT_CHARS));
 const PositiveFiniteDuration = Schema.DurationFromString.check(
@@ -218,7 +219,7 @@ const configErrorPath = (error: Config.ConfigError): string | undefined => {
 };
 
 export const decodeBroodConfigUnknown = Effect.fn("Brood.decodeBroodConfigUnknown")(
-  (raw: unknown, baseDir: string = process.cwd()) =>
+  (raw: Parameters<typeof ConfigProvider.fromUnknown>[0], baseDir: string = process.cwd()) =>
     ConfigRecipe.parse(ConfigProvider.fromUnknown(raw, { preserveEmptyStrings: true })).pipe(
       Effect.mapError((error) => {
         const path = configErrorPath(error);
@@ -396,7 +397,7 @@ const createModelRuntime = Effect.fn("Brood.createModelRuntime")(function* (conf
 });
 
 export const buildBroodRuntimeUnknown = Effect.fn("Brood.buildBroodRuntimeUnknown")(
-  (raw: unknown, baseDir?: string) =>
+  (raw: Parameters<typeof decodeBroodConfigUnknown>[0], baseDir?: string) =>
     Effect.gen(function* () {
       const decoded = yield* decodeBroodConfigUnknown(raw, baseDir);
       const config = yield* prepareDirectories(decoded);
@@ -404,8 +405,8 @@ export const buildBroodRuntimeUnknown = Effect.fn("Brood.buildBroodRuntimeUnknow
       const profileInput: ProfilesConfigInput = {
         defaultProfile: config.defaultProfile,
         profiles: config.profiles,
-        ...(config.rootProfile === undefined ? {} : { rootProfile: config.rootProfile }),
       };
+      assignOptional(profileInput, "rootProfile", config.rootProfile);
       const catalogue = yield* compileProfileCatalogue(
         profileInput,
         {

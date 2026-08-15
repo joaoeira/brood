@@ -6,12 +6,12 @@ import type { TickerEntry, Tone } from "../store";
 import { formatTimeOfDay, theme, truncate } from "../theme";
 import { SectionHeader } from "./Section";
 
-const TONE_COLORS: Record<Tone, string> = {
+const TONE_COLORS = {
   muted: theme.muted,
   info: theme.text,
   warn: theme.amber,
   error: theme.red,
-};
+} satisfies Record<Tone, string>;
 
 export interface EventTickerProps {
   readonly entries: ReadonlyArray<TickerEntry>;

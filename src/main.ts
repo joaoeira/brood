@@ -234,8 +234,10 @@ export const makeBroodApplication = (input: BroodConfigEncoded, baseDir?: string
 
 /** Unknown-input adapters such as the CLI file loader use the same decoder through this entry point.
  * `baseDir` anchors relative and defaulted paths — pass the config file's directory. */
-export const makeBroodApplicationFromUnknown = (input: unknown, baseDir?: string) =>
-  buildBroodRuntimeUnknown(input, baseDir).pipe(Effect.flatMap(makeApplication));
+export const makeBroodApplicationFromUnknown = (
+  input: Parameters<typeof buildBroodRuntimeUnknown>[0],
+  baseDir?: string,
+) => buildBroodRuntimeUnknown(input, baseDir).pipe(Effect.flatMap(makeApplication));
 
 export const runBrood = (
   request: BroodRunRequestEncoded,

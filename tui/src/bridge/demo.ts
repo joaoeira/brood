@@ -8,7 +8,24 @@
  * fails a tool and then fails outright, an ask/reply pair, two bulletins, and a
  * compaction marker inside one of the synthetic transcripts.
  */
-import type { AgentDetail, StatusAgent, SupervisorEvent, SwarmStatus, TrafficView } from "../brood";
+import { Schema } from "effect";
+import {
+  AgentId,
+  AgentName,
+  AgentPath,
+  BatchId,
+  ProfileName,
+  RequestId,
+  ToolInvocationId,
+  WaitId,
+  type AgentDetail,
+  type PiSessionEvent,
+  type StatusAgent,
+  type SupervisorEvent,
+  type SupervisorLifecycleEvent,
+  type SwarmStatus,
+  type TrafficView,
+} from "../brood";
 import { store } from "../store";
 import { makeMemoryTranscriptReader } from "../transcript/watch";
 import type { BridgeHandle, ConfigSummary } from "./types";
@@ -17,12 +34,14 @@ const TICK_MILLIS = 200;
 const DRAIN_MILLIS = 900;
 const REVIVAL_MILLIS = 2_600;
 
-/**
- * Brood's ids, names, and profile names are branded at the schema boundary.
- * Demo fixtures are hand-written rather than decoded, so the brands are
- * asserted here in one place instead of scattered across the timeline.
- */
-const brand = <T extends string>(value: string): T => value as unknown as T;
+const makeAgentId = Schema.decodeUnknownSync(AgentId);
+const makeAgentName = Schema.decodeUnknownSync(AgentName);
+const makeAgentPath = Schema.decodeUnknownSync(AgentPath);
+const makeBatchId = Schema.decodeUnknownSync(BatchId);
+const makeProfileName = Schema.decodeUnknownSync(ProfileName);
+const makeRequestId = Schema.decodeUnknownSync(RequestId);
+const makeToolInvocationId = Schema.decodeUnknownSync(ToolInvocationId);
+const makeWaitId = Schema.decodeUnknownSync(WaitId);
 
 type AgentState = StatusAgent["state"];
 type Profile = AgentDetail["profile"];
@@ -61,7 +80,7 @@ const profile = (
   model: string,
   thinkingLevel: Profile["thinkingLevel"],
 ): Profile => ({
-  name: brand(name),
+  name: makeProfileName(name),
   provider: "anthropic",
   model,
   thinkingLevel,
@@ -70,7 +89,7 @@ const profile = (
 const COORDINATOR = profile("coordinator", "claude-sonnet-4-5", "high");
 const WORKER = profile("worker", "claude-sonnet-4-5", "medium");
 
-const jsonl = (lines: ReadonlyArray<unknown>): string =>
+const jsonl = (lines: ReadonlyArray<Schema.Json>): string =>
   lines.map((line) => JSON.stringify(line)).join("\n") + "\n";
 
 const sessionHeader = (id: string) => ({
@@ -82,7 +101,7 @@ const sessionHeader = (id: string) => ({
 });
 
 let entryCounter = 0;
-const messageEntry = (message: unknown) => {
+const messageEntry = (message: Schema.Json) => {
   entryCounter += 1;
   return {
     type: "message",
@@ -98,7 +117,7 @@ const userMessage = (text: string) =>
 
 const assistantMessage = (
   text: string,
-  calls: ReadonlyArray<{ id: string; name: string; arguments: Record<string, unknown> }> = [],
+  calls: ReadonlyArray<{ id: string; name: string; arguments: Schema.JsonObject }> = [],
 ) =>
   messageEntry({
     role: "assistant",
@@ -119,28 +138,30 @@ const toolResult = (
   toolName: string,
   text: string,
   options: { isError?: boolean; suspend?: boolean } = {},
-) =>
-  messageEntry({
+) => {
+  const message: Schema.JsonObject = {
     role: "toolResult",
     toolCallId,
     toolName,
     content: [{ type: "text", text }],
     isError: options.isError === true,
     timestamp: Date.now(),
-    ...(options.suspend === true
-      ? {
-          details: {
-            version: 1,
-            broodControl: { version: 1, kind: "suspend", invocationId: "inv_1" },
-          },
-        }
-      : {}),
-  });
+  };
+  if (options.suspend === true) {
+    Object.assign(message, {
+      details: {
+        version: 1,
+        broodControl: { version: 1, kind: "suspend", invocationId: "inv_1" },
+      },
+    });
+  }
+  return messageEntry(message);
+};
 
 const buildTranscripts = (): ReadonlyMap<string, { fileName: string; text: string }> =>
   new Map([
     [
-      "agt_root",
+      "agent_root",
       {
         fileName: "2026-08-10T09-14-02-113Z_0192f3c1.jsonl",
         text: jsonl([
@@ -184,7 +205,7 @@ const buildTranscripts = (): ReadonlyMap<string, { fileName: string; text: strin
       },
     ],
     [
-      "agt_api",
+      "agent_api",
       {
         fileName: "2026-08-10T09-14-05-882Z_0192f3c2.jsonl",
         text: jsonl([
@@ -213,7 +234,7 @@ const buildTranscripts = (): ReadonlyMap<string, { fileName: string; text: strin
       },
     ],
     [
-      "agt_schema",
+      "agent_schema",
       {
         fileName: "2026-08-10T09-14-06-004Z_0192f3c3.jsonl",
         text: jsonl([
@@ -232,7 +253,7 @@ const buildTranscripts = (): ReadonlyMap<string, { fileName: string; text: strin
       },
     ],
     [
-      "agt_peer",
+      "agent_peer",
       {
         fileName: "2026-08-10T09-14-09-441Z_0192f3c4.jsonl",
         text: jsonl([
@@ -270,22 +291,33 @@ export const createDemoBridge = (): BridgeHandle => {
 
   const now = (): number => Date.now();
 
-  const emit = (lifecycleEvent: Record<string, unknown>): void => {
+  const emit = (lifecycleEvent: SupervisorLifecycleEvent): void => {
     sequence += 1;
-    store.onEvent({
+    const event: SupervisorEvent = {
       source: "supervisor",
       sequence,
       timestamp: now(),
       ...lifecycleEvent,
-    } as unknown as SupervisorEvent);
+    };
+    store.onEvent(event);
   };
 
-  const emitPi = (agentId: string, event: Record<string, unknown>): void => {
-    store.onEvent({
+  type SessionEventKind<Event> = Event extends PiSessionEvent
+    ? Omit<Event, "agentId" | "sessionId" | "sessionSequence">
+    : never;
+
+  const emitPi = (agentId: string, eventKind: SessionEventKind<PiSessionEvent>): void => {
+    const event: SupervisorEvent = {
       source: "pi",
       timestamp: now(),
-      event: { agentId: brand(agentId), sessionId: "demo", sessionSequence: sequence, ...event },
-    } as unknown as SupervisorEvent);
+      event: {
+        agentId: makeAgentId(agentId),
+        sessionId: "demo",
+        sessionSequence: sequence,
+        ...eventKind,
+      },
+    };
+    store.onEvent(event);
   };
 
   const pathOf = (id: string): string => {
@@ -301,22 +333,25 @@ export const createDemoBridge = (): BridgeHandle => {
     parentId?: string,
     state: AgentState = "starting",
   ): void => {
-    agents.set(id, {
+    const agent: DemoAgent = {
       id,
       name,
-      ...(parentId === undefined ? {} : { parentId }),
       state,
       waitTargets: [],
       createdAt: now(),
       profile: agentProfile,
-    });
-    emit({
+    };
+    if (parentId !== undefined) Object.assign(agent, { parentId });
+    agents.set(id, agent);
+
+    const registered: SupervisorLifecycleEvent = {
       type: "AgentRegistered",
-      agentId: brand(id),
-      name: brand(name),
-      ...(parentId === undefined ? {} : { parentId: brand(parentId) }),
+      agentId: makeAgentId(id),
+      name: makeAgentName(name),
       profile: agentProfile,
-    });
+    };
+    if (parentId !== undefined) Object.assign(registered, { parentId: makeAgentId(parentId) });
+    emit(registered);
   };
 
   const update = (id: string, changes: Partial<DemoAgent>): void => {
@@ -333,7 +368,7 @@ export const createDemoBridge = (): BridgeHandle => {
     const state: AgentState =
       status === "Completed" ? "completed" : status === "Failed" ? "failed" : "interrupted";
     update(id, { state, terminalAt: now(), outcome, activity: undefined, waitTargets: [] });
-    emit({ type: "AgentSettled", agentId: brand(id), status });
+    emit({ type: "AgentSettled", agentId: makeAgentId(id), status });
   };
 
   /**
@@ -352,7 +387,7 @@ export const createDemoBridge = (): BridgeHandle => {
       outcome: undefined,
       activity: "reading the operator message",
     });
-    emit({ type: "AgentRevived", agentId: brand(id), revivals });
+    emit({ type: "AgentRevived", agentId: makeAgentId(id), revivals });
     publishStatus();
     setTimeout(() => {
       if (agents.get(id)?.state !== "running") return;
@@ -367,10 +402,10 @@ export const createDemoBridge = (): BridgeHandle => {
 
   const completed = (id: string, summary: string): Outcome => ({
     _tag: "Completed",
-    agentId: brand(id),
-    name: brand(agents.get(id)?.name ?? id),
+    agentId: makeAgentId(id),
+    name: makeAgentName(agents.get(id)?.name ?? id),
     result: {
-      agentId: brand(id),
+      agentId: makeAgentId(id),
       sessionId: "demo",
       summary,
       truncated: false,
@@ -378,17 +413,24 @@ export const createDemoBridge = (): BridgeHandle => {
     },
   });
 
-  const statusAgent = (agent: DemoAgent, children: ReadonlyArray<DemoAgent>): StatusAgent => ({
-    path: pathOf(agent.id),
-    name: agent.name,
-    state: agent.state,
-    durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
-    ...(agent.activity === undefined ? {} : { activity: agent.activity }),
-    ...(agent.coordination === undefined ? {} : { coordination: agent.coordination }),
-    ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
-    waitTargets: agent.waitTargets.map(pathOf),
-    children: children.map((child) => statusAgent(child, childrenOf(child.id))),
-  });
+  const statusAgent = (agent: DemoAgent, children: ReadonlyArray<DemoAgent>): StatusAgent => {
+    const status: StatusAgent = {
+      path: pathOf(agent.id),
+      name: agent.name,
+      state: agent.state,
+      durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
+      waitTargets: agent.waitTargets.map(pathOf),
+      children: children.map((child) => statusAgent(child, childrenOf(child.id))),
+    };
+    if (agent.activity !== undefined) Object.assign(status, { activity: agent.activity });
+    if (agent.coordination !== undefined) {
+      Object.assign(status, { coordination: agent.coordination });
+    }
+    if (agent.revivals !== undefined && agent.revivals !== 0) {
+      Object.assign(status, { revivals: agent.revivals });
+    }
+    return status;
+  };
 
   const childrenOf = (id: string): ReadonlyArray<DemoAgent> =>
     [...agents.values()].filter((candidate) => candidate.parentId === id);
@@ -427,18 +469,23 @@ export const createDemoBridge = (): BridgeHandle => {
 
   const publishTraffic = (): void =>
     store.setTraffic(
-      traffic.map((record) => ({
-        sequence: record.sequence,
-        at: record.at,
-        kind: record.kind,
-        from: record.from,
-        to: brand(record.to),
-        body: record.body,
-        urgent: record.urgent,
-        status: record.status,
-        ...(record.statusAt === undefined ? {} : { statusAt: record.statusAt }),
-        ...(record.requestId === undefined ? {} : { requestId: brand(record.requestId) }),
-      })),
+      traffic.map((record): TrafficView => {
+        const view: TrafficView = {
+          sequence: record.sequence,
+          at: record.at,
+          kind: record.kind,
+          from: record.from,
+          to: makeAgentPath(record.to),
+          body: record.body,
+          urgent: record.urgent,
+          status: record.status,
+        };
+        if (record.statusAt !== undefined) Object.assign(view, { statusAt: record.statusAt });
+        if (record.requestId !== undefined) {
+          Object.assign(view, { requestId: makeRequestId(record.requestId) });
+        }
+        return view;
+      }),
     );
 
   const pushTraffic = (record: Omit<DemoTrafficRecord, "sequence" | "at">): DemoTrafficRecord => {
@@ -464,14 +511,14 @@ export const createDemoBridge = (): BridgeHandle => {
     store.setBulletins(
       bulletins.map((entry) => ({
         sequence: entry.sequence,
-        author: brand(entry.author),
+        author: makeAgentPath(entry.author),
         body: entry.body,
       })),
     );
 
   const bulletin = (authorId: string, body: string): void => {
     bulletins.push({ sequence: bulletins.length + 1, author: pathOf(authorId), body });
-    emit({ type: "BulletinPosted", authorId: brand(authorId) });
+    emit({ type: "BulletinPosted", authorId: makeAgentId(authorId) });
     publishBulletins();
   };
 
@@ -480,61 +527,65 @@ export const createDemoBridge = (): BridgeHandle => {
     {
       at: 0,
       run: () => {
-        add("agt_root", "root", COORDINATOR, undefined, "running");
-        update("agt_root", { activity: "planning the split" });
+        add("agent_root", "root", COORDINATOR, undefined, "running");
+        update("agent_root", { activity: "planning the split" });
       },
     },
-    { at: 800, run: () => update("agt_root", { activity: "delegating three tracks" }) },
+    { at: 800, run: () => update("agent_root", { activity: "delegating three tracks" }) },
     {
       at: 1_400,
       run: () => {
-        add("agt_api", "api", WORKER, "agt_root", "running");
-        add("agt_schema", "schema", WORKER, "agt_root", "running");
-        add("agt_audit", "audit", WORKER, "agt_root", "queued");
+        add("agent_api", "api", WORKER, "agent_root", "running");
+        add("agent_schema", "schema", WORKER, "agent_root", "running");
+        add("agent_audit", "audit", WORKER, "agent_root", "queued");
         emit({
           type: "BatchAdmitted",
-          parentId: brand("agt_root"),
-          batchId: brand("batch_1"),
-          agentIds: ["agt_api", "agt_schema", "agt_audit"].map((id) => brand(id)),
+          parentId: makeAgentId("agent_root"),
+          batchId: makeBatchId("batch_1"),
+          agentIds: ["agent_api", "agent_schema", "agent_audit"].map((id) => makeAgentId(id)),
         });
       },
     },
     {
       at: 1_900,
       run: () => {
-        const targets = ["agt_api", "agt_schema", "agt_audit"];
+        const targets = ["agent_api", "agent_schema", "agent_audit"];
         emit({
           type: "WaitPlanned",
-          parentId: brand("agt_root"),
-          invocationId: brand("inv_1"),
-          targetIds: targets.map((id) => brand(id)),
+          parentId: makeAgentId("agent_root"),
+          invocationId: makeToolInvocationId("inv_1"),
+          targetIds: targets.map((id) => makeAgentId(id)),
         });
-        update("agt_root", { state: "waiting", waitTargets: targets, activity: undefined });
+        update("agent_root", { state: "waiting", waitTargets: targets, activity: undefined });
         emit({
           type: "AgentSuspended",
-          agentId: brand("agt_root"),
-          waitId: brand("wait_1"),
-          targetIds: targets.map((id) => brand(id)),
+          agentId: makeAgentId("agent_root"),
+          waitId: makeWaitId("wait_1"),
+          targetIds: targets.map((id) => makeAgentId(id)),
         });
       },
     },
     {
       at: 2_300,
       run: () => {
-        update("agt_api", { activity: "reading the existing router" });
-        emitPi("agt_api", { type: "ToolStart", toolCallId: "call_read_1", toolName: "read_file" });
+        update("agent_api", { activity: "reading the existing router" });
+        emitPi("agent_api", {
+          type: "ToolStart",
+          toolCallId: "call_read_1",
+          toolName: "read_file",
+        });
       },
     },
     {
       at: 3_000,
       run: () =>
-        emitPi("agt_api", { type: "ToolEnd", toolCallId: "call_read_1", toolName: "read_file" }),
+        emitPi("agent_api", { type: "ToolEnd", toolCallId: "call_read_1", toolName: "read_file" }),
     },
     {
       at: 3_300,
       run: () => {
-        update("agt_api", { activity: "drafting the read handlers" });
-        emitPi("agt_api", {
+        update("agent_api", { activity: "drafting the read handlers" });
+        emitPi("agent_api", {
           type: "ToolStart",
           toolCallId: "call_write_1",
           toolName: "write_file",
@@ -544,28 +595,28 @@ export const createDemoBridge = (): BridgeHandle => {
     {
       at: 3_900,
       run: () => {
-        add("agt_peer", "peer", WORKER, "agt_api", "starting");
+        add("agent_peer", "peer", WORKER, "agent_api", "starting");
         emit({
           type: "BatchAdmitted",
-          parentId: brand("agt_api"),
-          batchId: brand("batch_2"),
-          agentIds: [brand("agt_peer")],
+          parentId: makeAgentId("agent_api"),
+          batchId: makeBatchId("batch_2"),
+          agentIds: [makeAgentId("agent_peer")],
         });
       },
     },
     {
       at: 4_500,
       run: () =>
-        update("agt_peer", { state: "running", activity: "drafting the pagination helper" }),
+        update("agent_peer", { state: "running", activity: "drafting the pagination helper" }),
     },
     {
       at: 5_000,
       run: () => {
         emit({
           type: "RequestOpened",
-          requestId: brand("req_1"),
-          fromId: brand("agt_peer"),
-          toPath: brand("root/api"),
+          requestId: makeRequestId("request_1"),
+          fromId: makeAgentId("agent_peer"),
+          toPath: makeAgentPath("root/api"),
         });
         pushTraffic({
           kind: "request",
@@ -574,7 +625,7 @@ export const createDemoBridge = (): BridgeHandle => {
           body: "Opaque cursor or numeric offset?",
           urgent: false,
           status: "unread",
-          requestId: "req_1",
+          requestId: "request_1",
         });
       },
     },
@@ -583,11 +634,11 @@ export const createDemoBridge = (): BridgeHandle => {
       run: () => {
         emit({
           type: "RequestReplied",
-          requestId: brand("req_1"),
-          byId: brand("agt_api"),
-          toPath: brand("root/api/peer"),
+          requestId: makeRequestId("request_1"),
+          byId: makeAgentId("agent_api"),
+          toPath: makeAgentPath("root/api/peer"),
         });
-        markTraffic((record) => record.requestId === "req_1", "answered");
+        markTraffic((record) => record.requestId === "request_1", "answered");
         pushTraffic({
           kind: "reply",
           from: "root/api",
@@ -595,7 +646,7 @@ export const createDemoBridge = (): BridgeHandle => {
           body: "Opaque cursor. Use the shared helper in src/routes/pagination.ts.",
           urgent: false,
           status: "sent",
-          requestId: "req_1",
+          requestId: "request_1",
         });
       },
     },
@@ -604,8 +655,8 @@ export const createDemoBridge = (): BridgeHandle => {
       run: () => {
         emit({
           type: "MessageAccepted",
-          fromId: brand("agt_schema"),
-          toPath: brand("root"),
+          fromId: makeAgentId("agent_schema"),
+          toPath: makeAgentPath("root"),
           urgent: true,
         });
         pushTraffic({
@@ -616,7 +667,7 @@ export const createDemoBridge = (): BridgeHandle => {
           urgent: true,
           status: "unread",
         });
-        update("agt_root", {
+        update("agent_root", {
           coordination: {
             unreadMessages: 1,
             unreadUrgent: 1,
@@ -631,14 +682,14 @@ export const createDemoBridge = (): BridgeHandle => {
     {
       at: 6_100,
       run: () => {
-        update("agt_schema", { activity: "validating fixtures" });
-        emitPi("agt_schema", { type: "ToolStart", toolCallId: "call_bash_1", toolName: "bash" });
+        update("agent_schema", { activity: "validating fixtures" });
+        emitPi("agent_schema", { type: "ToolStart", toolCallId: "call_bash_1", toolName: "bash" });
       },
     },
     {
       at: 6_900,
       run: () =>
-        emitPi("agt_schema", {
+        emitPi("agent_schema", {
           type: "ToolEnd",
           toolCallId: "call_bash_1",
           toolName: "bash",
@@ -649,7 +700,7 @@ export const createDemoBridge = (): BridgeHandle => {
       at: 7_400,
       run: () =>
         bulletin(
-          "agt_api",
+          "agent_api",
           "Cursor encoding is settled: opaque base64 of (published_at, id). Anything paginating the changelog should use the shared helper in src/routes/pagination.ts rather than rolling its own.",
         ),
     },
@@ -657,20 +708,24 @@ export const createDemoBridge = (): BridgeHandle => {
       at: 8_200,
       run: () =>
         settle(
-          "agt_peer",
+          "agent_peer",
           "Completed",
-          completed("agt_peer", "Pagination helper written and exported."),
+          completed("agent_peer", "Pagination helper written and exported."),
         ),
     },
     {
       at: 8_800,
       run: () => {
-        emitPi("agt_api", { type: "ToolEnd", toolCallId: "call_write_1", toolName: "write_file" });
+        emitPi("agent_api", {
+          type: "ToolEnd",
+          toolCallId: "call_write_1",
+          toolName: "write_file",
+        });
         settle(
-          "agt_api",
+          "agent_api",
           "Completed",
           completed(
-            "agt_api",
+            "agent_api",
             "Both read endpoints are in place.\nGET /changelog paginates by opaque cursor.\nGET /changelog/:id returns a single entry.\nCovered by the existing router tests; no new dependencies.",
           ),
         );
@@ -679,10 +734,10 @@ export const createDemoBridge = (): BridgeHandle => {
     {
       at: 9_700,
       run: () =>
-        settle("agt_schema", "Failed", {
+        settle("agent_schema", "Failed", {
           _tag: "Failed",
-          agentId: brand("agt_schema"),
-          name: brand("schema"),
+          agentId: makeAgentId("agent_schema"),
+          name: makeAgentName("schema"),
           code: "AgentRunFailed",
           message:
             "Fixture validation rejected 3 of 12 samples: the cursor field is an opaque string upstream but an integer in the fixtures. Reconciling needs a wire-format decision this agent cannot make alone.",
@@ -690,13 +745,14 @@ export const createDemoBridge = (): BridgeHandle => {
     },
     {
       at: 10_600,
-      run: () => update("agt_audit", { state: "running", activity: "cross-checking both tracks" }),
+      run: () =>
+        update("agent_audit", { state: "running", activity: "cross-checking both tracks" }),
     },
     {
       at: 11_800,
       run: () =>
         bulletin(
-          "agt_audit",
+          "agent_audit",
           "Coherence check: the endpoints and the schema disagree on one field only (cursor). Everything else lines up, so this is a single-decision block rather than a redesign.",
         ),
     },
@@ -704,10 +760,10 @@ export const createDemoBridge = (): BridgeHandle => {
       at: 13_000,
       run: () =>
         settle(
-          "agt_audit",
+          "agent_audit",
           "Completed",
           completed(
-            "agt_audit",
+            "agent_audit",
             "One disagreement found: cursor typing. No other coherence issues.",
           ),
         ),
@@ -715,10 +771,14 @@ export const createDemoBridge = (): BridgeHandle => {
     {
       at: 14_000,
       run: () => {
-        emit({ type: "AgentResumed", agentId: brand("agt_root"), waitId: brand("wait_1") });
-        emit({ type: "InboxRead", readerId: brand("agt_root"), messages: 1, requests: 0 });
+        emit({
+          type: "AgentResumed",
+          agentId: makeAgentId("agent_root"),
+          waitId: makeWaitId("wait_1"),
+        });
+        emit({ type: "InboxRead", readerId: makeAgentId("agent_root"), messages: 1, requests: 0 });
         markTraffic((record) => record.kind === "message" && record.to === "root", "read");
-        update("agt_root", {
+        update("agent_root", {
           state: "running",
           waitTargets: [],
           activity: "synthesizing results",
@@ -730,10 +790,10 @@ export const createDemoBridge = (): BridgeHandle => {
       at: 16_000,
       run: () => {
         settle(
-          "agt_root",
+          "agent_root",
           "Completed",
           completed(
-            "agt_root",
+            "agent_root",
             "The read API ships; the schema track does not.\nGET /changelog and GET /changelog/:id are implemented and tested.\nThe schema agent failed on a wire-format disagreement about the cursor field, which needs an operator decision before a second attempt.",
           ),
         );
@@ -800,27 +860,30 @@ export const createDemoBridge = (): BridgeHandle => {
         return;
       }
       const parent = agent.parentId === undefined ? undefined : agents.get(agent.parentId);
-      store.setDetail({
+      const detail: AgentDetail = {
         version: 2,
         path: pathOf(agent.id),
-        id: brand(agent.id),
-        ...(agent.parentId === undefined ? {} : { parentId: brand(agent.parentId) }),
-        ...(parent === undefined ? {} : { parentPath: pathOf(parent.id) }),
-        name: brand(agent.name),
+        id: makeAgentId(agent.id),
+        name: makeAgentName(agent.name),
         state: agent.state,
         durationMillis: Math.max(0, (agent.terminalAt ?? now()) - agent.createdAt),
-        ...(agent.activity === undefined ? {} : { activity: agent.activity }),
         waitTargets: agent.waitTargets.map(pathOf),
         children: childrenOf(agent.id).map((child) => pathOf(child.id)),
         profile: agent.profile,
         createdAt: agent.createdAt,
         updatedAt: now(),
-        ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
-        ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
-        ...(agent.revivals === undefined || agent.revivals === 0
-          ? {}
-          : { revivals: agent.revivals }),
-      });
+      };
+      if (agent.parentId !== undefined) {
+        Object.assign(detail, { parentId: makeAgentId(agent.parentId) });
+      }
+      if (parent !== undefined) Object.assign(detail, { parentPath: pathOf(parent.id) });
+      if (agent.activity !== undefined) Object.assign(detail, { activity: agent.activity });
+      if (agent.terminalAt !== undefined) Object.assign(detail, { terminalAt: agent.terminalAt });
+      if (agent.outcome !== undefined) Object.assign(detail, { outcome: agent.outcome });
+      if (agent.revivals !== undefined && agent.revivals !== 0) {
+        Object.assign(detail, { revivals: agent.revivals });
+      }
+      store.setDetail(detail);
     },
 
     fetchBulletins: async () => {
@@ -843,7 +906,7 @@ export const createDemoBridge = (): BridgeHandle => {
         return `The swarm is ${lifecycle === "not_started" ? "not running" : "closing"}.`;
       }
       if (body.trim() === "") return "Operator messages must be nonblank.";
-      emit({ type: "OperatorMessageAccepted", toId: brand(agent.id) });
+      emit({ type: "OperatorMessageAccepted", toId: makeAgentId(agent.id) });
       if (agent.terminalAt !== undefined) revive(agent.id);
       const record = pushTraffic({
         kind: "operator",
@@ -867,13 +930,13 @@ export const createDemoBridge = (): BridgeHandle => {
       if (agent === undefined || agent.terminalAt !== undefined) return;
       emit({
         type: "AgentInterruptRequested",
-        agentId: brand(agent.id),
+        agentId: makeAgentId(agent.id),
         reason: { _tag: "OperatorRequested", source: "api" },
       });
       settle(agent.id, "Interrupted", {
         _tag: "Interrupted",
-        agentId: brand(agent.id),
-        name: brand(agent.name),
+        agentId: makeAgentId(agent.id),
+        name: makeAgentName(agent.name),
         reason: "OperatorRequested",
       });
       publishStatus();
@@ -888,8 +951,8 @@ export const createDemoBridge = (): BridgeHandle => {
         if (agent.terminalAt !== undefined) continue;
         settle(agent.id, "Interrupted", {
           _tag: "Interrupted",
-          agentId: brand(agent.id),
-          name: brand(agent.name),
+          agentId: makeAgentId(agent.id),
+          name: makeAgentName(agent.name),
           reason: "OperatorRequested",
         });
       }
@@ -903,7 +966,7 @@ export const createDemoBridge = (): BridgeHandle => {
       });
       // The run resolves with the root's latest delivered result, exactly as
       // session mode does when the operator closes a live swarm.
-      const root = agents.get("agt_root");
+      const root = agents.get("agent_root");
       store.setRunOutcome(
         root?.outcome?._tag === "Completed"
           ? { kind: "completed", text: root.outcome.result.summary.split("\n")[0] ?? "" }

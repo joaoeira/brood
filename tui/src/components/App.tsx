@@ -11,7 +11,7 @@ import { readFile } from "node:fs/promises";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { BridgeHandle } from "../bridge/types";
-import { flattenAgents, store, useAppState } from "../store";
+import { flattenAgents, store, useAppState, type Overlay } from "../store";
 import { theme } from "../theme";
 import { BulletinOverlay } from "./BulletinOverlay";
 import { CommsScreen } from "./CommsScreen";
@@ -22,6 +22,21 @@ import { MonitorScreen } from "./MonitorScreen";
 import { TranscriptView } from "./TranscriptView";
 
 const STATUS_POLL_MILLIS = 1_000;
+
+type ConfirmOverlay = Extract<Overlay, { readonly kind: "confirm-interrupt" | "confirm-quit" }>;
+
+const confirmOverlayOf = (overlay: Overlay): ConfirmOverlay | undefined => {
+  switch (overlay) {
+    case "none":
+    case "bulletins":
+    case "transcript":
+    case "compose":
+    case "comms":
+      return undefined;
+    default:
+      return overlay;
+  }
+};
 
 export interface AppProps {
   readonly bridge: BridgeHandle;
@@ -35,6 +50,7 @@ export const App = ({ bridge }: AppProps) => {
 
   const rows = useMemo(() => flattenAgents(state.status?.agents ?? []), [state.status]);
   const { overlay, phase, selection } = state;
+  const confirmOverlay = confirmOverlayOf(overlay);
 
   useEffect(() => {
     if (phase !== "monitor") return;
@@ -109,8 +125,8 @@ export const App = ({ bridge }: AppProps) => {
   );
 
   const confirm = useCallback(async (): Promise<void> => {
-    if (typeof overlay !== "object") return;
-    if (overlay.kind === "confirm-interrupt") {
+    if (confirmOverlay === undefined) return;
+    if (confirmOverlay.kind === "confirm-interrupt") {
       store.setOverlay("none");
       if (selection !== undefined) await bridge.interrupt(selection);
       return;
@@ -121,7 +137,7 @@ export const App = ({ bridge }: AppProps) => {
     store.setQuitting(true);
     await bridge.close();
     await exitCleanly();
-  }, [bridge, exitCleanly, overlay, selection]);
+  }, [bridge, confirmOverlay, exitCleanly, selection]);
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
@@ -136,7 +152,7 @@ export const App = ({ bridge }: AppProps) => {
       return;
     }
 
-    if (typeof overlay === "object") {
+    if (confirmOverlay !== undefined) {
       if (state.quitting) return;
       if (key.name === "y") void confirm();
       else if (key.name === "n" || key.name === "escape") store.setOverlay("none");
@@ -246,11 +262,11 @@ export const App = ({ bridge }: AppProps) => {
   }
 
   const dialog =
-    typeof overlay === "object" ? (
+    confirmOverlay !== undefined ? (
       <ConfirmDialog
-        title={overlay.kind === "confirm-quit" ? " CLOSE " : " INTERRUPT "}
+        title={confirmOverlay.kind === "confirm-quit" ? " CLOSE " : " INTERRUPT "}
         question={
-          overlay.kind === "confirm-quit"
+          confirmOverlay.kind === "confirm-quit"
             ? "Close the session and drain the swarm?"
             : `Interrupt ${selection ?? "this agent"}?`
         }

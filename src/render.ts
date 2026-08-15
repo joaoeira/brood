@@ -67,14 +67,13 @@ const truncateToBudget = (
   return { prefixLength, totalCost };
 };
 
-const truncateCodePoints = (
-  value: string,
-  maxCodePoints: number,
-): {
+interface TruncatedText {
   readonly text: string;
   readonly truncated: boolean;
   readonly originalCharacterCount: number;
-} => {
+}
+
+const truncateCodePoints = (value: string, maxCodePoints: number): TruncatedText => {
   const points = Array.from(value);
   const sentinel = Array.from(TRUNCATION_SENTINEL);
   const selection = truncateToBudget(points, () => 1, Math.max(0, maxCodePoints - sentinel.length));

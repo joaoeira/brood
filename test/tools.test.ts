@@ -47,6 +47,43 @@ const delegateDetails = {
   },
 };
 
+type ControlTool = ReturnType<typeof makeAgentTools>[number];
+
+interface RawDelegatedTaskInput {
+  readonly name: string;
+  readonly goal: string | number;
+  readonly profile?: string;
+  readonly hidden?: string;
+}
+
+interface RawControlToolInput {
+  readonly tasks?: ReadonlyArray<RawDelegatedTaskInput>;
+  readonly wait?: string;
+  readonly children?: ReadonlyArray<string | number>;
+  readonly hidden?: string;
+}
+
+// SAFETY: these concrete Brood tools ignore Pi's extension context; tests invoke the definitions
+// directly and provide the required-but-unused fifth argument.
+const unusedExtensionContext = undefined as never;
+
+const executeRawControlTool = (
+  tool: ControlTool,
+  toolCallId: string,
+  input: RawControlToolInput,
+) => {
+  // SAFETY: each tool strictly decodes its raw input before accessing it; this helper intentionally
+  // crosses the static TypeBox contract to exercise rejection of malformed provider payloads.
+  const providerInput = input as never;
+  return tool.execute(toolCallId, providerInput, undefined, undefined, unusedExtensionContext);
+};
+
+const firstText = (result: Awaited<ReturnType<ControlTool["execute"]>>): string => {
+  const content = result.content[0];
+  if (content?.type !== "text") throw new Error("Expected text tool content");
+  return content.text;
+};
+
 const makePort = (): ControlToolPort => ({
   delegate: vi.fn<ControlToolPort["delegate"]>(() => Effect.succeed(delegateDetails)),
   waitForAgents: vi.fn<ControlToolPort["waitForAgents"]>((_callerId, invocationId) =>
@@ -101,13 +138,20 @@ describe("Brood tools", () => {
   it("builds one delegate profile enum from the sorted run catalogue", () => {
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), makePort());
     expect(delegate?.name).toBe("delegate");
-    const properties = Reflect.get(delegate!.parameters, "properties") as object;
-    const tasks = Reflect.get(properties, "tasks") as object;
-    const items = Reflect.get(tasks, "items") as object;
-    const taskProperties = Reflect.get(items, "properties") as object;
-    const profile = Reflect.get(taskProperties, "profile") as object;
-    expect(Reflect.get(profile, "enum")).toEqual(["coordinator", "worker"]);
-    expect(Reflect.has(profile, "allOf")).toBe(false);
+    expect(delegate.parameters).toMatchObject({
+      properties: {
+        tasks: {
+          items: {
+            properties: {
+              profile: { enum: ["coordinator", "worker"] },
+            },
+          },
+        },
+      },
+    });
+    expect(delegate.parameters.properties.tasks.items.properties.profile).not.toHaveProperty(
+      "allOf",
+    );
     expect(delegate?.description).toContain("Default profile: worker");
     expect(delegate?.description).toContain("irreversibly consumes one admission");
     expect(delegate?.description).toContain("never replenish during the run");
@@ -121,13 +165,9 @@ describe("Brood tools", () => {
   it("normalizes a whole delegate batch and defaults wait to all", async () => {
     const port = makePort();
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
-    const result = await delegate!.execute(
-      "call_1",
-      { tasks: [{ name: " research ", goal: " investigate " }] },
-      undefined,
-      undefined,
-      {} as never,
-    );
+    const result = await executeRawControlTool(delegate, "call_1", {
+      tasks: [{ name: " research ", goal: " investigate " }],
+    });
 
     expect(port.delegate).toHaveBeenCalledWith(
       makeAgentId("agent_1"),
@@ -139,7 +179,7 @@ describe("Brood tools", () => {
     expect(() =>
       Schema.decodeUnknownSync(DelegateToolDetails)({ ...delegateDetails, version: 1 }),
     ).toThrow("Expected 2");
-    const text = (result.content[0] as { readonly text: string }).text;
+    const text = firstText(result);
     expect(text).toContain("research -> agent_2 (profile: worker)");
     expect(text).toContain("Agent admissions after this batch: 3 of 8 used; 5 remain.");
     expect(text).toContain("may decrease concurrently");
@@ -149,18 +189,12 @@ describe("Brood tools", () => {
     const port = makePort();
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
     await expect(
-      delegate!.execute(
-        "call_1",
-        {
-          tasks: [
-            { name: "same", goal: "one" },
-            { name: " same ", goal: "two" },
-          ],
-        },
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(delegate, "call_1", {
+        tasks: [
+          { name: "same", goal: "one" },
+          { name: " same ", goal: "two" },
+        ],
+      }),
     ).rejects.toThrow("Duplicate task name");
     expect(port.delegate).not.toHaveBeenCalled();
   });
@@ -169,13 +203,9 @@ describe("Brood tools", () => {
     const port = makePort();
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
     await expect(
-      delegate!.execute(
-        "call_1",
-        { tasks: [{ name: "research", goal: "go", profile: "unknown" }] },
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(delegate, "call_1", {
+        tasks: [{ name: "research", goal: "go", profile: "unknown" }],
+      }),
     ).rejects.toThrow("Unknown profile");
     expect(port.delegate).not.toHaveBeenCalled();
   });
@@ -184,13 +214,10 @@ describe("Brood tools", () => {
     const port = makePort();
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
     await expect(
-      delegate.execute(
-        "call_1",
-        { tasks: [{ name: "research", goal: "go" }], wait: "sometimes" as "all" },
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(delegate, "call_1", {
+        tasks: [{ name: "research", goal: "go" }],
+        wait: "sometimes",
+      }),
     ).rejects.toThrow('Expected "all" | "none"');
     expect(port.delegate).not.toHaveBeenCalled();
   });
@@ -200,24 +227,15 @@ describe("Brood tools", () => {
     const [delegate, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
 
     await expect(
-      delegate.execute(
-        "call_1",
-        {
-          tasks: [{ name: "research", goal: "go", hidden: "ignored before" }],
-        } as never,
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(delegate, "call_1", {
+        tasks: [{ name: "research", goal: "go", hidden: "ignored before" }],
+      }),
     ).rejects.toThrow("Invalid task batch");
     await expect(
-      wait.execute(
-        "call_2",
-        { children: ["research"], hidden: "ignored before" } as never,
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(wait, "call_2", {
+        children: ["research"],
+        hidden: "ignored before",
+      }),
     ).rejects.toThrow("Invalid agent selection");
 
     expect(port.delegate).not.toHaveBeenCalled();
@@ -227,13 +245,9 @@ describe("Brood tools", () => {
   it("validates all wait names and renders terminal outcomes from details", async () => {
     const port = makePort();
     const [, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
-    const result = await wait!.execute(
-      "call_wait",
-      { children: [" first ", "second"] },
-      undefined,
-      undefined,
-      {} as never,
-    );
+    const result = await executeRawControlTool(wait, "call_wait", {
+      children: [" first ", "second"],
+    });
 
     expect(port.waitForAgents).toHaveBeenCalledWith(
       makeAgentId("agent_1"),
@@ -261,13 +275,9 @@ describe("Brood tools", () => {
       ),
     };
     const [, wait] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
-    const result = await wait.execute(
-      "call_wait",
-      { children: ["first"] },
-      undefined,
-      undefined,
-      {} as never,
-    );
+    const result = await executeRawControlTool(wait, "call_wait", {
+      children: ["first"],
+    });
     expect(result.content[0]).toEqual({
       type: "text",
       text: expect.stringContaining("while waiting for: first"),
@@ -291,13 +301,9 @@ describe("admission rejection at the tool boundary", () => {
     const [delegate] = makeAgentTools(makeAgentId("agent_1"), catalogue(), port);
 
     await expect(
-      delegate!.execute(
-        "call_reject",
-        { tasks: [{ name: "a", goal: "work" }] },
-        undefined,
-        undefined,
-        {} as never,
-      ),
+      executeRawControlTool(delegate, "call_reject", {
+        tasks: [{ name: "a", goal: "work" }],
+      }),
     ).rejects.toThrow(
       "Requested 3 agent admissions, but only 1 of 8 remain; no agents were created. Re-plan with at most 1 task, or continue directly.",
     );

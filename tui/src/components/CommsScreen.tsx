@@ -22,14 +22,14 @@ export interface CommsScreenProps {
 
 const DETAIL_HEIGHT = 10;
 
-const KIND_GLYPHS: Record<TrafficView["kind"], string> = {
+const KIND_GLYPHS = {
   message: "✉",
   request: "?",
   reply: "↩",
   operator: glyphs.operator,
-};
+} satisfies Record<TrafficView["kind"], string>;
 
-const STATUS_COLORS: Record<TrafficView["status"], string> = {
+const STATUS_COLORS = {
   unread: theme.amber,
   pending: theme.amber,
   read: theme.faint,
@@ -37,7 +37,7 @@ const STATUS_COLORS: Record<TrafficView["status"], string> = {
   answered: theme.green,
   delivered: theme.blue,
   void: theme.red,
-};
+} satisfies Record<TrafficView["status"], string>;
 
 const kindColor = (record: TrafficView): string => {
   if (record.kind === "operator") return theme.violet;

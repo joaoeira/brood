@@ -20,7 +20,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, Queue, Ref, Result, Schema, Scope, Stream } from "effect";
+import { Data, Effect, Option, Queue, Ref, Result, Schema, Scope, Stream } from "effect";
 import {
   AgentId,
   DelegateToolDetails,
@@ -237,13 +237,17 @@ const freshClassifier = (): RunClassifier => ({
 });
 
 const OPERATOR_MESSAGE_ID_PATTERN = /^<brood_operator_message id="(opmsg_[A-Za-z0-9-]+)"/;
+const TextContentBlock = Schema.Struct({
+  type: Schema.String,
+  text: Schema.optionalKey(Schema.String),
+});
+const isTextContentBlock = Schema.is(TextContentBlock);
+const isStringContent = Schema.is(Schema.String);
 
 const userMessageText = (content: string | ReadonlyArray<{ type: string }>): string =>
-  typeof content === "string"
+  isStringContent(content)
     ? content
-    : content
-        .map((block) => ("text" in block && typeof block.text === "string" ? block.text : ""))
-        .join("\n");
+    : content.map((block) => (isTextContentBlock(block) ? (block.text ?? "") : "")).join("\n");
 
 const safeMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
@@ -440,16 +444,21 @@ export const findLatestSessionFile = async (directory: string): Promise<string |
  * results are appended in call order, chained onto the entry tree exactly as
  * Pi would append them. Returns how many results were synthesized.
  */
+const PersistedRecord = Schema.Record(Schema.String, Schema.Json);
+type PersistedRecord = typeof PersistedRecord.Type;
+const PersistedContent = Schema.Array(Schema.Json);
+const decodePersistedRecord = Schema.decodeUnknownOption(PersistedRecord);
+const decodePersistedContent = Schema.decodeUnknownOption(PersistedContent);
+const decodePersistedString = Schema.decodeUnknownOption(Schema.String);
+
 export const repairDanglingToolCalls = async (sessionFile: string): Promise<number> => {
   const raw = await readFile(sessionFile, "utf8");
-  const entries: Array<Record<string, unknown>> = [];
+  const entries: Array<PersistedRecord> = [];
   for (const line of raw.split("\n")) {
     if (line.trim() === "") continue;
     try {
-      const parsed: unknown = JSON.parse(line);
-      if (typeof parsed === "object" && parsed !== null) {
-        entries.push(parsed as Record<string, unknown>);
-      }
+      const entry = Option.getOrUndefined(decodePersistedRecord(JSON.parse(line)));
+      if (entry !== undefined) entries.push(entry);
     } catch {
       // Matches Pi's own reader: malformed lines are skipped, not fatal.
     }
@@ -460,23 +469,28 @@ export const repairDanglingToolCalls = async (sessionFile: string): Promise<numb
   const usedIds = new Set<string>();
   let leafId: string | null = null;
   for (const entry of entries) {
-    if (typeof entry.id === "string") usedIds.add(entry.id);
-    if (entry.type !== "session" && typeof entry.id === "string") leafId = entry.id;
-    if (entry.type !== "message") continue;
-    const message = entry.message;
-    if (typeof message !== "object" || message === null) continue;
-    const { role, content, toolCallId } = message as {
-      role?: unknown;
-      content?: unknown;
-      toolCallId?: unknown;
-    };
-    if (role === "assistant" && Array.isArray(content)) {
-      for (const block of content as ReadonlyArray<Record<string, unknown>>) {
-        if (block.type === "toolCall" && typeof block.id === "string") {
-          calls.set(block.id, typeof block.name === "string" ? block.name : "unknown");
+    const id = Option.getOrUndefined(decodePersistedString(entry["id"]));
+    const type = Option.getOrUndefined(decodePersistedString(entry["type"]));
+    if (id !== undefined) usedIds.add(id);
+    if (type !== "session" && id !== undefined) leafId = id;
+    if (type !== "message") continue;
+    const message = Option.getOrUndefined(decodePersistedRecord(entry["message"]));
+    if (message === undefined) continue;
+    const role = Option.getOrUndefined(decodePersistedString(message["role"]));
+    const toolCallId = Option.getOrUndefined(decodePersistedString(message["toolCallId"]));
+    const blocks = Option.getOrUndefined(decodePersistedContent(message["content"]));
+    if (role === "assistant" && blocks !== undefined) {
+      for (const rawBlock of blocks) {
+        const block = Option.getOrUndefined(decodePersistedRecord(rawBlock));
+        if (block === undefined) continue;
+        const blockType = Option.getOrUndefined(decodePersistedString(block["type"]));
+        const blockId = Option.getOrUndefined(decodePersistedString(block["id"]));
+        const blockName = Option.getOrUndefined(decodePersistedString(block["name"]));
+        if (blockType === "toolCall" && blockId !== undefined) {
+          calls.set(blockId, blockName ?? "unknown");
         }
       }
-    } else if (role === "toolResult" && typeof toolCallId === "string") {
+    } else if (role === "toolResult" && toolCallId !== undefined) {
       answered.add(toolCallId);
     }
   }

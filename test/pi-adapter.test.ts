@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { defineTool, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { Cause, Effect, Exit, Fiber, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, Schema, Stream } from "effect";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
@@ -28,6 +28,18 @@ import {
 import { compileAgentToolFactory, type ControlToolPort } from "../src/tools.js";
 
 const agentId = makeAgentId("agent_adapter");
+
+const PersistedRequestDetails = Schema.Struct({ request: Schema.String });
+const SyntheticToolResultEntry = Schema.Struct({
+  id: Schema.String,
+  parentId: Schema.String,
+  message: Schema.Struct({
+    role: Schema.String,
+    toolCallId: Schema.String,
+    toolName: Schema.String,
+    isError: Schema.Boolean,
+  }),
+});
 
 const unusedPort: ControlToolPort = {
   delegate: () => Effect.die("unused"),
@@ -637,9 +649,8 @@ describe("Pi control-result inspection", () => {
             message.toolName === "ask_agent" &&
             message.toolCallId === "call_ask_persisted" &&
             !message.isError &&
-            typeof message.details === "object" &&
-            message.details !== null &&
-            Reflect.get(message.details, "request") === "request_persisted",
+            Schema.is(PersistedRequestDetails)(message.details) &&
+            message.details.request === "request_persisted",
         );
         return fauxAssistantMessage("reply received", { stopReason: "stop" });
       },
@@ -858,27 +869,24 @@ describe("Session resume and repair", () => {
       const lines = (await readFile(file, "utf8"))
         .trim()
         .split("\n")
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
+        .map((line) => JSON.parse(line));
       expect(lines).toHaveLength(6);
-      const [syntheticB, syntheticC] = lines.slice(4) as Array<{
-        id: string;
-        parentId: string;
-        message: Record<string, unknown>;
-      }>;
-      expect(syntheticB!.message).toMatchObject({
+      const syntheticB = Schema.decodeUnknownSync(SyntheticToolResultEntry)(lines[4]);
+      const syntheticC = Schema.decodeUnknownSync(SyntheticToolResultEntry)(lines[5]);
+      expect(syntheticB.message).toMatchObject({
         role: "toolResult",
         toolCallId: "call_b",
         toolName: "write",
         isError: true,
       });
-      expect(syntheticC!.message).toMatchObject({
+      expect(syntheticC.message).toMatchObject({
         role: "toolResult",
         toolCallId: "call_c",
         toolName: "bash",
         isError: true,
       });
-      expect(syntheticB!.parentId).toBe("aaaa0003");
-      expect(syntheticC!.parentId).toBe(syntheticB!.id);
+      expect(syntheticB.parentId).toBe("aaaa0003");
+      expect(syntheticC.parentId).toBe(syntheticB.id);
 
       // Idempotent: a second pass finds nothing dangling.
       expect(await repairDanglingToolCalls(file)).toBe(0);

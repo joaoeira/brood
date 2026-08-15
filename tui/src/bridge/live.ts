@@ -9,9 +9,16 @@
  * every effect runs with logging silenced, because Brood's logger and the
  * renderer both want stdout.
  */
-import { Cause, Effect, Exit, Option, References, Scope, Stream } from "effect";
-import type { BroodApplication, BroodResult, SupervisorEvent } from "../brood";
-import { makeBroodApplicationFromUnknown } from "../brood";
+import { Cause, Effect, Exit, Option, References, Schema, Scope, Stream } from "effect";
+import {
+  AgentFailed,
+  RootInterrupted,
+  RootStartError,
+  makeBroodApplicationFromUnknown,
+  type BroodApplication,
+  type BroodResult,
+  type SupervisorEvent,
+} from "../brood";
 import { store } from "../store";
 import { tildify } from "../theme";
 import { makeFileTranscriptReader } from "../transcript/watch";
@@ -29,7 +36,7 @@ const messageOf = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
 export interface LiveBridgeOptions {
-  readonly rawConfig: unknown;
+  readonly rawConfig: Schema.Json;
   /** Anchors relative and defaulted config paths: the config file's directory. */
   readonly baseDir: string;
   readonly configSummary: ConfigSummary;
@@ -130,12 +137,8 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
       return;
     }
     const error = Option.getOrUndefined(Cause.findErrorOption(exit.cause));
-    const tag =
-      typeof error === "object" && error !== null && "_tag" in error
-        ? String((error as { _tag: unknown })._tag)
-        : undefined;
 
-    if (tag === "RootStartError") {
+    if (Schema.is(RootStartError)(error)) {
       store.setLaunchError(messageOf(error));
       store.setPhase("launch");
       // The registry never admitted a root, so the operator may fix the goal
@@ -144,17 +147,15 @@ export const createLiveBridge = async (options: LiveBridgeOptions): Promise<Brid
       runSettled = false;
       return;
     }
-    if (tag === "AgentFailed") {
-      const failure = (error as { failure?: { code?: string; message?: string } }).failure;
+    if (Schema.is(AgentFailed)(error)) {
       store.setRunOutcome({
         kind: "failed",
-        text: `${failure?.code ?? "AgentFailed"} — ${failure?.message ?? ""}`,
+        text: `${error.failure.code} — ${error.failure.message}`,
       });
       return;
     }
-    if (tag === "RootInterrupted") {
-      const reason = (error as { reason?: { _tag?: string } }).reason;
-      store.setRunOutcome({ kind: "interrupted", text: reason?._tag ?? "interrupted" });
+    if (Schema.is(RootInterrupted)(error)) {
+      store.setRunOutcome({ kind: "interrupted", text: error.reason._tag });
       return;
     }
     store.setRunOutcome({ kind: "failed", text: messageOf(error ?? exit.cause) });

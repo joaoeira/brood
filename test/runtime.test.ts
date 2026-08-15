@@ -290,7 +290,7 @@ describe("Brood runtime configuration", () => {
 
 describe("legacy maxAgents tombstone", () => {
   it("rejects the legacy key with the rename message at its path", async () => {
-    const raw: unknown = { ...validConfig(), maxAgents: 50 };
+    const raw = { ...validConfig(), maxAgents: 50 };
     const error = await Effect.runPromise(Effect.flip(decodeBroodConfigUnknown(raw)));
 
     expect(error._tag).toBe("BroodConfigError");
@@ -300,7 +300,7 @@ describe("legacy maxAgents tombstone", () => {
   });
 
   it("documents the provider-erasure gap: a null legacy value decodes as absent", async () => {
-    const raw: unknown = { ...validConfig(), maxAgents: null };
+    const raw = { ...validConfig(), maxAgents: null };
     const config = await Effect.runPromise(decodeBroodConfigUnknown(raw));
 
     expect(config.maxAgentAdmissions).toBe(128);

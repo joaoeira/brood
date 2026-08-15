@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
-import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Stream } from "effect";
+import { Cause, Data, Effect, Exit, Match, Option, Queue, Ref, Schema, Stream } from "effect";
 import {
   AgentFailed,
   BroodConfigError,
@@ -17,6 +17,7 @@ import {
   type BroodRunRequestEncoded,
 } from "./agent.js";
 import { makeBroodApplicationFromUnknown, type BroodApplication } from "./main.js";
+import { assignOptional } from "./optional.js";
 import { formatAgentDetail, formatSwarmStatus } from "./status.js";
 
 export interface CliArguments {
@@ -155,7 +156,10 @@ export const decodeOperatorCommand = Effect.fn("Brood.Cli.decodeOperatorCommand"
     }),
 );
 
-const writeJson = (value: unknown): Effect.Effect<void> =>
+const JsonValue = Schema.Json;
+type JsonValue = typeof JsonValue.Type;
+
+const writeJson = <Value>(value: Value): Effect.Effect<void> =>
   Effect.sync(() => {
     process.stdout.write(`${JSON.stringify(value)}\n`);
   });
@@ -165,7 +169,7 @@ const writeMessage = (message: string): Effect.Effect<void> =>
     process.stderr.write(`${message}\n`);
   });
 
-const loadConfig = (path: string): Effect.Effect<unknown, CliInputError> =>
+const loadConfig = (path: string): Effect.Effect<JsonValue, CliInputError> =>
   Effect.tryPromise({
     try: () => readFile(path, "utf8"),
     catch: (cause) =>
@@ -175,7 +179,7 @@ const loadConfig = (path: string): Effect.Effect<unknown, CliInputError> =>
   }).pipe(
     Effect.flatMap((text) =>
       Effect.try({
-        try: (): unknown => JSON.parse(text),
+        try: () => Schema.decodeUnknownSync(JsonValue)(JSON.parse(text)),
         catch: (cause) =>
           new CliInputError({
             message: `Invalid JSON in ${path}: ${causeMessage(cause)}`,
@@ -319,10 +323,9 @@ export const runCli = (arguments_: ReadonlyArray<string>): Effect.Effect<unknown
         rawConfig,
         dirname(parsed.configPath),
       );
-      return yield* runApplication(application, parsed, {
-        goal: parsed.goal,
-        ...(instructions === undefined ? {} : { instructions }),
-      });
+      const request: BroodRunRequestEncoded = { goal: parsed.goal };
+      assignOptional(request, "instructions", instructions);
+      return yield* runApplication(application, parsed, request);
     }),
   );
 

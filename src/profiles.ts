@@ -31,7 +31,7 @@ const THINKING_LEVELS = [
   "max",
 ] as const satisfies ReadonlyArray<ModelThinkingLevel>;
 
-const exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
+const exhaustiveThinkingLevels = {
   off: true,
   minimal: true,
   low: true,
@@ -39,7 +39,7 @@ const exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
   high: true,
   xhigh: true,
   max: true,
-};
+} satisfies Record<ModelThinkingLevel, true>;
 void exhaustiveThinkingLevels;
 
 export const ModelThinkingLevel = Schema.Literals(THINKING_LEVELS);

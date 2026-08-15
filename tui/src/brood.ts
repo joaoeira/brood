@@ -6,11 +6,18 @@
  */
 export {
   AgentFailed,
+  AgentId,
+  ProfileName,
   RootInterrupted,
   RootStartError,
   UnknownAgentReference,
   makeBroodApplicationFromUnknown,
 } from "../../src/index.js";
+
+export { AgentName, BatchId, ToolInvocationId, WaitId } from "../../src/agent.js";
+export { AgentPath, RequestId } from "../../src/communication.js";
+export type { PiSessionEvent } from "../../src/pi-adapter.js";
+export type { SupervisorLifecycleEvent } from "../../src/supervisor.js";
 
 export type {
   AgentDetail,

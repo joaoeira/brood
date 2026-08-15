@@ -19,8 +19,11 @@ export const SuspensionMarker = Schema.TaggedUnion({
   },
 });
 export type SuspensionMarker = typeof SuspensionMarker.Type;
-export const decodeSuspensionMarker = (input: unknown) =>
-  Schema.decodeUnknownEffect(SuspensionMarker, { onExcessProperty: "error" })(input);
+const decodeSuspensionMarkerInput = Schema.decodeUnknownEffect(SuspensionMarker, {
+  onExcessProperty: "error",
+});
+export const decodeSuspensionMarker = (input: Parameters<typeof decodeSuspensionMarkerInput>[0]) =>
+  decodeSuspensionMarkerInput(input);
 
 export interface PiRunResult {
   readonly finalText: string;

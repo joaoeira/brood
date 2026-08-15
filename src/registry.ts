@@ -33,6 +33,7 @@ import {
 import { type AgentCommand, type PiRunOutcome, type RevivalContext } from "./control.js";
 import type { PublicModelProfile } from "./profiles.js";
 import { DEFAULT_MAX_FAILURE_MESSAGE_CHARS, dependencyOutcomeFromAgent } from "./render.js";
+import { assignOptional } from "./optional.js";
 import {
   AskAgentRejected,
   MAX_DIRECTORY_PAGE_ITEMS,
@@ -1065,7 +1066,6 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         name: entry.name,
         state: addressableState(entry.status),
         profile: entry.profile.name,
-        ...(entry.activity === undefined ? {} : { activity: entry.activity }),
         waitingFor: {
           agentCompletions: unresolvedDependencies.length,
           replies: unresolvedRequestRecipients.length,
@@ -1074,13 +1074,11 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           unresolvedDependencies.includes(callerId) ||
           unresolvedRequestRecipients.includes(callerId),
       };
+      assignOptional(projected, "activity", entry.activity);
       const candidateAgents = [...agents, projected];
       const candidateNextAfter = index < eligible.length - 1 ? projected.path : undefined;
-      const candidateResult: ListAgentsResult = {
-        self,
-        agents: candidateAgents,
-        ...(candidateNextAfter === undefined ? {} : { nextAfter: candidateNextAfter }),
-      };
+      const candidateResult: ListAgentsResult = { self, agents: candidateAgents };
+      assignOptional(candidateResult, "nextAfter", candidateNextAfter);
       if (Array.from(JSON.stringify(candidateResult)).length > MAX_TOOL_RESULT_CHARS) {
         break;
       }
@@ -1092,11 +1090,9 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
       );
     }
     const nextAfter = eligible.length > agents.length ? agents.at(-1)?.path : undefined;
-    return {
-      self,
-      agents,
-      ...(nextAfter === undefined ? {} : { nextAfter }),
-    };
+    const result: ListAgentsResult = { self, agents };
+    assignOptional(result, "nextAfter", nextAfter);
+    return result;
   });
 
   const nextSafeCounter = (current: number, label: string): number => {
@@ -1301,22 +1297,21 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
         : undefined;
       const agents = new Map(state.agents);
       agents.set(callerId, { ...claimed.success, updatedAt: deliveredAt });
-      agents.set(recipientId, {
+      const message: InboxEntry = {
+        _tag: "Message",
+        sequence,
+        fromId: callerId,
+        body: input.message,
+      };
+      assignOptional(message, "wakeGeneration", wakeGeneration);
+      const updatedTarget: AgentEntry = {
         ...target,
-        inbox: [
-          ...target.inbox,
-          {
-            _tag: "Message",
-            sequence,
-            fromId: callerId,
-            body: input.message,
-            ...(wakeGeneration === undefined ? {} : { wakeGeneration }),
-          },
-        ],
+        inbox: [...target.inbox, message],
         nextInboxSequence: sequence,
-        ...(wakeGeneration === undefined ? {} : { urgentWakeGeneration: wakeGeneration }),
         updatedAt: deliveredAt,
-      });
+      };
+      assignOptional(updatedTarget, "urgentWakeGeneration", wakeGeneration);
+      agents.set(recipientId, updatedTarget);
       const result: SendMessageResult =
         recipient.outcome === undefined
           ? { to: recipient.path, recipientState: addressableState(recipient.status) }
@@ -1399,6 +1394,11 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
               ),
             );
           }
+          const delivery: OperatorMessageDelivery = {
+            to: recipient.path,
+            recipientState: addressableState(target.status),
+          };
+          if (revived) Object.assign(delivery, { revived: true });
           return {
             next: appendTraffic(
               {
@@ -1424,11 +1424,7 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
               },
             ),
             actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
-            result: Result.succeed({
-              to: recipient.path,
-              recipientState: addressableState(target.status),
-              ...(revived ? { revived: true } : {}),
-            }),
+            result: Result.succeed(delivery),
           };
         }),
     );
@@ -1590,19 +1586,25 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           },
         ),
         actions: [PostCommitAction.Open({ latch: recipient.mailbox })],
-        result: Result.succeed({
-          version: 1,
-          request: requestId,
-          to: recipient.path,
-          recipientState: addressableState(target.status),
-          ...(revived ? { revived: true } : {}),
-          broodControl: { version: 1, kind: "suspend", invocationId },
-        }),
+        result: Result.succeed(
+          (() => {
+            const details: AskAgentToolDetails = {
+              version: 1,
+              request: requestId,
+              to: recipient.path,
+              recipientState: addressableState(target.status),
+              broodControl: { version: 1, kind: "suspend", invocationId },
+            };
+            if (revived) Object.assign(details, { revived: true });
+            return details;
+          })(),
+        ),
       };
     });
   });
 
-  const inboxProjectionSize = (value: unknown): number => Array.from(JSON.stringify(value)).length;
+  const inboxProjectionSize = <Value>(value: Value): number =>
+    Array.from(JSON.stringify(value)).length;
 
   const readMessages = Effect.fn("Brood.Registry.readMessages")(function* (
     callerId: AgentId,
@@ -2256,8 +2258,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
           command = {
             _tag: "InitialGoal",
             goal: entry.initialGoal,
-            ...(notice === undefined ? {} : { notice }),
           };
+          assignOptional(command, "notice", notice);
           nextEntry = { ...entry, initialGoal: undefined };
         } else if (activeWaitSatisfied(state, entry)) {
           const active = entry.activeWait;
@@ -2270,8 +2272,8 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
             waitId: active.waitId,
             dependencies: outcomesFor(state, active.dependencies),
             requests,
-            ...(notice === undefined ? {} : { notice }),
           };
+          assignOptional(command, "notice", notice);
           const retainedRequests = new Map(state.requests);
           for (const requestId of active.requests) retainedRequests.delete(requestId);
           nextState = { ...state, requests: retainedRequests };
@@ -2843,18 +2845,21 @@ export const makeRegistry = Effect.fn("Brood.makeRegistry")(function* (options: 
 
   const trafficLog = Ref.get(stateRef).pipe(
     Effect.map((state): ReadonlyArray<TrafficView> =>
-      state.traffic.map((record) => ({
-        sequence: record.sequence,
-        at: record.at,
-        kind: record.kind,
-        from: record.fromPath,
-        to: record.toPath,
-        body: record.body,
-        urgent: record.urgent,
-        status: record.status,
-        ...(record.statusAt === undefined ? {} : { statusAt: record.statusAt }),
-        ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
-      })),
+      state.traffic.map((record): TrafficView => {
+        const view: TrafficView = {
+          sequence: record.sequence,
+          at: record.at,
+          kind: record.kind,
+          from: record.fromPath,
+          to: record.toPath,
+          body: record.body,
+          urgent: record.urgent,
+          status: record.status,
+        };
+        assignOptional(view, "statusAt", record.statusAt);
+        assignOptional(view, "requestId", record.requestId);
+        return view;
+      }),
     ),
   );
 

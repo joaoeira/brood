@@ -14,11 +14,11 @@ import { StatusBar } from "./StatusBar";
 const TREE_WIDTH = 36;
 const TICKER_HEIGHT = 7;
 
-const OUTCOME_COLORS: Record<string, string> = {
+const OUTCOME_COLORS = {
   completed: theme.green,
   failed: theme.red,
   interrupted: theme.violet,
-};
+} satisfies Record<string, string>;
 
 export interface MonitorScreenProps {
   readonly state: AppState;

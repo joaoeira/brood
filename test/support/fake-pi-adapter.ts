@@ -99,22 +99,23 @@ const outcomeForStep = (
   step: FakeRunStep,
 ): Effect.Effect<PiRunOutcome, PiRunError | PiProtocolError> => {
   switch (step._tag) {
-    case "Complete":
-      return Effect.succeed({
-        _tag: "Completed",
+    case "Complete": {
+      const result = {
+        _tag: "Completed" as const,
         result: {
           finalText: step.text,
           finalMessageId: `message-${agentId}`,
-          stopReason: "stop",
+          stopReason: "stop" as const,
         },
-        ...(step.delivered === undefined ? {} : { deliveredOperatorMessages: step.delivered }),
-      });
-    case "Suspend":
-      return Effect.succeed({
-        _tag: "Suspended",
-        markers: step.markers,
-        ...(step.delivered === undefined ? {} : { deliveredOperatorMessages: step.delivered }),
-      });
+      };
+      if (step.delivered === undefined) return Effect.succeed(result);
+      return Effect.succeed({ ...result, deliveredOperatorMessages: step.delivered });
+    }
+    case "Suspend": {
+      const result = { _tag: "Suspended" as const, markers: step.markers };
+      if (step.delivered === undefined) return Effect.succeed(result);
+      return Effect.succeed({ ...result, deliveredOperatorMessages: step.delivered });
+    }
     case "RunFailure":
       return Effect.fail(new PiRunError({ agentId, message: step.message }));
     case "ProtocolFailure":
@@ -328,17 +329,13 @@ export const makeFakePiAdapter = Effect.fn("Brood.Test.makeFakePiAdapter")(funct
     nextSteer: Queue.take(steers),
     nextCleanup: Queue.take(cleanups),
     complete: (agentId, text, delivered?) =>
-      offerStep(agentId, {
-        _tag: "Complete",
-        text,
-        ...(delivered === undefined ? {} : { delivered }),
-      }),
+      delivered === undefined
+        ? offerStep(agentId, { _tag: "Complete", text })
+        : offerStep(agentId, { _tag: "Complete", text, delivered }),
     suspend: (agentId, markers, delivered?) =>
-      offerStep(agentId, {
-        _tag: "Suspend",
-        markers,
-        ...(delivered === undefined ? {} : { delivered }),
-      }),
+      delivered === undefined
+        ? offerStep(agentId, { _tag: "Suspend", markers })
+        : offerStep(agentId, { _tag: "Suspend", markers, delivered }),
     failRun: (agentId, message) => offerStep(agentId, { _tag: "RunFailure", message }),
     failProtocol: (agentId, message) => offerStep(agentId, { _tag: "ProtocolFailure", message }),
     emitEvent,

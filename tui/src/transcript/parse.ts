@@ -1,3 +1,5 @@
+import { Schema } from "effect";
+
 /**
  * Turns a Pi session `.jsonl` file into flat, render-ready transcript entries.
  *
@@ -47,22 +49,26 @@ export interface Transcript {
 const ARGS_PREVIEW_CHARS = 80;
 const RESULT_PREVIEW_CHARS = 100;
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
+const JsonObject = Schema.Record(Schema.String, Schema.Json);
+type JsonObject = typeof JsonObject.Type;
 
-const asString = (value: unknown): string | undefined =>
-  typeof value === "string" ? value : undefined;
+const isJsonObject = Schema.is(JsonObject);
+const isString = Schema.is(Schema.String);
+const isNumber = Schema.is(Schema.Number);
 
-const asNumber = (value: unknown): number | undefined =>
-  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+const asString = (value: Schema.Json | undefined): string | undefined =>
+  value !== undefined && isString(value) ? value : undefined;
+
+const asNumber = (value: Schema.Json | undefined): number | undefined =>
+  value !== undefined && isNumber(value) && Number.isFinite(value) ? value : undefined;
 
 /** Flattens a Pi content array (or bare string) down to its text blocks. */
-const contentText = (content: unknown): string => {
-  if (typeof content === "string") return content;
+const contentText = (content: Schema.Json | undefined): string => {
+  if (content !== undefined && isString(content)) return content;
   if (!Array.isArray(content)) return "";
   const parts: Array<string> = [];
   for (const block of content) {
-    if (!isRecord(block)) continue;
+    if (!isJsonObject(block)) continue;
     if (block["type"] === "text") {
       const text = asString(block["text"]);
       if (text !== undefined) parts.push(text);
@@ -71,13 +77,17 @@ const contentText = (content: unknown): string => {
   return parts.join("\n");
 };
 
-const toolCalls = (
-  content: unknown,
-): ReadonlyArray<{ id: string; name: string; args: unknown }> => {
+interface ToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly args: Schema.Json | undefined;
+}
+
+const toolCalls = (content: Schema.Json | undefined): ReadonlyArray<ToolCall> => {
   if (!Array.isArray(content)) return [];
-  const calls: Array<{ id: string; name: string; args: unknown }> = [];
+  const calls: Array<ToolCall> = [];
   for (const block of content) {
-    if (!isRecord(block) || block["type"] !== "toolCall") continue;
+    if (!isJsonObject(block) || block["type"] !== "toolCall") continue;
     const id = asString(block["id"]);
     if (id === undefined) continue;
     calls.push({ id, name: asString(block["name"]) ?? "tool", args: block["arguments"] });
@@ -104,7 +114,7 @@ const preview = (text: string, limit: number): string => {
   return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
 };
 
-const argsPreview = (args: unknown): string => {
+const argsPreview = (args: Schema.Json | undefined): string => {
   if (args === undefined) return "";
   try {
     return preview(JSON.stringify(args) ?? "", ARGS_PREVIEW_CHARS);
@@ -113,12 +123,13 @@ const argsPreview = (args: unknown): string => {
   }
 };
 
-const isSuspendResult = (details: unknown): boolean =>
-  isRecord(details) &&
-  isRecord(details["broodControl"]) &&
+const isSuspendResult = (details: Schema.Json | undefined): boolean =>
+  details !== undefined &&
+  isJsonObject(details) &&
+  isJsonObject(details["broodControl"]) &&
   details["broodControl"]["kind"] === "suspend";
 
-const parseHeader = (line: Record<string, unknown>): TranscriptHeader => ({
+const parseHeader = (line: JsonObject): TranscriptHeader => ({
   sessionId: asString(line["id"]) ?? "",
   timestamp: asString(line["timestamp"]) ?? "",
   cwd: asString(line["cwd"]) ?? "",
@@ -133,13 +144,14 @@ export const parseTranscript = (text: string): Transcript => {
 
   for (const rawLine of text.split("\n")) {
     if (rawLine.trim() === "") continue;
-    let line: unknown;
+    let parsed: Schema.Json;
     try {
-      line = JSON.parse(rawLine);
+      parsed = Schema.decodeUnknownSync(Schema.Json)(JSON.parse(rawLine));
     } catch {
       continue;
     }
-    if (!isRecord(line)) continue;
+    if (!isJsonObject(parsed)) continue;
+    const line = parsed;
 
     const entryTime = Date.parse(asString(line["timestamp"]) ?? "");
     const fallbackTime = Number.isNaN(entryTime) ? 0 : entryTime;
@@ -159,18 +171,19 @@ export const parseTranscript = (text: string): Transcript => {
     if (line["type"] !== "message") continue;
 
     const message = line["message"];
-    if (!isRecord(message)) continue;
+    if (!isJsonObject(message)) continue;
     const at = asNumber(message["timestamp"]) ?? fallbackTime;
 
     if (message["role"] === "user") {
       const body = contentText(message["content"]);
       const envelope = summarizeEnvelope(body);
-      entries.push({
+      const entry: TranscriptEntry = {
         kind: "user",
         at,
         text: body,
-        ...(envelope === undefined ? {} : { envelope }),
-      });
+      };
+      if (envelope !== undefined) Object.assign(entry, { envelope });
+      entries.push(entry);
       continue;
     }
 
@@ -204,28 +217,32 @@ export const parseTranscript = (text: string): Transcript => {
       const rowIndex = toolCallId === undefined ? undefined : pendingToolRows.get(toolCallId);
       const existing = rowIndex === undefined ? undefined : entries[rowIndex];
       if (rowIndex !== undefined && existing !== undefined && existing.kind === "tool") {
-        entries[rowIndex] = {
+        const resolved: TranscriptEntry = {
           ...existing,
           ok,
           resultPreview: resultText,
-          ...(suspended ? { suspended: true } : {}),
         };
-        pendingToolRows.delete(toolCallId as string);
+        if (suspended) Object.assign(resolved, { suspended: true });
+        entries[rowIndex] = resolved;
+        if (toolCallId !== undefined) pendingToolRows.delete(toolCallId);
         continue;
       }
       // Orphan result — the calling turn was compacted away or the file was
       // truncated. Still worth showing, just without its arguments.
-      entries.push({
+      const orphan: TranscriptEntry = {
         kind: "tool",
         at,
         toolName: asString(message["toolName"]) ?? "tool",
         argsPreview: "",
         ok,
         resultPreview: resultText,
-        ...(suspended ? { suspended: true } : {}),
-      });
+      };
+      if (suspended) Object.assign(orphan, { suspended: true });
+      entries.push(orphan);
     }
   }
 
-  return { ...(header === undefined ? {} : { header }), entries };
+  const transcript: Transcript = { entries };
+  if (header !== undefined) Object.assign(transcript, { header });
+  return transcript;
 };

@@ -49,7 +49,7 @@ export const glyphs = {
 
 export const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
-const STATE_COLORS: Record<AgentState, string> = {
+const STATE_COLORS = {
   starting: theme.muted,
   queued: theme.muted,
   running: theme.amber,
@@ -57,7 +57,7 @@ const STATE_COLORS: Record<AgentState, string> = {
   completed: theme.green,
   failed: theme.red,
   interrupted: theme.violet,
-};
+} satisfies Record<AgentState, string>;
 
 export const stateColor = (state: AgentState): string => STATE_COLORS[state];
 

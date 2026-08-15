@@ -68,12 +68,6 @@ const normalizePeerBody = (value: string): string =>
     .join("")
     .trim();
 
-const normalizedBodyLength = (input: unknown, field: string): number | undefined => {
-  if (typeof input !== "object" || input === null || !(field in input)) return undefined;
-  const value = Reflect.get(input, field);
-  return typeof value === "string" ? Array.from(normalizePeerBody(value)).length : undefined;
-};
-
 const codePointLimit = (maximum: number, label: string) =>
   Schema.makeFilter(
     (value: string) =>
@@ -423,13 +417,25 @@ export class ReadBulletinsRejected extends Schema.TaggedError<ReadBulletinsRejec
 ) {}
 
 const strict = { onExcessProperty: "error" as const };
+const decodeListAgents = Schema.decodeUnknownEffect(ListAgentsInput, strict);
+const decodeSetActivity = Schema.decodeUnknownEffect(SetActivityInput, strict);
+const decodeSendMessage = Schema.decodeUnknownEffect(SendMessageInput, strict);
+const decodeAskAgent = Schema.decodeUnknownEffect(AskAgentInput, strict);
+const decodeReadMessages = Schema.decodeUnknownEffect(ReadMessagesInput, strict);
+const decodeReplyToRequest = Schema.decodeUnknownEffect(ReplyToRequestInput, strict);
+const decodePostBulletin = Schema.decodeUnknownEffect(PostBulletinInput, strict);
+const decodeReadBulletins = Schema.decodeUnknownEffect(ReadBulletinsInput, strict);
+const MessageField = Schema.Struct({ message: Schema.String });
+const LimitField = Schema.Struct({ limit: Schema.Unknown });
+const isMessageField = Schema.is(MessageField);
+const isLimitField = Schema.is(LimitField);
+
+const normalizedBodyLength = (input: Parameters<typeof isMessageField>[0]): number | undefined =>
+  isMessageField(input) ? Array.from(normalizePeerBody(input.message)).length : undefined;
 
 export const decodeListAgentsInput = Effect.fn("Brood.Communication.decodeListAgentsInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      ListAgentsInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeListAgents>[0]) {
+    return yield* decodeListAgents(input).pipe(
       Effect.mapError(
         () =>
           new ListAgentsRejected({
@@ -443,11 +449,8 @@ export const decodeListAgentsInput = Effect.fn("Brood.Communication.decodeListAg
 );
 
 export const decodeSetActivityInput = Effect.fn("Brood.Communication.decodeSetActivityInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      SetActivityInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeSetActivity>[0]) {
+    return yield* decodeSetActivity(input).pipe(
       Effect.mapError(
         () =>
           new SetActivityRejected({
@@ -460,11 +463,8 @@ export const decodeSetActivityInput = Effect.fn("Brood.Communication.decodeSetAc
 );
 
 export const decodeSendMessageInput = Effect.fn("Brood.Communication.decodeSendMessageInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      SendMessageInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeSendMessage>[0]) {
+    return yield* decodeSendMessage(input).pipe(
       Effect.mapError(
         () =>
           new SendMessageRejected({
@@ -477,12 +477,9 @@ export const decodeSendMessageInput = Effect.fn("Brood.Communication.decodeSendM
 );
 
 export const decodeAskAgentInput = Effect.fn("Brood.Communication.decodeAskAgentInput")(function* (
-  input: unknown,
+  input: Parameters<typeof decodeAskAgent>[0],
 ) {
-  return yield* Schema.decodeUnknownEffect(
-    AskAgentInput,
-    strict,
-  )(input).pipe(
+  return yield* decodeAskAgent(input).pipe(
     Effect.mapError(
       () =>
         new AskAgentRejected({
@@ -493,18 +490,12 @@ export const decodeAskAgentInput = Effect.fn("Brood.Communication.decodeAskAgent
   );
 });
 
-const hasOnlyLimit = (input: unknown): boolean =>
-  typeof input === "object" &&
-  input !== null &&
-  "limit" in input &&
-  Object.keys(input).every((key) => key === "limit");
+const hasOnlyLimit = (input: Parameters<typeof isLimitField>[0]): boolean =>
+  isLimitField(input) && Object.keys(input).every((key) => key === "limit");
 
 export const decodeReadMessagesInput = Effect.fn("Brood.Communication.decodeReadMessagesInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      ReadMessagesInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeReadMessages>[0]) {
+    return yield* decodeReadMessages(input).pipe(
       Effect.mapError(
         () =>
           new ReadMessagesRejected({
@@ -519,13 +510,10 @@ export const decodeReadMessagesInput = Effect.fn("Brood.Communication.decodeRead
 );
 
 export const decodeReplyToRequestInput = Effect.fn("Brood.Communication.decodeReplyToRequestInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      ReplyToRequestInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeReplyToRequest>[0]) {
+    return yield* decodeReplyToRequest(input).pipe(
       Effect.mapError(() => {
-        const length = normalizedBodyLength(input, "message");
+        const length = normalizedBodyLength(input);
         return new ReplyRejected({
           reason: "InvalidInput",
           message:
@@ -539,13 +527,10 @@ export const decodeReplyToRequestInput = Effect.fn("Brood.Communication.decodeRe
 );
 
 export const decodePostBulletinInput = Effect.fn("Brood.Communication.decodePostBulletinInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      PostBulletinInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodePostBulletin>[0]) {
+    return yield* decodePostBulletin(input).pipe(
       Effect.mapError(() => {
-        const length = normalizedBodyLength(input, "message");
+        const length = normalizedBodyLength(input);
         return new PostBulletinRejected({
           reason: "InvalidInput",
           message:
@@ -559,11 +544,8 @@ export const decodePostBulletinInput = Effect.fn("Brood.Communication.decodePost
 );
 
 export const decodeReadBulletinsInput = Effect.fn("Brood.Communication.decodeReadBulletinsInput")(
-  function* (input: unknown) {
-    return yield* Schema.decodeUnknownEffect(
-      ReadBulletinsInput,
-      strict,
-    )(input).pipe(
+  function* (input: Parameters<typeof decodeReadBulletins>[0]) {
+    return yield* decodeReadBulletins(input).pipe(
       Effect.mapError(
         () =>
           new ReadBulletinsRejected({

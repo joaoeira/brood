@@ -60,15 +60,18 @@ const WaitForAgentsInput = Schema.Struct({
 });
 
 const strict = { onExcessProperty: "error" as const };
+const decodeDelegateInput = Schema.decodeUnknownEffect(DelegateInput, strict);
+const decodeWaitForAgentsInput = Schema.decodeUnknownEffect(WaitForAgentsInput, strict);
+const EmptyWaitForAgentsInput = Schema.Struct({
+  children: Schema.Array(Schema.Unknown).check(Schema.isMaxLength(0)),
+});
+const isEmptyWaitForAgentsInput = Schema.is(EmptyWaitForAgentsInput);
 
 const normalizeDelegateInput = Effect.fn("Brood.Tools.normalizeDelegateInput")(function* (
-  input: unknown,
+  input: Parameters<typeof decodeDelegateInput>[0],
   catalogue: ProfileCatalogue,
 ) {
-  return yield* Schema.decodeUnknownEffect(
-    DelegateInput,
-    strict,
-  )(input).pipe(
+  return yield* decodeDelegateInput(input).pipe(
     Effect.mapError((error) => invalidDelegate(`Invalid task batch: ${String(error)}`)),
     Effect.flatMap(
       (
@@ -101,22 +104,14 @@ const normalizeDelegateInput = Effect.fn("Brood.Tools.normalizeDelegateInput")(f
   );
 });
 
-const normalizeNames = Effect.fn("Brood.Tools.normalizeNames")(function* (input: unknown) {
-  return yield* Schema.decodeUnknownEffect(
-    WaitForAgentsInput,
-    strict,
-  )(input).pipe(
+const normalizeNames = Effect.fn("Brood.Tools.normalizeNames")(function* (
+  input: Parameters<typeof decodeWaitForAgentsInput>[0],
+) {
+  return yield* decodeWaitForAgentsInput(input).pipe(
     Effect.mapError(
       (error) =>
         new WaitRejected({
-          reason:
-            typeof input === "object" &&
-            input !== null &&
-            "children" in input &&
-            Array.isArray(input.children) &&
-            input.children.length === 0
-              ? "EmptySelection"
-              : "InvalidInput",
+          reason: isEmptyWaitForAgentsInput(input) ? "EmptySelection" : "InvalidInput",
           message: `Invalid agent selection: ${String(error)}`,
         }),
     ),

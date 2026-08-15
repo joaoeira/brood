@@ -11,6 +11,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
+import { Schema } from "effect";
 import { createDemoBridge } from "./bridge/demo";
 import { createLiveBridge } from "./bridge/live";
 import type { BridgeHandle, ConfigSummary } from "./bridge/types";
@@ -51,23 +52,28 @@ const parseArguments = (argv: ReadonlyArray<string>): Arguments => {
   return { configPath: resolve(configPath), demo };
 };
 
-const asRecord = (value: unknown): Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+const JsonObject = Schema.Record(Schema.String, Schema.Json);
+type JsonObject = typeof JsonObject.Type;
 
-const asText = (value: unknown, fallback: string): string =>
-  typeof value === "string" ? value : fallback;
+const isJsonObject = Schema.is(JsonObject);
+const isString = Schema.is(Schema.String);
+const isNumber = Schema.is(Schema.Number);
 
-const asCount = (value: unknown, fallback: number): number =>
-  typeof value === "number" && Number.isFinite(value) ? value : fallback;
+const asRecord = (value: Schema.Json | undefined): JsonObject =>
+  value !== undefined && isJsonObject(value) ? value : {};
+
+const asText = (value: Schema.Json | undefined, fallback: string): string =>
+  value !== undefined && isString(value) ? value : fallback;
+
+const asCount = (value: Schema.Json | undefined, fallback: number): number =>
+  value !== undefined && isNumber(value) && Number.isFinite(value) ? value : fallback;
 
 /**
  * A best-effort read of the raw config for display. Brood's own decoder is the
  * authority and runs a moment later inside the bridge; this only needs to be
  * good enough to fill a header, and must not reject a config Brood would accept.
  */
-const summarize = (configPath: string, raw: unknown): ConfigSummary => {
+const summarize = (configPath: string, raw: Schema.Json): ConfigSummary => {
   const config = asRecord(raw);
   const profiles = asRecord(config["profiles"]);
   return {
@@ -96,9 +102,9 @@ const buildBridge = async (parsed: Arguments): Promise<BridgeHandle> => {
       { cause },
     );
   }
-  let rawConfig: unknown;
+  let rawConfig: Schema.Json;
   try {
-    rawConfig = JSON.parse(text);
+    rawConfig = Schema.decodeUnknownSync(Schema.Json)(JSON.parse(text));
   } catch (cause: unknown) {
     throw new Error(
       `Invalid JSON in ${parsed.configPath}: ${cause instanceof Error ? cause.message : String(cause)}`,

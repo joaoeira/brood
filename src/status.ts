@@ -12,6 +12,7 @@ import {
   type AgentStatus,
 } from "./agent.js";
 import { AgentActivity, type AgentActivity as AgentActivityType } from "./communication.js";
+import { assignOptional } from "./optional.js";
 import { PublicModelProfile } from "./profiles.js";
 
 export const SwarmRunState = Schema.Literals(["not_started", "running", "draining", "completed"]);
@@ -241,14 +242,11 @@ const statusTree = (
       throw new StatusInvariantDefect(`Agent ${agent.id} is missing from the status index`);
     }
     const coordination = activeCoordination(agent.coordination);
-    return {
+    const status: StatusAgent = {
       path: indexedAgent.path,
       name: agent.name,
       state: operationalState(agent.status),
       durationMillis: Math.max(0, (agent.terminalAt ?? now) - agent.createdAt),
-      ...(agent.activity === undefined ? {} : { activity: agent.activity }),
-      ...(coordination === undefined ? {} : { coordination }),
-      ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
       waitTargets: agent.waitTargets.map((targetId) => {
         const target = indexed.get(targetId);
         if (target === undefined) {
@@ -260,6 +258,12 @@ const statusTree = (
       }),
       children: (children.get(agent.id) ?? []).map(build),
     };
+    assignOptional(status, "activity", agent.activity);
+    assignOptional(status, "coordination", coordination);
+    if (agent.revivals !== undefined && agent.revivals !== 0) {
+      Object.assign(status, { revivals: agent.revivals });
+    }
+    return status;
   };
 
   return (children.get(undefined) ?? []).map(build);
@@ -306,17 +310,13 @@ export const buildAgentDetail = (
   const agent = selected.source;
   const parent = agent.parentId === undefined ? undefined : indexed.get(agent.parentId);
   const coordination = activeCoordination(agent.coordination);
-  return {
+  const detail: AgentDetail = {
     version: 2,
     path: selected.path,
     id: agent.id,
-    ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
-    ...(parent === undefined ? {} : { parentPath: parent.path }),
     name: agent.name,
     state: operationalState(agent.status),
     durationMillis: Math.max(0, (agent.terminalAt ?? input.now) - agent.createdAt),
-    ...(agent.activity === undefined ? {} : { activity: agent.activity }),
-    ...(coordination === undefined ? {} : { coordination }),
     waitTargets: agent.waitTargets.map((targetId) => {
       const target = indexed.get(targetId);
       if (target === undefined) {
@@ -335,10 +335,17 @@ export const buildAgentDetail = (
     profile: agent.profile,
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
-    ...(agent.terminalAt === undefined ? {} : { terminalAt: agent.terminalAt }),
-    ...(agent.outcome === undefined ? {} : { outcome: agent.outcome }),
-    ...(agent.revivals === undefined || agent.revivals === 0 ? {} : { revivals: agent.revivals }),
   };
+  assignOptional(detail, "parentId", agent.parentId);
+  assignOptional(detail, "parentPath", parent?.path);
+  assignOptional(detail, "activity", agent.activity);
+  assignOptional(detail, "coordination", coordination);
+  assignOptional(detail, "terminalAt", agent.terminalAt);
+  assignOptional(detail, "outcome", agent.outcome);
+  if (agent.revivals !== undefined && agent.revivals !== 0) {
+    Object.assign(detail, { revivals: agent.revivals });
+  }
+  return detail;
 };
 
 export const resolveAgentReference = (

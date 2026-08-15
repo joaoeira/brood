@@ -50,7 +50,7 @@ const thinkingLevels = [
   "max",
 ] as const satisfies ReadonlyArray<ModelThinkingLevel>;
 
-const exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
+const exhaustiveThinkingLevels = {
   off: true,
   minimal: true,
   low: true,
@@ -58,7 +58,7 @@ const exhaustiveThinkingLevels: Record<ModelThinkingLevel, true> = {
   high: true,
   xhigh: true,
   max: true,
-};
+} satisfies Record<ModelThinkingLevel, true>;
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
   constructor() {
@@ -115,11 +115,16 @@ const createUserMessage = (content: string): UserMessage => ({
   timestamp: Date.now(),
 });
 
-const identityConverter = (messages: AgentMessage[]): Message[] =>
-  messages.filter(
-    (message) =>
-      message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-  ) as Message[];
+const isModelMessage = (message: AgentMessage): message is Message =>
+  message.role === "user" || message.role === "assistant" || message.role === "toolResult";
+
+const identityConverter = (messages: AgentMessage[]): Message[] => messages.filter(isModelMessage);
+
+const PersistedRequestDetails = Schema.Struct({ request: Schema.String });
+
+// SAFETY: the mapped Brood communication definitions do not read Pi's extension context; the SDK
+// compatibility adapter supplies the required-but-unused fifth argument.
+const unusedExtensionContext = undefined as never;
 
 class CompatibilityToolRejected extends Schema.TaggedError<CompatibilityToolRejected>()(
   "CompatibilityToolRejected",
@@ -131,7 +136,7 @@ describe("pinned Pi SDK compatibility", () => {
     const profileNames: ReadonlyArray<string> = ["worker", "researcher"];
     const schema = StringEnum(profileNames);
 
-    expect(Reflect.get(schema, "enum")).toEqual(["worker", "researcher"]);
+    expect(schema).toMatchObject({ enum: ["worker", "researcher"] });
   });
 
   it("keeps Brood's thinking levels exhaustive with Pi", () => {
@@ -357,7 +362,7 @@ describe("pinned Pi SDK compatibility", () => {
         parameters: definition.parameters,
         prepareArguments,
         execute: (toolCallId, params, signal, onUpdate) =>
-          definition.execute(toolCallId, params, signal, onUpdate, {} as never),
+          definition.execute(toolCallId, params, signal, onUpdate, unusedExtensionContext),
       };
     });
     const context: AgentContext = { systemPrompt: "", messages: [], tools };
@@ -598,9 +603,8 @@ describe("pinned Pi SDK compatibility", () => {
             toolResults.some(
               (result) =>
                 result.toolCallId === "persist-call" &&
-                typeof result.details === "object" &&
-                result.details !== null &&
-                Reflect.get(result.details, "request") === "request_compat",
+                Schema.is(PersistedRequestDetails)(result.details) &&
+                result.details.request === "request_compat",
             ) &&
             context.messages.some(
               (message) => message.role === "toolResult" && message.toolCallId === "persist-call",
